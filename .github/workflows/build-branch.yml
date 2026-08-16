@@ -445,6 +445,11 @@ jobs:
           cd "$aio_temp/runtime"
           source "$repo_root/deployments/aio/community/start.sh"
           update_env_file
+
+          unset GOOGLE_CALENDAR_CLIENT_ID
+          unset GOOGLE_CALENDAR_CLIENT_SECRET
+          unset GOOGLE_CALENDAR_IS_PROJECT_DEDICATED
+          unset GOOGLE_CALENDAR_RELEASED
           load_env_file
 
           for process_name in api worker beat migrator; do
