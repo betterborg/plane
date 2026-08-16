@@ -63,7 +63,7 @@ mkdir plane-selfhost
 cd plane-selfhost
 ```
 
-#### For *Docker Compose* based setup
+#### For _Docker Compose_ based setup
 
 ```
 curl -fsSL -o setup.sh https://github.com/makeplane/plane/releases/latest/download/setup.sh
@@ -71,7 +71,7 @@ curl -fsSL -o setup.sh https://github.com/makeplane/plane/releases/latest/downlo
 chmod +x setup.sh
 ```
 
-#### For *Docker Swarm* based setup
+#### For _Docker Swarm_ based setup
 
 ```
 curl -fsSL -o setup.sh https://github.com/makeplane/plane/releases/latest/download/swarm.sh
@@ -89,7 +89,8 @@ Lets get started by running the `./setup.sh` command.
 
 This will prompt you with the below options.
 
-#### Docker Compose 
+#### Docker Compose
+
 ```bash
 Select an Action you want to perform:
    1) Install (x86_64)
@@ -152,6 +153,23 @@ Below are the most import keys you must refer to. _<span style="color: #fcba03">
 
 There are many other settings you can play with, but we suggest you configure `EMAIL SETTINGS` as it will enable you to invite your teammates onto the platform.
 
+#### Google Calendar deployment contract
+
+Docker Compose and Docker Swarm use the same released `docker-compose.yaml` and `plane.env`. Create a Google Cloud project used only for Plane's Google Calendar integration; do not reuse a project or OAuth client that serves another application. Set the same four backend values for the API, worker, beat-worker, and migrator through `plane.env`:
+
+- `GOOGLE_CALENDAR_CLIENT_ID`: the Web application OAuth client ID from the dedicated project.
+- `GOOGLE_CALENDAR_CLIENT_SECRET`: the matching OAuth client secret. Treat this as a secret and do not print it during deployment checks.
+- `GOOGLE_CALENDAR_IS_PROJECT_DEDICATED`: set to `1` only after confirming that the Google Cloud project is dedicated to this integration.
+- `GOOGLE_CALENDAR_RELEASED`: the instance-wide release gate. Keep it at the shipped default of `0` until Phase 7 is deployed and its release-readiness checks are complete.
+
+In Google Cloud, enable the Google Calendar API and configure the OAuth consent screen with the app name, support and developer contact details, and the Calendar scopes Plane requests. Publish the consent screen when ready. Google may require verification before external users can authorize the sensitive Calendar scopes. Until Google verifies the consent screen, self-hosted users can see Google's **unverified app** interstitial; Google controls that warning, not Plane. Plane requests offline consent so it can refresh access and keep calendars synchronized while members are away.
+
+Create a **Web application** OAuth client and add your public Plane API origin followed by `/auth/google-calendar/callback/` to its **Authorized redirect URIs**, for example `https://plane.example.com/auth/google-calendar/callback/`. The value must use the same origin users reach and must retain the trailing slash. God Mode displays the exact callback under **Integrations > Google Calendar**.
+
+Roll out a release with `GOOGLE_CALENDAR_RELEASED=0` to all four backend workloads first. Configure the credentials, confirm the dedicated-project acknowledgement, callback, consent screen, and Google verification status in God Mode, and complete the Phase 7 deployment and release-readiness checks. Only then change the gate to `1` and redeploy every backend workload together. Do not expose the integration from only part of the backend fleet.
+
+Live credential rotation is unsupported. Workspace disable retains member grants and is not sufficient preparation for replacing the OAuth client. Start Plane's project-wide revocation flow, wait for terminal cleanup to finish with every grant in a terminal state, and only then disable the release gate across all backend workloads and replace the credentials. Revoking or deleting the dedicated Google OAuth client disconnects Calendar for every member, so coordinate that action with the project-wide cleanup. Revalidate the full rollout contract before setting the release gate back to `1`.
+
 ---
 
 ### Continue with setup - Start Server (Docker Compose)
@@ -189,7 +207,7 @@ You have successfully self hosted `Plane` instance. Access the application by go
 
 In case you want to make changes to `plane.env` variables, we suggest you to stop the services before doing that.
 
-#### Docker Compose 
+#### Docker Compose
 
 Lets again run the `./setup.sh` command. You will again be prompted with the below options. This time select `3` to stop the services
 
@@ -239,6 +257,7 @@ In case you want to make changes to `plane.env` variables, without stopping the 
 Lets again run the `./setup.sh` command. You will again be prompted with the below options. This time select `4` to restart the services
 
 #### Docker Compose
+
 ```bash
 Select a Action you want to perform:
    1) Install (x86_64)
@@ -275,7 +294,7 @@ If all goes well, you will see the confirmation from docker cli
 
 ---
 
-### Upgrading Plane Version 
+### Upgrading Plane Version
 
 It is always advised to keep Plane up to date with the latest release.
 
@@ -337,9 +356,9 @@ Once done with making changes in `plane.env` file, jump on to `Redeploy Stack`
 
 ### View Logs
 
-There would a time when you might want to check what is happening inside the API, Worker or any other container.  
+There would a time when you might want to check what is happening inside the API, Worker or any other container.
 
-Lets again run the `./setup.sh` command. You will again be prompted with the below options. 
+Lets again run the `./setup.sh` command. You will again be prompted with the below options.
 
 This time select `6` to view logs.
 
@@ -361,7 +380,6 @@ Action [2]: 6
 
 #### Docker Swarm
 
-
 ```bash
    1) Deploy Stack
    2) Remove Stack
@@ -375,7 +393,9 @@ Action [3]: 6
 ```
 
 #### Service Menu Options for Logs
+
 This will further open sub-menu with list of services
+
 ```bash
 Select a Service you want to view the logs for:
    1) Web
@@ -395,6 +415,7 @@ Service: 3
 ```
 
 Select any of the service to view the logs e.g. `3`. Expect something similar to this
+
 ```bash
 api-1  | Waiting for database...
 api-1  | Database available!
@@ -439,9 +460,9 @@ api-1  | [2024-05-02 03:56:03 +0000] [25] [INFO] Application startup complete.
 
 ```
 
-To exit this, use `CTRL+C` and then you will land on to the main-menu with the list of actions. 
+To exit this, use `CTRL+C` and then you will land on to the main-menu with the list of actions.
 
-Similarly, you can view the logs of other services. 
+Similarly, you can view the logs of other services.
 
 ---
 
@@ -500,12 +521,12 @@ When you want to restore the previously backed-up data, follow the instructions 
 
    ```bash
    --------------------------------------------
-    ____  _                          ///////// 
-   |  _ \| | __ _ _ __   ___         ///////// 
-   | |_) | |/ _` | '_ \ / _ \   /////    ///// 
-   |  __/| | (_| | | | |  __/   /////    ///// 
-   |_|   |_|\__,_|_| |_|\___|        ////      
-                                    ////      
+    ____  _                          /////////
+   |  _ \| | __ _ _ __   ___         /////////
+   | |_) | |/ _` | '_ \ / _ \   /////    /////
+   |  __/| | (_| | | | |  __/   /////    /////
+   |_|   |_|\__,_|_| |_|\___|        ////
+                                    ////
    --------------------------------------------
    Project management tool from the future
    --------------------------------------------
@@ -550,7 +571,7 @@ When you want to restore the previously backed-up data on Plane Commercial Air-G
    ./restore-airgapped.sh <path to backup folder containing *.tar.gz files>
    ```
 
-1. After restoration, you are ready to start Plane Commercial (Airgapped) will all your previously saved data. 
+1. After restoration, you are ready to start Plane Commercial (Airgapped) will all your previously saved data.
 
 ---
 
@@ -627,4 +648,5 @@ In case the suffixes are wrong or the mentioned volumes are not found, you will 
 In case of successful migration, it will be a silent exit without error.
 
 Now its time to restart v0.14.0 setup.
+
 </details>
