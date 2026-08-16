@@ -351,6 +351,66 @@ jobs:
           sed -i 's/${APP_RELEASE:-stable}/${APP_RELEASE:-'${REL_VERSION}'}/g' deployments/cli/community/docker-compose.yml
           # sed -i 's/APP_RELEASE=stable/APP_RELEASE='${REL_VERSION}'/g' deployments/cli/community/variables.env
 
+      - name: Validate Community Calendar Environment
+        run: |
+          compose_file=deployments/cli/community/docker-compose.yml
+          defaults_file=deployments/cli/community/variables.env
+          default_render=$(mktemp)
+          sentinel_render=$(mktemp)
+          trap 'rm -f "$default_render" "$sentinel_render"' EXIT
+
+          env \
+            -u GOOGLE_CALENDAR_CLIENT_ID \
+            -u GOOGLE_CALENDAR_CLIENT_SECRET \
+            -u GOOGLE_CALENDAR_IS_PROJECT_DEDICATED \
+            -u GOOGLE_CALENDAR_RELEASED \
+            docker compose --env-file "$defaults_file" -f "$compose_file" config --format json > "$default_render"
+
+          export GOOGLE_CALENDAR_CLIENT_ID="calendar-client-id-${RANDOM}-${RANDOM}"
+          export GOOGLE_CALENDAR_CLIENT_SECRET="calendar-client-secret-${RANDOM}-${RANDOM}"
+          export GOOGLE_CALENDAR_IS_PROJECT_DEDICATED="calendar-isolation-${RANDOM}-${RANDOM}"
+          export GOOGLE_CALENDAR_RELEASED="calendar-release-${RANDOM}-${RANDOM}"
+          echo "::add-mask::$GOOGLE_CALENDAR_CLIENT_SECRET"
+          docker compose --env-file "$defaults_file" -f "$compose_file" config --format json > "$sentinel_render"
+
+          python3 - "$default_render" "$sentinel_render" <<'PY'
+          import json
+          import os
+          import sys
+
+          services = ("api", "worker", "beat-worker", "migrator")
+          keys = (
+              "GOOGLE_CALENDAR_CLIENT_ID",
+              "GOOGLE_CALENDAR_CLIENT_SECRET",
+              "GOOGLE_CALENDAR_IS_PROJECT_DEDICATED",
+              "GOOGLE_CALENDAR_RELEASED",
+          )
+
+          def load_render(path):
+              with open(path, encoding="utf-8") as render_file:
+                  return json.load(render_file)
+
+          def validate(render, expected, label):
+              for service in services:
+                  environment = render["services"][service]["environment"]
+                  for key in keys:
+                      if environment.get(key) != expected[key]:
+                          raise SystemExit(f"{label} render has an invalid {key} value for {service}")
+
+          validate(
+              load_render(sys.argv[1]),
+              {
+                  "GOOGLE_CALENDAR_CLIENT_ID": "",
+                  "GOOGLE_CALENDAR_CLIENT_SECRET": "",
+                  "GOOGLE_CALENDAR_IS_PROJECT_DEDICATED": "0",
+                  "GOOGLE_CALENDAR_RELEASED": "0",
+              },
+              "default",
+          )
+          validate(load_render(sys.argv[2]), {key: os.environ[key] for key in keys}, "sentinel")
+          print("Calendar environment contract is consistent across all backend services")
+          PY
+
       - name: Upload Assets
         uses: actions/upload-artifact@v7
         with:
