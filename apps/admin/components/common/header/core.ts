@@ -9,6 +9,8 @@ export const CORE_HEADER_SEGMENT_LABELS: Record<string, string> = {
   ai: "Artificial Intelligence",
   email: "Email",
   authentication: "Authentication",
+  integrations: "Integrations",
+  "google-calendar": "Google Calendar",
   image: "Image",
   google: "Google",
   github: "GitHub",
