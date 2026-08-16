@@ -19,8 +19,8 @@ def django_db_setup(django_db_setup):  # noqa: F811
 
 
 @pytest.fixture
-def migration_executor(request, django_db_setup, django_db_blocker):
-    """Provide a migration executor and always restore the database to the migration tip."""
+def migration_executor(request, transactional_db, django_db_blocker):
+    """Provide an isolated migration executor and restore the database to the migration tip."""
 
     if request.node.get_closest_marker("migration") is None:
         pytest.fail("The migration_executor fixture requires the migration marker")
