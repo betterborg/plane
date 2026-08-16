@@ -12,7 +12,9 @@ from smtplib import (
 )
 
 # Django imports
+from django.conf import settings
 from django.core.mail import BadHeaderError, EmailMultiAlternatives, get_connection
+from django.db import transaction
 from django.db.models import Q, Case, When, Value
 
 # Third party imports
@@ -29,6 +31,20 @@ from plane.utils.cache import cache_response, invalidate_cache
 from plane.license.utils.instance_value import get_email_configuration
 
 
+GOOGLE_CALENDAR_CREDENTIAL_KEYS = frozenset(
+    {
+        "GOOGLE_CALENDAR_CLIENT_ID",
+        "GOOGLE_CALENDAR_CLIENT_SECRET",
+        "GOOGLE_CALENDAR_IS_PROJECT_DEDICATED",
+    }
+)
+
+
+def google_calendar_credentials_are_locked(configuration_keys):
+    """Return whether a configuration update would replace released Calendar credentials."""
+    return settings.GOOGLE_CALENDAR_RELEASED and bool(GOOGLE_CALENDAR_CREDENTIAL_KEYS.intersection(configuration_keys))
+
+
 class InstanceConfigurationEndpoint(BaseAPIView):
     permission_classes = [InstanceAdminPermission]
 
@@ -41,19 +57,26 @@ class InstanceConfigurationEndpoint(BaseAPIView):
     @invalidate_cache(path="/api/instances/configurations/", user=False)
     @invalidate_cache(path="/api/instances/", user=False)
     def patch(self, request):
-        configurations = InstanceConfiguration.objects.filter(key__in=request.data.keys())
+        with transaction.atomic():
+            configurations = list(
+                InstanceConfiguration.objects.select_for_update().filter(key__in=request.data.keys())
+            )
 
-        bulk_configurations = []
-        for configuration in configurations:
-            raw_value = request.data.get(configuration.key, configuration.value)
-            value = "" if raw_value is None else str(raw_value).strip()
-            if configuration.is_encrypted:
-                configuration.value = encrypt_data(value)
-            else:
-                configuration.value = value
-            bulk_configurations.append(configuration)
+            if google_calendar_credentials_are_locked(request.data.keys()):
+                return Response(
+                    {"error": "google_calendar_credentials_locked"},
+                    status=status.HTTP_409_CONFLICT,
+                )
 
-        InstanceConfiguration.objects.bulk_update(bulk_configurations, ["value"], batch_size=100)
+            for configuration in configurations:
+                raw_value = request.data.get(configuration.key, configuration.value)
+                value = "" if raw_value is None else str(raw_value).strip()
+                if configuration.is_encrypted:
+                    configuration.value = encrypt_data(value)
+                else:
+                    configuration.value = value
+
+            InstanceConfiguration.objects.bulk_update(configurations, ["value"], batch_size=100)
 
         serializer = InstanceConfigurationSerializer(configurations, many=True)
         return Response(serializer.data, status=status.HTTP_200_OK)
