@@ -62,6 +62,27 @@ google_config_variables = [
     },
 ]
 
+google_calendar_config_variables = [
+    {
+        "key": "GOOGLE_CALENDAR_CLIENT_ID",
+        "value": os.environ.get("GOOGLE_CALENDAR_CLIENT_ID"),
+        "category": "GOOGLE_CALENDAR",
+        "is_encrypted": False,
+    },
+    {
+        "key": "GOOGLE_CALENDAR_CLIENT_SECRET",
+        "value": os.environ.get("GOOGLE_CALENDAR_CLIENT_SECRET"),
+        "category": "GOOGLE_CALENDAR",
+        "is_encrypted": True,
+    },
+    {
+        "key": "GOOGLE_CALENDAR_IS_PROJECT_DEDICATED",
+        "value": os.environ.get("GOOGLE_CALENDAR_IS_PROJECT_DEDICATED", "0"),
+        "category": "GOOGLE_CALENDAR",
+        "is_encrypted": False,
+    },
+]
+
 github_config_variables = [
     {
         "key": "IS_GITHUB_ENABLED",
@@ -254,6 +275,7 @@ core_config_variables = [
     *authentication_config_variables,
     *workspace_management_config_variables,
     *google_config_variables,
+    *google_calendar_config_variables,
     *github_config_variables,
     *gitlab_config_variables,
     *gitea_config_variables,

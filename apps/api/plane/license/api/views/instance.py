@@ -7,6 +7,8 @@ import os
 
 # Django imports
 from django.conf import settings
+from django.utils.decorators import method_decorator
+from django.views.decorators.cache import cache_control
 
 # Third party imports
 from rest_framework import status
@@ -21,8 +23,6 @@ from plane.license.api.serializers import InstanceSerializer
 from plane.license.models import Instance
 from plane.license.utils.instance_value import get_configuration_value
 from plane.utils.cache import cache_response, invalidate_cache
-from django.utils.decorators import method_decorator
-from django.views.decorators.cache import cache_control
 
 
 class InstanceEndpoint(BaseAPIView):
@@ -63,6 +63,9 @@ class InstanceEndpoint(BaseAPIView):
             POSTHOG_HOST,
             UNSPLASH_ACCESS_KEY,
             LLM_API_KEY,
+            GOOGLE_CALENDAR_CLIENT_ID,
+            GOOGLE_CALENDAR_CLIENT_SECRET,
+            GOOGLE_CALENDAR_IS_PROJECT_DEDICATED,
         ) = get_configuration_value(
             [
                 {
@@ -122,6 +125,18 @@ class InstanceEndpoint(BaseAPIView):
                     "key": "LLM_API_KEY",
                     "default": os.environ.get("LLM_API_KEY", ""),
                 },
+                {
+                    "key": "GOOGLE_CALENDAR_CLIENT_ID",
+                    "default": os.environ.get("GOOGLE_CALENDAR_CLIENT_ID", ""),
+                },
+                {
+                    "key": "GOOGLE_CALENDAR_CLIENT_SECRET",
+                    "default": os.environ.get("GOOGLE_CALENDAR_CLIENT_SECRET", ""),
+                },
+                {
+                    "key": "GOOGLE_CALENDAR_IS_PROJECT_DEDICATED",
+                    "default": os.environ.get("GOOGLE_CALENDAR_IS_PROJECT_DEDICATED", "0"),
+                },
             ]
         )
 
@@ -151,6 +166,14 @@ class InstanceEndpoint(BaseAPIView):
 
         # Open AI settings
         data["has_llm_configured"] = bool(LLM_API_KEY)
+
+        # Google Calendar settings
+        data["is_google_calendar_available"] = (
+            settings.GOOGLE_CALENDAR_RELEASED
+            and bool(GOOGLE_CALENDAR_CLIENT_ID)
+            and bool(GOOGLE_CALENDAR_CLIENT_SECRET)
+            and GOOGLE_CALENDAR_IS_PROJECT_DEDICATED == "1"
+        )
 
         # File size settings
         data["file_size_limit"] = float(os.environ.get("FILE_SIZE_LIMIT", 5242880))

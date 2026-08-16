@@ -53,6 +53,10 @@ DEBUG = int(os.environ.get("DEBUG", "0"))
 # Self-hosted mode
 IS_SELF_MANAGED = True
 
+# Google Calendar is released independently of its instance credentials so an
+# image can ship the integration without making it available by default.
+GOOGLE_CALENDAR_RELEASED = os.environ.get("GOOGLE_CALENDAR_RELEASED", "0") == "1"
+
 # Webhook IP allowlist — comma-separated IPs or CIDR ranges that are allowed as
 # webhook targets even if they resolve to private networks.
 # Example: "10.0.0.0/8,192.168.1.0/24,172.16.0.5"
