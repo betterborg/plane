@@ -41,9 +41,13 @@ class Integration(AuditModel):
 class WorkspaceIntegration(BaseModel):
     workspace = models.ForeignKey("db.Workspace", related_name="workspace_integrations", on_delete=models.CASCADE)
     # Bot user
-    actor = models.ForeignKey("db.User", related_name="integrations", on_delete=models.CASCADE)
+    actor = models.ForeignKey(
+        "db.User", related_name="integrations", on_delete=models.CASCADE, null=True, blank=True
+    )
     integration = models.ForeignKey("db.Integration", related_name="integrated_workspaces", on_delete=models.CASCADE)
-    api_token = models.ForeignKey("db.APIToken", related_name="integrations", on_delete=models.CASCADE)
+    api_token = models.ForeignKey(
+        "db.APIToken", related_name="integrations", on_delete=models.CASCADE, null=True, blank=True
+    )
     metadata = models.JSONField(default=dict)
 
     config = models.JSONField(default=dict)

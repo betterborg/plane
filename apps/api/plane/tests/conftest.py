@@ -3,6 +3,8 @@
 # See the LICENSE file for details.
 
 import pytest
+from django.db import connection
+from django.db.migrations.executor import MigrationExecutor
 from rest_framework.test import APIClient
 from pytest_django.fixtures import django_db_setup
 
@@ -14,6 +16,22 @@ from plane.db.models.api import APIToken
 def django_db_setup(django_db_setup):  # noqa: F811
     """Set up the Django database for the test session"""
     pass
+
+
+@pytest.fixture
+def migration_executor(request, django_db_setup, django_db_blocker):
+    """Provide a migration executor and always restore the database to the migration tip."""
+
+    if request.node.get_closest_marker("migration") is None:
+        pytest.fail("The migration_executor fixture requires the migration marker")
+
+    with django_db_blocker.unblock():
+        executor = MigrationExecutor(connection)
+        try:
+            yield executor
+        finally:
+            executor.loader.build_graph()
+            executor.migrate(executor.loader.graph.leaf_nodes())
 
 
 @pytest.fixture
