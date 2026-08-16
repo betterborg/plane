@@ -31,6 +31,9 @@ def test_calendar_migration_preserves_legacy_integrations_and_adds_connection_sc
     Integration = old_apps.get_model("db", "Integration")
     WorkspaceIntegration = old_apps.get_model("db", "WorkspaceIntegration")
 
+    Integration.objects.filter(provider="google_calendar").delete()
+    assert not Integration.objects.filter(provider="google_calendar").exists()
+
     actor = User.objects.create(username="integration-bot", email="integration-bot@example.com", is_bot=True)
     member = User.objects.create(username="calendar-member", email="calendar-member@example.com")
     workspace = Workspace.objects.create(name="Migration workspace", slug="migration-workspace", owner=member)
@@ -83,7 +86,7 @@ def test_calendar_migration_preserves_legacy_integrations_and_adds_connection_sc
     assert connection_row.lifecycle_generation == 0
     assert connection_row.oauth_state == "attempt-state"
 
-    table = connection._meta.db_table
+    table = CalendarConnection._meta.db_table
     with connection.cursor() as cursor:
         cursor.execute(f'SELECT "access_token", "refresh_token" FROM "{table}" WHERE "id" = %s', [connection_row.id])
         stored_access_token, stored_refresh_token = cursor.fetchone()
