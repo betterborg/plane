@@ -177,8 +177,23 @@ update_env_file(){
 
     update_env_value "API_KEY_RATE_LIMIT" "${API_KEY_RATE_LIMIT:-60/minute}"
 
+    # Google Calendar integration credentials persist across restarts when no
+    # replacement is supplied. The feature flags remain disabled by default.
+    update_env_value "GOOGLE_CALENDAR_CLIENT_ID" "$GOOGLE_CALENDAR_CLIENT_ID"
+    update_env_value "GOOGLE_CALENDAR_CLIENT_SECRET" "$GOOGLE_CALENDAR_CLIENT_SECRET"
+    update_env_value "GOOGLE_CALENDAR_IS_PROJECT_DEDICATED" "${GOOGLE_CALENDAR_IS_PROJECT_DEDICATED:-0}"
+    update_env_value "GOOGLE_CALENDAR_RELEASED" "${GOOGLE_CALENDAR_RELEASED:-0}"
+
     echo "✅ Environment file updated"
     echo ""
+}
+
+load_env_file(){
+    while IFS='=' read -r key value; do
+        if [ -n "$key" ] && [[ "$key" != \#* ]]; then
+            export "$key=$value"
+        fi
+    done < plane.env
 }
 
 main(){
@@ -187,9 +202,11 @@ main(){
     update_env_file
 
     # load plane.env as exported variables
-    export $(grep -v '^#' plane.env | xargs)
+    load_env_file
 
     /usr/local/bin/supervisord -c /etc/supervisor/conf.d/supervisor.conf
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi

@@ -351,13 +351,14 @@ jobs:
           sed -i 's/${APP_RELEASE:-stable}/${APP_RELEASE:-'${REL_VERSION}'}/g' deployments/cli/community/docker-compose.yml
           # sed -i 's/APP_RELEASE=stable/APP_RELEASE='${REL_VERSION}'/g' deployments/cli/community/variables.env
 
-      - name: Validate Community Calendar Environment
+      - name: Validate Community Calendar Environments
         run: |
           compose_file=deployments/cli/community/docker-compose.yml
           defaults_file=deployments/cli/community/variables.env
           default_render=$(mktemp)
           sentinel_render=$(mktemp)
-          trap 'rm -f "$default_render" "$sentinel_render"' EXIT
+          aio_temp=$(mktemp -d)
+          trap 'rm -f "$default_render" "$sentinel_render"; rm -rf "$aio_temp"' EXIT
 
           env \
             -u GOOGLE_CALENDAR_CLIENT_ID \
@@ -408,8 +409,70 @@ jobs:
               "default",
           )
           validate(load_render(sys.argv[2]), {key: os.environ[key] for key in keys}, "sentinel")
-          print("Calendar environment contract is consistent across all backend services")
+          print("Compose Calendar environment contract is consistent across all backend services")
           PY
+
+          repo_root=$PWD
+          DIST_DIR="$aio_temp/dist" bash deployments/aio/community/build.sh --release calendar-validation
+          [ "$(grep '^GOOGLE_CALENDAR_CLIENT_ID=' "$aio_temp/dist/plane.env")" = "GOOGLE_CALENDAR_CLIENT_ID=" ] || { echo "AIO ships an invalid Calendar client ID default"; exit 1; }
+          [ "$(grep '^GOOGLE_CALENDAR_CLIENT_SECRET=' "$aio_temp/dist/plane.env")" = "GOOGLE_CALENDAR_CLIENT_SECRET=" ] || { echo "AIO ships an invalid Calendar client secret default"; exit 1; }
+          [ "$(grep '^GOOGLE_CALENDAR_IS_PROJECT_DEDICATED=' "$aio_temp/dist/plane.env")" = "GOOGLE_CALENDAR_IS_PROJECT_DEDICATED=0" ] || { echo "AIO ships an invalid Calendar isolation default"; exit 1; }
+          [ "$(grep '^GOOGLE_CALENDAR_RELEASED=' "$aio_temp/dist/plane.env")" = "GOOGLE_CALENDAR_RELEASED=0" ] || { echo "AIO ships an invalid Calendar release default"; exit 1; }
+          mkdir "$aio_temp/runtime"
+          cp "$aio_temp/dist/plane.env" "$aio_temp/runtime/plane.env"
+
+          export DOMAIN_NAME="calendar-aio.example.com"
+          export DATABASE_URL="postgresql://calendar-aio"
+          export REDIS_URL="redis://calendar-aio"
+          export AMQP_URL="amqp://calendar-aio"
+          export AWS_REGION="calendar-aio-region"
+          export AWS_ACCESS_KEY_ID="calendar-aio-access-key"
+          export AWS_SECRET_ACCESS_KEY="calendar-aio-storage-secret"
+          export AWS_S3_BUCKET_NAME="calendar-aio-bucket"
+          export SECRET_KEY="calendar-aio-django-secret"
+          export LIVE_SERVER_SECRET_KEY="calendar-aio-live-secret"
+          export GOOGLE_CALENDAR_CLIENT_ID="calendar-aio-client-id-${RANDOM}-${RANDOM}"
+          export GOOGLE_CALENDAR_CLIENT_SECRET="calendar-aio-client-secret-${RANDOM}-${RANDOM}"
+          export GOOGLE_CALENDAR_IS_PROJECT_DEDICATED="calendar-aio-isolation-${RANDOM}-${RANDOM}"
+          export GOOGLE_CALENDAR_RELEASED="calendar-aio-release-${RANDOM}-${RANDOM}"
+          echo "::add-mask::$GOOGLE_CALENDAR_CLIENT_SECRET"
+
+          expected_client_id=$GOOGLE_CALENDAR_CLIENT_ID
+          expected_client_secret=$GOOGLE_CALENDAR_CLIENT_SECRET
+          expected_isolation=$GOOGLE_CALENDAR_IS_PROJECT_DEDICATED
+          expected_release=$GOOGLE_CALENDAR_RELEASED
+
+          cd "$aio_temp/runtime"
+          source "$repo_root/deployments/aio/community/start.sh"
+          update_env_file
+          load_env_file
+
+          for process_name in api worker beat migrator; do
+            PROCESS_NAME="$process_name" \
+            EXPECTED_CLIENT_ID="$expected_client_id" \
+            EXPECTED_CLIENT_SECRET="$expected_client_secret" \
+            EXPECTED_ISOLATION="$expected_isolation" \
+            EXPECTED_RELEASE="$expected_release" \
+              bash -eu -c '
+                [ "$GOOGLE_CALENDAR_CLIENT_ID" = "$EXPECTED_CLIENT_ID" ] || { echo "$PROCESS_NAME has an invalid Calendar client ID"; exit 1; }
+                [ "$GOOGLE_CALENDAR_CLIENT_SECRET" = "$EXPECTED_CLIENT_SECRET" ] || { echo "$PROCESS_NAME has an invalid Calendar client secret"; exit 1; }
+                [ "$GOOGLE_CALENDAR_IS_PROJECT_DEDICATED" = "$EXPECTED_ISOLATION" ] || { echo "$PROCESS_NAME has an invalid Calendar isolation value"; exit 1; }
+                [ "$GOOGLE_CALENDAR_RELEASED" = "$EXPECTED_RELEASE" ] || { echo "$PROCESS_NAME has an invalid Calendar release value"; exit 1; }
+              '
+          done
+
+          unset GOOGLE_CALENDAR_CLIENT_ID
+          unset GOOGLE_CALENDAR_CLIENT_SECRET
+          unset GOOGLE_CALENDAR_IS_PROJECT_DEDICATED
+          unset GOOGLE_CALENDAR_RELEASED
+          update_env_file
+          load_env_file
+
+          [ "$GOOGLE_CALENDAR_CLIENT_ID" = "$expected_client_id" ] || { echo "AIO did not preserve the Calendar client ID"; exit 1; }
+          [ "$GOOGLE_CALENDAR_CLIENT_SECRET" = "$expected_client_secret" ] || { echo "AIO did not preserve the Calendar client secret"; exit 1; }
+          [ "$GOOGLE_CALENDAR_IS_PROJECT_DEDICATED" = "0" ] || { echo "AIO did not restore the default Calendar isolation value"; exit 1; }
+          [ "$GOOGLE_CALENDAR_RELEASED" = "0" ] || { echo "AIO did not restore the default Calendar release value"; exit 1; }
+          echo "AIO Calendar environment contract is consistent across all backend subprocesses"
 
       - name: Upload Assets
         uses: actions/upload-artifact@v7
