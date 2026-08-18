@@ -119,7 +119,12 @@ class TestGoogleCalendarConnectionMigration:
         assert attempt.status == GoogleCalendarConnection.Status.DISCONNECTED
         assert attempt.lifecycle_generation == 0
         assert not attempt.provider_account_id
+        assert not attempt.provider_email
+        assert not attempt.access_token
         assert not attempt.refresh_token
+        assert attempt.token_expires_at is None
+        assert attempt.scopes == []
+        assert not attempt.last_error
 
         broken = google_calendar_connection_scenario("bound_broken")
         assert broken.provider_account_id
@@ -134,8 +139,12 @@ class TestGoogleCalendarConnectionMigration:
         assert not tombstone.provider_email
         assert not tombstone.access_token
         assert not tombstone.refresh_token
+        assert tombstone.token_expires_at is None
+        assert tombstone.scopes == []
+        assert not tombstone.last_error
         assert not tombstone.oauth_state
         assert not tombstone.oauth_code_verifier
+        assert not tombstone.oauth_redirect_uri
         assert tombstone.oauth_attempt_expires_at is None
 
         pending_cleanup = GoogleCalendarConnectionFactory(pending_cleanup=True)
