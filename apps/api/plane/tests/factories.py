@@ -102,6 +102,7 @@ class IntegrationFactory(factory.django.DjangoModelFactory):
 
     class Meta:
         model = Integration
+        django_get_or_create = ("provider",)
 
     title = factory.Sequence(lambda n: f"Integration {n}")
     provider = factory.Sequence(lambda n: f"test_provider_{n}")
@@ -129,7 +130,7 @@ class GoogleCalendarConnectionFactory(factory.django.DjangoModelFactory):
     workspace_integration = factory.SubFactory(
         WorkspaceIntegrationFactory,
         integration__title="Google Calendar",
-        integration__provider=factory.Sequence(lambda n: f"google_calendar_test_{n}"),
+        integration__provider="google_calendar",
     )
     member = factory.SubFactory(UserFactory)
 

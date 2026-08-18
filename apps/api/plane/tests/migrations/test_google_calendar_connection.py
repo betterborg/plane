@@ -115,6 +115,11 @@ class TestGoogleCalendarConnectionMigration:
 
         attempt = google_calendar_connection_scenario("attempt_only")
         assert attempt.oauth_state
+        assert attempt.workspace_integration.integration.provider == "google_calendar"
+        assert GoogleCalendarConnection.objects.filter(
+            workspace_integration__integration__provider="google_calendar",
+            pk=attempt.pk,
+        ).exists()
         assert attempt.desired_state == GoogleCalendarConnection.DesiredState.DISCONNECTED
         assert attempt.status == GoogleCalendarConnection.Status.DISCONNECTED
         assert attempt.lifecycle_generation == 0
