@@ -33,6 +33,7 @@ from .user.base import (
 
 
 from .base import BaseAPIView, BaseViewSet
+from .integration import GoogleCalendarWorkspacePolicyEndpoint
 
 from .workspace.base import (
     WorkSpaceViewSet,

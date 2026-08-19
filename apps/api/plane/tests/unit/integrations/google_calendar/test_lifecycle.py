@@ -3,16 +3,19 @@
 # See the LICENSE file for details.
 
 from datetime import timedelta
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier, Event
 from unittest.mock import patch
 from uuid import UUID
 
 import pytest
-from django.db import transaction
+from django.db import close_old_connections, transaction
 from django.utils import timezone
 
 from plane.db.models import GoogleCalendarConnection
 from plane.integrations.google_calendar.lifecycle import (
     IllegalGoogleCalendarTransition,
+    GoogleCalendarDisableCleanupInProgress,
     StaleGoogleCalendarGeneration,
     UnusableGoogleCalendarGrant,
     _stable_advisory_lock_key,
@@ -24,6 +27,8 @@ from plane.integrations.google_calendar.lifecycle import (
     mark_google_calendar_connection_active,
     record_google_calendar_cleanup_error,
     request_google_calendar_disconnect,
+    request_google_calendar_workspace_policy_disable,
+    request_google_calendar_workspace_policy_enable,
     request_google_calendar_workspace_reconciliation,
 )
 from plane.tests.factories import GoogleCalendarConnectionFactory, WorkspaceIntegrationFactory
@@ -125,6 +130,16 @@ class TestUsableGoogleCalendarGrant:
         )
 
         assert has_usable_google_calendar_grant(calendar_connection, at=checked_at) is True
+
+    def test_retained_disconnected_refresh_token_is_a_usable_grant(self):
+        calendar_connection = GoogleCalendarConnectionFactory(
+            provider_account_id="google-account",
+            refresh_token="validated-refresh-token",
+            desired_state=GoogleCalendarConnection.DesiredState.DISCONNECTED,
+            status=GoogleCalendarConnection.Status.DISCONNECTED,
+        )
+
+        assert has_usable_google_calendar_grant(calendar_connection) is True
 
 
 @pytest.mark.unit
@@ -259,3 +274,171 @@ class TestGoogleCalendarLifecycleTransitions:
             assert calendar_connection.desired_state == GoogleCalendarConnection.DesiredState.CONNECTED
             assert calendar_connection.status == GoogleCalendarConnection.Status.PENDING
             assert calendar_connection.refresh_token
+
+    def test_policy_disable_cleanup_retains_grant_and_enable_advances_it(self):
+        workspace_integration = WorkspaceIntegrationFactory()
+        active = GoogleCalendarConnectionFactory(
+            workspace_integration=workspace_integration,
+            provider_account_id="google-account",
+            provider_email="member@example.com",
+            calendar_id="plane-calendar",
+            refresh_token="validated-refresh-token",
+            desired_state=GoogleCalendarConnection.DesiredState.CONNECTED,
+            status=GoogleCalendarConnection.Status.ACTIVE,
+            lifecycle_generation=3,
+        )
+        unusable = GoogleCalendarConnectionFactory(
+            workspace_integration=workspace_integration,
+            provider_account_id="tokenless-account",
+            desired_state=GoogleCalendarConnection.DesiredState.CONNECTED,
+            status=GoogleCalendarConnection.Status.ERROR,
+            lifecycle_generation=7,
+        )
+
+        with patch("plane.integrations.google_calendar.lifecycle._acquire_advisory_xact_lock"):
+            disable_commands = request_google_calendar_workspace_policy_disable(
+                workspace_integration.workspace_id
+            )
+
+            with pytest.raises(GoogleCalendarDisableCleanupInProgress):
+                request_google_calendar_workspace_policy_enable(workspace_integration.workspace_id)
+
+            active.refresh_from_db()
+            complete_google_calendar_disconnect(
+                active.id,
+                active.lifecycle_generation,
+                retain_grant=True,
+            )
+            enable_commands = request_google_calendar_workspace_policy_enable(
+                workspace_integration.workspace_id
+            )
+
+        active.refresh_from_db()
+        unusable.refresh_from_db()
+        assert {(command.connection_id, command.generation) for command in disable_commands} == {
+            (active.id, 4),
+            (unusable.id, 8),
+        }
+        assert [(command.connection_id, command.generation) for command in enable_commands] == [
+            (active.id, 5)
+        ]
+        assert active.desired_state == GoogleCalendarConnection.DesiredState.CONNECTED
+        assert active.status == GoogleCalendarConnection.Status.PENDING
+        assert active.calendar_id == ""
+        assert active.provider_account_id == "google-account"
+        assert active.refresh_token == "validated-refresh-token"
+        assert unusable.desired_state == GoogleCalendarConnection.DesiredState.DISCONNECTED
+        assert unusable.lifecycle_generation == 8
+
+
+@pytest.mark.unit
+@pytest.mark.django_db(transaction=True)
+class TestGoogleCalendarWorkspacePolicyRaces:
+    def test_reenable_waits_for_cleanup_then_advances_one_generation(self):
+        workspace_integration = WorkspaceIntegrationFactory()
+        calendar_connection = GoogleCalendarConnectionFactory(
+            workspace_integration=workspace_integration,
+            provider_account_id="google-account",
+            calendar_id="calendar-awaiting-delete",
+            refresh_token="validated-refresh-token",
+            desired_state=GoogleCalendarConnection.DesiredState.DISCONNECTED,
+            status=GoogleCalendarConnection.Status.CLEANUP_PENDING,
+            lifecycle_generation=4,
+        )
+        cleanup_locked = Barrier(2)
+        cleanup_can_finish = Event()
+        enable_started = Event()
+
+        def finish_cleanup():
+            close_old_connections()
+            try:
+                with transaction.atomic():
+                    locked_connection = lock_google_calendar_connection(calendar_connection.id)
+                    cleanup_locked.wait(timeout=5)
+                    assert cleanup_can_finish.wait(timeout=5)
+                    return complete_google_calendar_disconnect(
+                        locked_connection.id,
+                        locked_connection.lifecycle_generation,
+                        retain_grant=True,
+                    )
+            finally:
+                close_old_connections()
+
+        def reenable_workspace():
+            close_old_connections()
+            try:
+                cleanup_locked.wait(timeout=5)
+                enable_started.set()
+                return request_google_calendar_workspace_policy_enable(workspace_integration.workspace_id)
+            finally:
+                close_old_connections()
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            cleanup_future = executor.submit(finish_cleanup)
+            enable_future = executor.submit(reenable_workspace)
+            assert enable_started.wait(timeout=5)
+            assert enable_future.done() is False
+            cleanup_can_finish.set()
+            cleanup_future.result(timeout=5)
+            commands = enable_future.result(timeout=5)
+
+        calendar_connection.refresh_from_db()
+        assert [(command.connection_id, command.generation) for command in commands] == [
+            (calendar_connection.id, 5)
+        ]
+        assert calendar_connection.calendar_id == ""
+        assert calendar_connection.desired_state == GoogleCalendarConnection.DesiredState.CONNECTED
+        assert calendar_connection.status == GoogleCalendarConnection.Status.PENDING
+        assert calendar_connection.lifecycle_generation == 5
+
+    def test_reenable_waits_for_unfinished_cleanup_then_conflicts_without_mutation(self):
+        workspace_integration = WorkspaceIntegrationFactory()
+        calendar_connection = GoogleCalendarConnectionFactory(
+            workspace_integration=workspace_integration,
+            provider_account_id="google-account",
+            calendar_id="calendar-awaiting-delete",
+            refresh_token="validated-refresh-token",
+            desired_state=GoogleCalendarConnection.DesiredState.DISCONNECTED,
+            status=GoogleCalendarConnection.Status.CLEANUP_PENDING,
+            lifecycle_generation=4,
+        )
+        cleanup_locked = Barrier(2)
+        cleanup_can_finish = Event()
+        enable_started = Event()
+
+        def retain_unfinished_cleanup():
+            close_old_connections()
+            try:
+                with transaction.atomic():
+                    locked_connection = lock_google_calendar_connection(calendar_connection.id)
+                    cleanup_locked.wait(timeout=5)
+                    assert cleanup_can_finish.wait(timeout=5)
+                    locked_connection.last_error = "provider unavailable"
+                    locked_connection.save(update_fields=["last_error", "updated_at"])
+            finally:
+                close_old_connections()
+
+        def reenable_workspace():
+            close_old_connections()
+            try:
+                cleanup_locked.wait(timeout=5)
+                enable_started.set()
+                return request_google_calendar_workspace_policy_enable(workspace_integration.workspace_id)
+            finally:
+                close_old_connections()
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            cleanup_future = executor.submit(retain_unfinished_cleanup)
+            enable_future = executor.submit(reenable_workspace)
+            assert enable_started.wait(timeout=5)
+            assert enable_future.done() is False
+            cleanup_can_finish.set()
+            cleanup_future.result(timeout=5)
+            with pytest.raises(GoogleCalendarDisableCleanupInProgress):
+                enable_future.result(timeout=5)
+
+        calendar_connection.refresh_from_db()
+        assert calendar_connection.calendar_id == "calendar-awaiting-delete"
+        assert calendar_connection.desired_state == GoogleCalendarConnection.DesiredState.DISCONNECTED
+        assert calendar_connection.status == GoogleCalendarConnection.Status.CLEANUP_PENDING
+        assert calendar_connection.lifecycle_generation == 4

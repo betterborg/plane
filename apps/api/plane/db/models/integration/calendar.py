@@ -58,6 +58,7 @@ class GoogleCalendarConnection(BaseModel):
     # Provider binding. Tokens are transparently encrypted before persistence.
     provider_account_id = models.CharField(max_length=255, blank=True)
     provider_email = models.EmailField(blank=True)
+    calendar_id = models.CharField(max_length=255, blank=True)
     access_token = EncryptedTextField(blank=True)
     refresh_token = EncryptedTextField(blank=True)
     token_expires_at = models.DateTimeField(null=True, blank=True)
