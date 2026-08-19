@@ -19,6 +19,7 @@ from plane.integrations.google_calendar.oauth import (
 
 GOOGLE_CALENDAR_API_URL = "https://www.googleapis.com/calendar/v3"
 GOOGLE_CALENDAR_SUMMARY = "Plane"
+GOOGLE_CALENDAR_OPERATION_DESCRIPTION_PREFIX = "Plane calendar operation:"
 GOOGLE_CALENDAR_TOKEN_EXPIRY_SKEW = timedelta(seconds=60)
 
 
@@ -111,10 +112,50 @@ class GoogleCalendarClient:
         except requests.RequestException as exc:
             raise GoogleCalendarClientError("Google Calendar provider request failed") from exc
 
-    def create_calendar(self):
+    @staticmethod
+    def _operation_description(operation_id):
+        return f"{GOOGLE_CALENDAR_OPERATION_DESCRIPTION_PREFIX} {operation_id}"
+
+    def find_calendar(self, operation_id):
+        """Find the app-created calendar carrying one durable operation marker."""
+
+        page_token = None
+        operation_description = self._operation_description(operation_id)
+        while True:
+            params = {"maxResults": 250, "minAccessRole": "owner"}
+            if page_token:
+                params["pageToken"] = page_token
+            response = self._calendar_request("get", "/users/me/calendarList", params=params)
+            try:
+                response.raise_for_status()
+                payload = response.json()
+                if not isinstance(payload, dict):
+                    raise ValueError("Calendar list response is not an object")
+                items = payload.get("items", [])
+                if not isinstance(items, list):
+                    raise ValueError("Calendar list response omitted a valid item list")
+                for item in items:
+                    if not isinstance(item, dict) or item.get("description") != operation_description:
+                        continue
+                    calendar_id = item.get("id", "")
+                    if not isinstance(calendar_id, str) or not calendar_id or len(calendar_id) > 255:
+                        raise ValueError("Calendar list response contained an invalid ID")
+                    return calendar_id
+                page_token = payload.get("nextPageToken")
+                if page_token is None:
+                    return None
+                if not isinstance(page_token, str) or not page_token:
+                    raise ValueError("Calendar list response contained an invalid page token")
+            except (requests.RequestException, TypeError, ValueError) as exc:
+                raise GoogleCalendarClientError("Google Calendar recovery lookup failed") from exc
+
+    def create_calendar(self, operation_id=None):
         """Create one dedicated app-owned calendar and return its provider ID."""
 
-        response = self._calendar_request("post", "/calendars", json={"summary": GOOGLE_CALENDAR_SUMMARY})
+        payload = {"summary": GOOGLE_CALENDAR_SUMMARY}
+        if operation_id is not None:
+            payload["description"] = self._operation_description(operation_id)
+        response = self._calendar_request("post", "/calendars", json=payload)
         try:
             response.raise_for_status()
             payload = response.json()

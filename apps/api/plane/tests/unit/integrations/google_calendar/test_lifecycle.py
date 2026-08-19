@@ -330,6 +330,28 @@ class TestGoogleCalendarLifecycleTransitions:
         assert unusable.desired_state == GoogleCalendarConnection.DesiredState.DISCONNECTED
         assert unusable.lifecycle_generation == 8
 
+    def test_policy_enable_is_blocked_by_an_unresolved_calendar_operation(self):
+        workspace_integration = WorkspaceIntegrationFactory()
+        calendar_connection = GoogleCalendarConnectionFactory(
+            workspace_integration=workspace_integration,
+            provider_account_id="google-account",
+            refresh_token="validated-refresh-token",
+            calendar_operation_id=UUID("12345678-1234-5678-1234-567812345678"),
+            desired_state=GoogleCalendarConnection.DesiredState.DISCONNECTED,
+            status=GoogleCalendarConnection.Status.CLEANUP_PENDING,
+            lifecycle_generation=4,
+        )
+
+        with (
+            patch("plane.integrations.google_calendar.lifecycle._acquire_advisory_xact_lock"),
+            pytest.raises(GoogleCalendarDisableCleanupInProgress),
+        ):
+            request_google_calendar_workspace_policy_enable(workspace_integration.workspace_id)
+
+        calendar_connection.refresh_from_db()
+        assert calendar_connection.lifecycle_generation == 4
+        assert calendar_connection.calendar_operation_id is not None
+
 
 @pytest.mark.unit
 @pytest.mark.django_db(transaction=True)

@@ -340,7 +340,7 @@ def request_google_calendar_workspace_policy_enable(workspace_id):
     calendar_connections = lock_google_calendar_workspace_connections(workspace_id)
     if any(
         calendar_connection.desired_state == GoogleCalendarConnection.DesiredState.DISCONNECTED
-        and calendar_connection.calendar_id
+        and (calendar_connection.calendar_id or calendar_connection.calendar_operation_id is not None)
         for calendar_connection in calendar_connections
     ):
         raise GoogleCalendarDisableCleanupInProgress(

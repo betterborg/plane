@@ -27,6 +27,7 @@ from plane.integrations.google_calendar.lifecycle import (
     request_google_calendar_disconnect,
 )
 from plane.integrations.google_calendar.oauth import (
+    GOOGLE_CALENDAR_LIST_SCOPE,
     GOOGLE_CALENDAR_SCOPE,
     GoogleCalendarOAuthCredentials,
     GoogleCalendarOAuthExchangeError,
@@ -62,7 +63,7 @@ def complete_grant():
         access_token="new-access-token",
         refresh_token="new-refresh-token",
         token_expires_at=timezone.now() + timedelta(hours=1),
-        scopes=frozenset({"openid", "email", GOOGLE_CALENDAR_SCOPE}),
+        scopes=frozenset({"openid", "email", GOOGLE_CALENDAR_SCOPE, GOOGLE_CALENDAR_LIST_SCOPE}),
     )
 
 
@@ -170,7 +171,12 @@ class TestGoogleCalendarOAuth:
         assert second_response.status_code == status.HTTP_302_FOUND
         assert first_state != second_state
         query = parse_qs(urlparse(second_response.url).query)
-        assert set(query["scope"][0].split()) == {"openid", "email", GOOGLE_CALENDAR_SCOPE}
+        assert set(query["scope"][0].split()) == {
+            "openid",
+            "email",
+            GOOGLE_CALENDAR_SCOPE,
+            GOOGLE_CALENDAR_LIST_SCOPE,
+        }
         assert query["access_type"] == ["offline"]
         assert query["prompt"] == ["consent"]
         assert query["code_challenge_method"] == ["S256"]

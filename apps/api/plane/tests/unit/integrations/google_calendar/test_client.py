@@ -4,6 +4,7 @@
 
 from datetime import timedelta
 from unittest.mock import Mock, patch
+from uuid import UUID
 
 import pytest
 import requests
@@ -35,6 +36,55 @@ class TestGoogleCalendarClient:
             timeout=10,
             json={"summary": "Plane"},
         )
+
+    def test_create_records_the_durable_operation_marker(self):
+        response = Mock(status_code=200)
+        response.json.return_value = {"id": "plane-calendar@example.com"}
+        client = GoogleCalendarClient(
+            access_token="access-token",
+            token_expires_at=timezone.now() + timedelta(hours=1),
+        )
+        operation_id = UUID("12345678-1234-5678-1234-567812345678")
+
+        with patch("plane.integrations.google_calendar.client.requests.request", return_value=response) as request:
+            client.create_calendar(operation_id)
+
+        assert request.call_args.kwargs["json"] == {
+            "summary": "Plane",
+            "description": "Plane calendar operation: 12345678-1234-5678-1234-567812345678",
+        }
+
+    def test_find_calendar_paginates_to_recover_a_completed_creation(self):
+        first_response = Mock(status_code=200)
+        first_response.json.return_value = {"items": [], "nextPageToken": "next-page"}
+        second_response = Mock(status_code=200)
+        second_response.json.return_value = {
+            "items": [
+                {
+                    "id": "recovered-calendar@example.com",
+                    "description": "Plane calendar operation: 12345678-1234-5678-1234-567812345678",
+                }
+            ]
+        }
+        client = GoogleCalendarClient(
+            access_token="access-token",
+            token_expires_at=timezone.now() + timedelta(hours=1),
+        )
+
+        with patch(
+            "plane.integrations.google_calendar.client.requests.request",
+            side_effect=[first_response, second_response],
+        ) as request:
+            calendar_id = client.find_calendar(UUID("12345678-1234-5678-1234-567812345678"))
+
+        assert calendar_id == "recovered-calendar@example.com"
+        assert request.call_count == 2
+        assert request.call_args_list[0].kwargs["params"] == {"maxResults": 250, "minAccessRole": "owner"}
+        assert request.call_args_list[1].kwargs["params"] == {
+            "maxResults": 250,
+            "minAccessRole": "owner",
+            "pageToken": "next-page",
+        }
 
     def test_delete_targets_only_the_recorded_encoded_calendar_id(self):
         response = Mock(status_code=204)

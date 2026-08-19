@@ -59,6 +59,7 @@ class GoogleCalendarConnection(BaseModel):
     provider_account_id = models.CharField(max_length=255, blank=True)
     provider_email = models.EmailField(blank=True)
     calendar_id = models.CharField(max_length=255, blank=True)
+    calendar_operation_id = models.UUIDField(null=True, blank=True)
     access_token = EncryptedTextField(blank=True)
     refresh_token = EncryptedTextField(blank=True)
     token_expires_at = models.DateTimeField(null=True, blank=True)

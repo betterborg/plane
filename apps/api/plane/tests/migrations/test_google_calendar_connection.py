@@ -13,7 +13,7 @@ from plane.tests.factories import (
 
 
 MIGRATE_FROM = ("db", "0122_alter_draftissue_assignees_alter_issue_assignees_and_more")
-MIGRATE_TO = ("db", "0124_google_calendar_connection_calendar_id")
+MIGRATE_TO = ("db", "0125_google_calendar_operation_id")
 
 
 def migrate_to(executor, target):
@@ -88,6 +88,7 @@ class TestGoogleCalendarConnectionMigration:
         assert connection_row.lifecycle_generation == 0
         assert connection_row.oauth_state == "attempt-state"
         assert connection_row.calendar_id == "plane-calendar"
+        assert connection_row.calendar_operation_id is None
 
         table = CalendarConnection._meta.db_table
         with connection.cursor() as cursor:

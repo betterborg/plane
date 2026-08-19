@@ -5,6 +5,7 @@
 from concurrent.futures import ThreadPoolExecutor
 from threading import Event
 from unittest.mock import Mock, call, patch
+from uuid import UUID
 
 import pytest
 from django.db import close_old_connections, transaction
@@ -19,12 +20,14 @@ from plane.integrations.google_calendar.lifecycle import (
     request_google_calendar_disconnect,
     request_google_calendar_workspace_policy_enable,
 )
+from plane.integrations.google_calendar.oauth import GOOGLE_CALENDAR_SCOPES
 from plane.tests.factories import GoogleCalendarConnectionFactory, WorkspaceIntegrationFactory
 
 
 def _provider_client():
     client = Mock()
     client.access_token = None
+    client.find_calendar.return_value = None
     client.create_calendar.return_value = "new-plane-calendar"
     return client
 
@@ -72,7 +75,80 @@ class TestGoogleCalendarConvergenceTask:
         assert delayed_result == "stale"
         assert connection.calendar_id == "new-plane-calendar"
         assert connection.status == GoogleCalendarConnection.Status.ACTIVE
-        client.create_calendar.assert_called_once_with()
+        client.find_calendar.assert_called_once()
+        client.create_calendar.assert_called_once_with(client.find_calendar.call_args.args[0])
+
+    def test_present_generation_recovers_creation_after_result_commit_failure(self):
+        connection = GoogleCalendarConnectionFactory(
+            provider_account_id="google-account",
+            refresh_token="refresh-token",
+            desired_state=GoogleCalendarConnection.DesiredState.CONNECTED,
+            status=GoogleCalendarConnection.Status.PENDING,
+            lifecycle_generation=3,
+        )
+        first_client = _provider_client()
+        recovered_client = _provider_client()
+        recovered_client.find_calendar.return_value = "new-plane-calendar"
+
+        with (
+            patch("plane.integrations.google_calendar.lifecycle._acquire_advisory_xact_lock"),
+            patch("plane.bgtasks.google_calendar_task.GoogleCalendarClient", return_value=first_client),
+            patch(
+                "plane.bgtasks.google_calendar_task.mark_google_calendar_connection_active",
+                side_effect=RuntimeError("result commit failed"),
+            ),
+            pytest.raises(RuntimeError, match="result commit failed"),
+        ):
+            reconcile_google_calendar_connection(str(connection.id), 3)
+
+        connection.refresh_from_db()
+        operation_id = connection.calendar_operation_id
+        assert operation_id is not None
+        assert connection.calendar_id == ""
+        assert connection.status == GoogleCalendarConnection.Status.PENDING
+
+        with (
+            patch("plane.integrations.google_calendar.lifecycle._acquire_advisory_xact_lock"),
+            patch("plane.bgtasks.google_calendar_task.GoogleCalendarClient", return_value=recovered_client),
+        ):
+            result = reconcile_google_calendar_connection(str(connection.id), 3)
+
+        connection.refresh_from_db()
+        assert result == "active"
+        first_client.find_calendar.assert_called_once_with(operation_id)
+        first_client.create_calendar.assert_called_once_with(operation_id)
+        recovered_client.find_calendar.assert_called_once_with(operation_id)
+        recovered_client.create_calendar.assert_not_called()
+        assert connection.calendar_id == "new-plane-calendar"
+        assert connection.calendar_operation_id is None
+
+    def test_disable_recovers_and_deletes_an_unrecorded_created_calendar(self):
+        workspace_integration = WorkspaceIntegrationFactory(config={"enabled": False})
+        operation_id = UUID("12345678-1234-5678-1234-567812345678")
+        connection = GoogleCalendarConnectionFactory(
+            workspace_integration=workspace_integration,
+            provider_account_id="google-account",
+            refresh_token="refresh-token",
+            calendar_operation_id=operation_id,
+            desired_state=GoogleCalendarConnection.DesiredState.DISCONNECTED,
+            status=GoogleCalendarConnection.Status.CLEANUP_PENDING,
+            lifecycle_generation=4,
+        )
+        client = _provider_client()
+        client.find_calendar.return_value = "created-before-crash"
+
+        with (
+            patch("plane.integrations.google_calendar.lifecycle._acquire_advisory_xact_lock"),
+            patch("plane.bgtasks.google_calendar_task.GoogleCalendarClient", return_value=client),
+        ):
+            result = reconcile_google_calendar_connection(str(connection.id), 4)
+
+        connection.refresh_from_db()
+        assert result == "disabled"
+        client.find_calendar.assert_called_once_with(operation_id)
+        client.delete_calendar.assert_called_once_with("created-before-crash")
+        assert connection.calendar_id == ""
+        assert connection.calendar_operation_id is None
 
     def test_disable_deletes_calendar_but_retains_grant_for_reenable(self):
         workspace_integration = WorkspaceIntegrationFactory(config={"enabled": False})
@@ -105,7 +181,7 @@ class TestGoogleCalendarConvergenceTask:
         connection.refresh_from_db()
         delete_client.delete_calendar.assert_called_once_with("old-plane-calendar")
         delete_client.revoke_grant.assert_not_called()
-        create_client.create_calendar.assert_called_once_with()
+        create_client.create_calendar.assert_called_once()
         assert connection.provider_account_id == "google-account"
         assert connection.refresh_token == "refresh-token"
         assert connection.calendar_id == "new-plane-calendar"
@@ -146,6 +222,91 @@ class TestGoogleCalendarConvergenceTask:
         assert connection.refresh_token == ""
         assert connection.oauth_state == ""
         assert connection.status == GoogleCalendarConnection.Status.DISCONNECTED
+
+    def test_terminal_cleanup_commits_delete_before_attempting_revocation(self):
+        workspace_integration = WorkspaceIntegrationFactory(config={"enabled": True})
+        connection = GoogleCalendarConnectionFactory(
+            workspace_integration=workspace_integration,
+            provider_account_id="old-google-account",
+            calendar_id="old-plane-calendar",
+            refresh_token="refresh-token",
+            desired_state=GoogleCalendarConnection.DesiredState.DISCONNECTED,
+            status=GoogleCalendarConnection.Status.CLEANUP_PENDING,
+            lifecycle_generation=7,
+        )
+        delete_client = _provider_client()
+
+        with (
+            patch("plane.integrations.google_calendar.lifecycle._acquire_advisory_xact_lock"),
+            patch("plane.bgtasks.google_calendar_task.GoogleCalendarClient", return_value=delete_client),
+            patch(
+                "plane.bgtasks.google_calendar_task._complete_absent",
+                side_effect=RuntimeError("worker stopped before revoke"),
+            ),
+            pytest.raises(RuntimeError, match="worker stopped before revoke"),
+        ):
+            reconcile_google_calendar_connection(str(connection.id), 7)
+
+        connection.refresh_from_db()
+        assert connection.calendar_id == ""
+        assert connection.refresh_token == "refresh-token"
+        assert connection.status == GoogleCalendarConnection.Status.CLEANUP_PENDING
+        delete_client.delete_calendar.assert_called_once_with("old-plane-calendar")
+        delete_client.revoke_grant.assert_not_called()
+
+        revoke_client = _provider_client()
+        with (
+            patch("plane.integrations.google_calendar.lifecycle._acquire_advisory_xact_lock"),
+            patch("plane.bgtasks.google_calendar_task.GoogleCalendarClient", return_value=revoke_client),
+        ):
+            result = reconcile_google_calendar_connection(str(connection.id), 7)
+
+        connection.refresh_from_db()
+        assert result == "disconnected"
+        revoke_client.delete_calendar.assert_not_called()
+        revoke_client.revoke_grant.assert_called_once_with()
+        assert connection.refresh_token == ""
+        assert connection.status == GoogleCalendarConnection.Status.DISCONNECTED
+
+    def test_terminal_cleanup_retries_idempotent_revoke_after_result_commit_failure(self):
+        workspace_integration = WorkspaceIntegrationFactory(config={"enabled": True})
+        connection = GoogleCalendarConnectionFactory(
+            workspace_integration=workspace_integration,
+            provider_account_id="old-google-account",
+            refresh_token="refresh-token",
+            desired_state=GoogleCalendarConnection.DesiredState.DISCONNECTED,
+            status=GoogleCalendarConnection.Status.CLEANUP_PENDING,
+            lifecycle_generation=7,
+        )
+        first_client = _provider_client()
+
+        with (
+            patch("plane.integrations.google_calendar.lifecycle._acquire_advisory_xact_lock"),
+            patch("plane.bgtasks.google_calendar_task.GoogleCalendarClient", return_value=first_client),
+            patch(
+                "plane.bgtasks.google_calendar_task.complete_google_calendar_disconnect",
+                side_effect=RuntimeError("result commit failed"),
+            ),
+            pytest.raises(RuntimeError, match="result commit failed"),
+        ):
+            reconcile_google_calendar_connection(str(connection.id), 7)
+
+        connection.refresh_from_db()
+        assert connection.refresh_token == "refresh-token"
+        assert connection.status == GoogleCalendarConnection.Status.CLEANUP_PENDING
+        first_client.revoke_grant.assert_called_once_with()
+
+        retry_client = _provider_client()
+        with (
+            patch("plane.integrations.google_calendar.lifecycle._acquire_advisory_xact_lock"),
+            patch("plane.bgtasks.google_calendar_task.GoogleCalendarClient", return_value=retry_client),
+        ):
+            result = reconcile_google_calendar_connection(str(connection.id), 7)
+
+        connection.refresh_from_db()
+        assert result == "disconnected"
+        retry_client.revoke_grant.assert_called_once_with()
+        assert connection.refresh_token == ""
 
     def test_calendar_delete_failure_keeps_old_account_cleanup_nonterminal(self):
         workspace_integration = WorkspaceIntegrationFactory(config={"enabled": True})
@@ -195,20 +356,15 @@ class TestGoogleCalendarConvergenceTask:
             status=GoogleCalendarConnection.Status.CLEANUP_PENDING,
             lifecycle_generation=5,
         )
-        first_client = _provider_client()
         second_client = _provider_client()
 
         with (
             patch("plane.integrations.google_calendar.lifecycle._acquire_advisory_xact_lock"),
-            patch(
-                "plane.bgtasks.google_calendar_task.GoogleCalendarClient",
-                side_effect=[first_client, second_client],
-            ),
+            patch("plane.bgtasks.google_calendar_task.GoogleCalendarClient", return_value=second_client),
         ):
             reconcile_google_calendar_connection(str(first.id), 2)
             reconcile_google_calendar_connection(str(second.id), 5)
 
-        first_client.revoke_grant.assert_not_called()
         second_client.revoke_grant.assert_called_once_with()
 
     def test_same_account_callback_commits_before_final_revoke_accounting(self):
@@ -291,13 +447,14 @@ class TestGoogleCalendarConvergenceTask:
             lifecycle_generation=8,
         )
         delete_client = _provider_client()
+        revoke_client = _provider_client()
         create_client = _provider_client()
 
         with (
             patch("plane.integrations.google_calendar.lifecycle._acquire_advisory_xact_lock"),
             patch(
                 "plane.bgtasks.google_calendar_task.GoogleCalendarClient",
-                side_effect=[delete_client, create_client],
+                side_effect=[delete_client, revoke_client, create_client],
             ),
         ):
             disconnect = request_google_calendar_disconnect(connection.id, 8)
@@ -310,13 +467,14 @@ class TestGoogleCalendarConvergenceTask:
                 provider_account_id="new-google-account",
                 provider_email="new@example.com",
                 refresh_token="new-refresh-token",
-                scopes=["https://www.googleapis.com/auth/calendar.app.created"],
+                scopes=GOOGLE_CALENDAR_SCOPES,
             )
             reconcile_google_calendar_connection(str(connection.id), oauth.generation)
 
         connection.refresh_from_db()
         delete_client.delete_calendar.assert_called_once_with("old-plane-calendar")
-        create_client.create_calendar.assert_called_once_with()
+        revoke_client.revoke_grant.assert_called_once_with()
+        create_client.create_calendar.assert_called_once()
         assert connection.provider_account_id == "new-google-account"
         assert connection.calendar_id == "new-plane-calendar"
         assert connection.status == GoogleCalendarConnection.Status.ACTIVE
