@@ -127,6 +127,32 @@ class TestGoogleCalendarOAuth:
         assert not GoogleCalendarConnection.objects.exists()
 
     @pytest.mark.django_db
+    def test_nonterminal_cleanup_blocks_a_fresh_account_start(
+        self,
+        session_client,
+        workspace,
+        calendar_workspace_integration,
+        oauth_credentials,
+        create_user,
+    ):
+        GoogleCalendarConnectionFactory(
+            workspace_integration=calendar_workspace_integration,
+            member=create_user,
+            provider_account_id="old-google-account",
+            calendar_id="old-plane-calendar",
+            refresh_token="old-refresh-token",
+            desired_state=GoogleCalendarConnection.DesiredState.DISCONNECTED,
+            status=GoogleCalendarConnection.Status.CLEANUP_PENDING,
+            lifecycle_generation=6,
+            last_error="Google Calendar deletion failed",
+        )
+
+        response = _start_consent(session_client, workspace, oauth_credentials)
+
+        assert response.status_code == status.HTTP_409_CONFLICT
+        assert response.data == {"error": "google_calendar_disconnect_in_progress"}
+
+    @pytest.mark.django_db
     def test_start_constructs_exact_offline_pkce_consent_and_one_bounded_attempt(
         self,
         session_client,
