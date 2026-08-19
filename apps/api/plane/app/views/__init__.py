@@ -34,6 +34,7 @@ from .user.base import (
 
 from .base import BaseAPIView, BaseViewSet
 from .integration import GoogleCalendarWorkspacePolicyEndpoint
+from .google_calendar_oauth import GoogleCalendarOAuthStartEndpoint
 
 from .workspace.base import (
     WorkSpaceViewSet,

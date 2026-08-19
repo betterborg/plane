@@ -2,8 +2,6 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # See the LICENSE file for details.
 
-import os
-
 from celery import current_app
 from django.conf import settings
 from django.db import transaction
@@ -15,7 +13,10 @@ from plane.app.permissions import WorkspaceOwnerPermission
 from plane.app.serializers import GoogleCalendarWorkspacePolicySerializer
 from plane.app.views.base import BaseAPIView
 from plane.db.models import Integration, Workspace, WorkspaceIntegration
-from plane.integrations.google_calendar.dispatch import enqueue_google_calendar_task_on_commit
+from plane.integrations.google_calendar.dispatch import (
+    GOOGLE_CALENDAR_LIFECYCLE_TASK,
+    enqueue_google_calendar_task_on_commit,
+)
 from plane.integrations.google_calendar.lifecycle import (
     GoogleCalendarDisableCleanupInProgress,
     lock_google_calendar_workspace_connections,
@@ -23,27 +24,18 @@ from plane.integrations.google_calendar.lifecycle import (
     request_google_calendar_workspace_policy_enable,
     request_google_calendar_workspace_reconciliation,
 )
-from plane.license.utils.instance_value import get_configuration_value
-
-
-GOOGLE_CALENDAR_LIFECYCLE_TASK = "plane.bgtasks.google_calendar_task.reconcile_google_calendar_connection"
+from plane.integrations.google_calendar.oauth import (
+    GoogleCalendarOAuthConfigurationError,
+    get_google_calendar_oauth_credentials,
+)
 
 
 def _has_complete_google_calendar_credentials():
-    client_id, client_secret, project_is_dedicated = get_configuration_value(
-        [
-            {"key": "GOOGLE_CALENDAR_CLIENT_ID", "default": os.environ.get("GOOGLE_CALENDAR_CLIENT_ID", "")},
-            {
-                "key": "GOOGLE_CALENDAR_CLIENT_SECRET",
-                "default": os.environ.get("GOOGLE_CALENDAR_CLIENT_SECRET", ""),
-            },
-            {
-                "key": "GOOGLE_CALENDAR_IS_PROJECT_DEDICATED",
-                "default": os.environ.get("GOOGLE_CALENDAR_IS_PROJECT_DEDICATED", "0"),
-            },
-        ]
-    )
-    return bool(client_id) and bool(client_secret) and project_is_dedicated == "1"
+    try:
+        get_google_calendar_oauth_credentials()
+    except GoogleCalendarOAuthConfigurationError:
+        return False
+    return True
 
 
 class GoogleCalendarWorkspacePolicyEndpoint(BaseAPIView):

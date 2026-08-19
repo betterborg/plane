@@ -214,7 +214,9 @@ def _transition(connection, expected_generation, desired_state, status, *, advan
     return connection
 
 
-def _clear_oauth_attempt(connection):
+def clear_google_calendar_oauth_attempt(connection):
+    """Clear only short-lived consent-attempt metadata on a locked connection."""
+
     connection.oauth_state = ""
     connection.oauth_code_verifier = ""
     connection.oauth_redirect_uri = ""
@@ -287,7 +289,7 @@ def apply_google_calendar_oauth_success(
     calendar_connection.desired_state, calendar_connection.status = oauth_success_state
     calendar_connection.lifecycle_generation = expected_generation + 1
     calendar_connection.last_error = ""
-    _clear_oauth_attempt(calendar_connection)
+    clear_google_calendar_oauth_attempt(calendar_connection)
     calendar_connection.save(
         update_fields=[
             *_PROVIDER_FIELDS,
@@ -381,7 +383,7 @@ def request_google_calendar_workspace_policy_disable(workspace_id):
             GoogleCalendarConnection.Status.CLEANUP_PENDING,
             advance_generation=True,
         )
-        _clear_oauth_attempt(calendar_connection)
+        clear_google_calendar_oauth_attempt(calendar_connection)
         calendar_connection.last_error = ""
         calendar_connection.save(update_fields=[*_OAUTH_ATTEMPT_FIELDS, "last_error", "updated_at"])
         commands.append(
@@ -400,7 +402,7 @@ def request_google_calendar_disconnect(connection_id, expected_generation):
         calendar_connection.desired_state == GoogleCalendarConnection.DesiredState.DISCONNECTED
         and calendar_connection.status == GoogleCalendarConnection.Status.DISCONNECTED
     ):
-        _clear_oauth_attempt(calendar_connection)
+        clear_google_calendar_oauth_attempt(calendar_connection)
         calendar_connection.last_error = ""
         calendar_connection.save(update_fields=[*_OAUTH_ATTEMPT_FIELDS, "last_error", "updated_at"])
         return None
@@ -411,7 +413,7 @@ def request_google_calendar_disconnect(connection_id, expected_generation):
         GoogleCalendarConnection.Status.CLEANUP_PENDING,
         advance_generation=True,
     )
-    _clear_oauth_attempt(calendar_connection)
+    clear_google_calendar_oauth_attempt(calendar_connection)
     calendar_connection.last_error = ""
     calendar_connection.save(update_fields=[*_OAUTH_ATTEMPT_FIELDS, "last_error", "updated_at"])
     return GoogleCalendarLifecycleCommand(calendar_connection.id, calendar_connection.lifecycle_generation)
@@ -479,7 +481,7 @@ def complete_google_calendar_disconnect(connection_id, expected_generation, *, r
     calendar_connection.calendar_id = ""
     if not retain_grant:
         _clear_provider_grant(calendar_connection)
-    _clear_oauth_attempt(calendar_connection)
+    clear_google_calendar_oauth_attempt(calendar_connection)
     calendar_connection.last_error = ""
     calendar_connection.save(
         update_fields=["calendar_id", *_PROVIDER_FIELDS, *_OAUTH_ATTEMPT_FIELDS, "last_error", "updated_at"]
