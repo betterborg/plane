@@ -61,7 +61,8 @@ class GoogleCalendarWorkspacePolicyEndpoint(BaseAPIView):
         if not settings.GOOGLE_CALENDAR_RELEASED:
             return Response({"error": "Not found"}, status=status.HTTP_404_NOT_FOUND)
 
-        serializer = GoogleCalendarWorkspacePolicySerializer(data=request.data)
+        workspace = Workspace.objects.get(slug=slug)
+        serializer = GoogleCalendarWorkspacePolicySerializer(data=request.data, context={"workspace": workspace})
         serializer.is_valid(raise_exception=True)
         policy = dict(serializer.validated_data)
         if policy["enabled"] and not _has_complete_google_calendar_credentials():
@@ -74,7 +75,6 @@ class GoogleCalendarWorkspacePolicyEndpoint(BaseAPIView):
         if integration is None:
             return Response({"error": "Not found"}, status=status.HTTP_404_NOT_FOUND)
 
-        workspace = Workspace.objects.get(slug=slug)
         workspace_integration, _ = WorkspaceIntegration.objects.get_or_create(
             workspace=workspace,
             integration=integration,

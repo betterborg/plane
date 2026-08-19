@@ -4,6 +4,8 @@
 
 from rest_framework import serializers
 
+from plane.db.models import Issue, Label
+
 
 class GoogleCalendarWorkspacePolicySerializer(serializers.Serializer):
     """Validate the complete workspace-level Google Calendar policy."""
@@ -11,9 +13,23 @@ class GoogleCalendarWorkspacePolicySerializer(serializers.Serializer):
     enabled = serializers.BooleanField()
     mode = serializers.ChoiceField(choices=("assignment", "filter"), default="assignment")
     update_on_completion = serializers.BooleanField(default=True)
-    recipients = serializers.CharField(default="cycle_members", allow_blank=False)
+    recipients = serializers.ChoiceField(choices=("cycle_members",), default="cycle_members")
     label_id = serializers.UUIDField(required=False, allow_null=True, default=None)
-    priority = serializers.CharField(required=False, allow_null=True, allow_blank=True, default=None)
+    priority = serializers.ChoiceField(
+        choices=Issue.PRIORITY_CHOICES,
+        required=False,
+        allow_null=True,
+        default=None,
+    )
+
+    def validate_label_id(self, value):
+        if value is None:
+            return value
+
+        workspace = self.context["workspace"]
+        if not Label.objects.filter(id=value, workspace=workspace).exists():
+            raise serializers.ValidationError("Label does not belong to this workspace")
+        return value
 
     def validate(self, attrs):
         if attrs["mode"] == "filter" and not (attrs.get("label_id") or attrs.get("priority")):

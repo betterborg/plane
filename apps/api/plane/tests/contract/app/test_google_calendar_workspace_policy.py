@@ -3,16 +3,18 @@
 # See the LICENSE file for details.
 
 from unittest.mock import Mock, patch
+from uuid import uuid4
 
 import pytest
 from django.test import override_settings
 from django.urls import reverse
 from rest_framework import status
 
-from plane.db.models import GoogleCalendarConnection, WorkspaceIntegration, WorkspaceMember
+from plane.db.models import GoogleCalendarConnection, Label, WorkspaceIntegration, WorkspaceMember
 from plane.tests.factories import (
     GoogleCalendarConnectionFactory,
     IntegrationFactory,
+    WorkspaceFactory,
     WorkspaceIntegrationFactory,
 )
 
@@ -85,6 +87,89 @@ class TestGoogleCalendarWorkspacePolicy:
 
         assert response.status_code == status.HTTP_400_BAD_REQUEST
         assert "non_field_errors" in response.data
+
+    @pytest.mark.django_db
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        (
+            ("priority", "critical"),
+            ("recipients", "workspace_members"),
+        ),
+    )
+    def test_policy_rejects_unsupported_choice(
+        self,
+        session_client,
+        workspace,
+        calendar_integration,
+        field,
+        value,
+    ):
+        with override_settings(GOOGLE_CALENDAR_RELEASED=True):
+            response = session_client.patch(
+                _policy_url(workspace),
+                {"enabled": False, field: value},
+                format="json",
+            )
+
+        assert response.status_code == status.HTTP_400_BAD_REQUEST
+        assert field in response.data
+        assert not WorkspaceIntegration.objects.filter(
+            workspace=workspace,
+            integration=calendar_integration,
+        ).exists()
+
+    @pytest.mark.django_db
+    @pytest.mark.parametrize("label_workspace", ("missing", "foreign"))
+    def test_policy_rejects_label_outside_workspace(
+        self,
+        session_client,
+        workspace,
+        calendar_integration,
+        label_workspace,
+    ):
+        label_id = uuid4()
+        if label_workspace == "foreign":
+            foreign_workspace = WorkspaceFactory()
+            label_id = Label.objects.create(name="Foreign Calendar Label", workspace=foreign_workspace).id
+
+        with override_settings(GOOGLE_CALENDAR_RELEASED=True):
+            response = session_client.patch(
+                _policy_url(workspace),
+                {"enabled": False, "mode": "filter", "label_id": label_id},
+                format="json",
+            )
+
+        assert response.status_code == status.HTTP_400_BAD_REQUEST
+        assert response.data == {"label_id": ["Label does not belong to this workspace"]}
+        assert not WorkspaceIntegration.objects.filter(
+            workspace=workspace,
+            integration=calendar_integration,
+        ).exists()
+
+    @pytest.mark.django_db
+    def test_policy_accepts_workspace_label_and_canonical_priority(
+        self,
+        session_client,
+        workspace,
+        calendar_integration,
+    ):
+        label = Label.objects.create(name="Calendar Label", workspace=workspace)
+
+        with override_settings(GOOGLE_CALENDAR_RELEASED=True):
+            response = session_client.patch(
+                _policy_url(workspace),
+                {
+                    "enabled": False,
+                    "mode": "filter",
+                    "label_id": label.id,
+                    "priority": "urgent",
+                },
+                format="json",
+            )
+
+        assert response.status_code == status.HTTP_200_OK
+        assert response.data["label_id"] == str(label.id)
+        assert response.data["priority"] == "urgent"
 
     @pytest.mark.django_db
     def test_reenable_conflict_preserves_policy_and_generation(
