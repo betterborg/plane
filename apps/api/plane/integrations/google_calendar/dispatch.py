@@ -5,6 +5,9 @@
 from django.db import transaction
 
 
+GOOGLE_CALENDAR_LIFECYCLE_TASK = "plane.bgtasks.google_calendar_task.reconcile_google_calendar_connection"
+
+
 def enqueue_google_calendar_task_on_commit(task, *args, **kwargs):
     """Publish a Calendar task after the current database transaction commits."""
 

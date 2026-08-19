@@ -4,6 +4,8 @@
 
 from django.urls import path
 
+from plane.app.views.google_calendar_oauth import GoogleCalendarOAuthCallbackEndpoint
+
 from .views import (
     CSRFTokenEndpoint,
     ForgotPasswordEndpoint,
@@ -47,6 +49,11 @@ from .views import (
 )
 
 urlpatterns = [
+    path(
+        "google-calendar/callback/",
+        GoogleCalendarOAuthCallbackEndpoint.as_view(),
+        name="google-calendar-oauth-callback",
+    ),
     # credentials
     path("sign-in/", SignInAuthEndpoint.as_view(), name="sign-in"),
     path("sign-up/", SignUpAuthEndpoint.as_view(), name="sign-up"),
