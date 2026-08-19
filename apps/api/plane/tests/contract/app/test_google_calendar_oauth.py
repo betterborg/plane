@@ -2,18 +2,30 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # See the LICENSE file for details.
 
+from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
+from threading import Barrier, Event
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 from urllib.parse import parse_qs, urlparse
 
 import pytest
+from django.db import close_old_connections, transaction
 from django.test import override_settings
 from django.urls import reverse
 from django.utils import timezone
 from rest_framework import status
 
-from plane.app.views.google_calendar_oauth import GOOGLE_CALENDAR_OAUTH_SESSION_KEY
-from plane.db.models import GoogleCalendarConnection
+from plane.app.views.google_calendar_oauth import (
+    GOOGLE_CALENDAR_OAUTH_SESSION_KEY,
+    StaleGoogleCalendarOAuthAttempt,
+    _complete_callback,
+)
+from plane.db.models import GoogleCalendarConnection, WorkspaceMember
+from plane.integrations.google_calendar.lifecycle import (
+    lock_google_calendar_connection,
+    request_google_calendar_disconnect,
+)
 from plane.integrations.google_calendar.oauth import (
     GOOGLE_CALENDAR_SCOPE,
     GoogleCalendarOAuthCredentials,
@@ -304,6 +316,127 @@ class TestGoogleCalendarOAuth:
         assert _redirect_error(replay) == "google_calendar_oauth_stale"
         connection.refresh_from_db()
         assert connection.lifecycle_generation == 1
+
+    @pytest.mark.django_db(transaction=True)
+    def test_callback_rechecks_active_membership_after_token_exchange(
+        self,
+        session_client,
+        workspace,
+        calendar_workspace_integration,
+        oauth_credentials,
+        complete_grant,
+        create_user,
+    ):
+        callback_state = _state_from_response(_start_consent(session_client, workspace, oauth_credentials))
+        lifecycle_task = Mock()
+
+        def exchange_after_membership_removal(*args, **kwargs):
+            WorkspaceMember.objects.filter(workspace=workspace, member=create_user).update(is_active=False)
+            return complete_grant
+
+        with (
+            override_settings(GOOGLE_CALENDAR_RELEASED=True, APP_BASE_URL="https://plane.example"),
+            patch("plane.integrations.google_calendar.lifecycle._acquire_advisory_xact_lock"),
+            patch(
+                "plane.app.views.google_calendar_oauth.get_google_calendar_oauth_credentials",
+                return_value=oauth_credentials,
+            ),
+            patch(
+                "plane.app.views.google_calendar_oauth.exchange_google_calendar_code",
+                side_effect=exchange_after_membership_removal,
+            ),
+            patch(
+                "plane.app.views.google_calendar_oauth.get_google_calendar_identity",
+                return_value=GoogleCalendarOAuthIdentity("google-account", "member@example.com"),
+            ),
+            patch("plane.app.views.google_calendar_oauth.current_app.signature", return_value=lifecycle_task),
+            patch("plane.app.views.google_calendar_oauth.revoke_rejected_google_calendar_grant") as revoke,
+        ):
+            response = session_client.get(_callback_url(), {"state": callback_state, "code": "callback-code"})
+
+        assert _redirect_error(response) == "google_calendar_oauth_stale"
+        revoke.assert_called_once_with(complete_grant, account_id="google-account")
+        lifecycle_task.delay.assert_not_called()
+        connection = GoogleCalendarConnection.objects.get()
+        assert connection.lifecycle_generation == 0
+        assert not connection.provider_account_id
+        assert not connection.access_token
+
+    @pytest.mark.django_db(transaction=True)
+    def test_callback_waits_for_revoke_and_cannot_commit_or_publish_stale_generation(
+        self,
+        session_client,
+        workspace,
+        calendar_workspace_integration,
+        oauth_credentials,
+        complete_grant,
+        create_user,
+    ):
+        connection = GoogleCalendarConnectionFactory(
+            workspace_integration=calendar_workspace_integration,
+            member=create_user,
+            provider_account_id="google-account",
+            provider_email="old@example.com",
+            calendar_id="old-calendar",
+            access_token="old-access-token",
+            refresh_token="old-refresh-token",
+            desired_state=GoogleCalendarConnection.DesiredState.CONNECTED,
+            status=GoogleCalendarConnection.Status.ACTIVE,
+            lifecycle_generation=5,
+        )
+        _start_consent(session_client, workspace, oauth_credentials)
+        payload = session_client.session[GOOGLE_CALENDAR_OAUTH_SESSION_KEY]
+        revoke_locked = Barrier(2)
+        revoke_can_finish = Event()
+        callback_started = Event()
+        identity = GoogleCalendarOAuthIdentity("google-account", "new@example.com")
+
+        def revoke_connection():
+            close_old_connections()
+            try:
+                with transaction.atomic():
+                    locked_connection = lock_google_calendar_connection(connection.id)
+                    revoke_locked.wait(timeout=5)
+                    assert revoke_can_finish.wait(timeout=5)
+                    return request_google_calendar_disconnect(
+                        locked_connection.id,
+                        locked_connection.lifecycle_generation,
+                    )
+            finally:
+                close_old_connections()
+
+        def complete_callback():
+            close_old_connections()
+            try:
+                revoke_locked.wait(timeout=5)
+                callback_started.set()
+                request = SimpleNamespace(user=create_user)
+                return _complete_callback(request, payload, complete_grant, identity)
+            finally:
+                close_old_connections()
+
+        with patch("plane.app.views.google_calendar_oauth.enqueue_google_calendar_task_on_commit") as publish:
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                revoke_future = executor.submit(revoke_connection)
+                callback_future = executor.submit(complete_callback)
+                assert callback_started.wait(timeout=5)
+                assert callback_future.done() is False
+                revoke_can_finish.set()
+                revoke_command = revoke_future.result(timeout=5)
+                with pytest.raises(StaleGoogleCalendarOAuthAttempt):
+                    callback_future.result(timeout=5)
+
+        assert revoke_command.connection_id == connection.id
+        assert revoke_command.generation == 6
+        publish.assert_not_called()
+        connection.refresh_from_db()
+        assert connection.desired_state == GoogleCalendarConnection.DesiredState.DISCONNECTED
+        assert connection.status == GoogleCalendarConnection.Status.CLEANUP_PENDING
+        assert connection.lifecycle_generation == 6
+        assert connection.provider_email == "old@example.com"
+        assert connection.access_token == "old-access-token"
+        assert connection.refresh_token == "old-refresh-token"
+        assert not connection.oauth_state
 
     @pytest.mark.django_db
     def test_same_account_reconnect_retains_existing_refresh_token(

@@ -129,6 +129,16 @@ def _assert_attempt_owner(connection, request, payload):
         or not connection.workspace_integration.config.get("enabled", False)
     ):
         raise StaleGoogleCalendarOAuthAttempt("Google Calendar OAuth callback no longer owns this attempt")
+    if not (
+        WorkspaceMember.objects.select_for_update()
+        .filter(
+            workspace_id=connection.workspace_integration.workspace_id,
+            member_id=request.user.id,
+            is_active=True,
+        )
+        .exists()
+    ):
+        raise StaleGoogleCalendarOAuthAttempt("Google Calendar OAuth member is no longer active")
 
 
 @transaction.atomic
