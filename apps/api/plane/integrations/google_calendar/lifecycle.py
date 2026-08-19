@@ -30,6 +30,10 @@ class UnusableGoogleCalendarGrant(GoogleCalendarLifecycleError):
     """Raised when an OAuth result does not contain a usable provider grant."""
 
 
+class GoogleCalendarDisableCleanupInProgress(GoogleCalendarLifecycleError):
+    """Raised when a workspace is re-enabled before its calendars are removed."""
+
+
 @dataclass(frozen=True)
 class GoogleCalendarLifecycleCommand:
     """Generation-scoped work to publish after a lifecycle transaction commits."""
@@ -106,6 +110,10 @@ _LEGAL_TRANSITIONS = {
             GoogleCalendarConnection.DesiredState.DISCONNECTED,
             GoogleCalendarConnection.Status.DISCONNECTED,
         ),
+        (
+            GoogleCalendarConnection.DesiredState.CONNECTED,
+            GoogleCalendarConnection.Status.PENDING,
+        ),
     },
 }
 
@@ -172,8 +180,6 @@ def lock_google_calendar_workspace_connections(workspace_id):
 def has_usable_google_calendar_grant(connection, at=None):
     """Return whether a durable row has provider identity and a usable token."""
 
-    if connection.desired_state != GoogleCalendarConnection.DesiredState.CONNECTED:
-        return False
     if not connection.provider_account_id:
         return False
     if connection.refresh_token:
@@ -304,6 +310,8 @@ def request_google_calendar_workspace_reconciliation(workspace_id):
     for calendar_connection in lock_google_calendar_workspace_connections(workspace_id):
         if calendar_connection.desired_state != GoogleCalendarConnection.DesiredState.CONNECTED:
             continue
+        if not has_usable_google_calendar_grant(calendar_connection):
+            continue
         if calendar_connection.status != GoogleCalendarConnection.Status.PENDING:
             _transition(
                 calendar_connection,
@@ -317,6 +325,65 @@ def request_google_calendar_workspace_reconciliation(workspace_id):
             calendar_connection.save(update_fields=["lifecycle_generation", "updated_at"])
         calendar_connection.last_error = ""
         calendar_connection.save(update_fields=["last_error", "updated_at"])
+        commands.append(
+            GoogleCalendarLifecycleCommand(calendar_connection.id, calendar_connection.lifecycle_generation)
+        )
+    return commands
+
+
+@transaction.atomic
+def request_google_calendar_workspace_policy_enable(workspace_id):
+    """Advance retained usable grants after all disabled calendars are gone."""
+
+    calendar_connections = lock_google_calendar_workspace_connections(workspace_id)
+    if any(
+        calendar_connection.desired_state == GoogleCalendarConnection.DesiredState.DISCONNECTED
+        and calendar_connection.calendar_id
+        for calendar_connection in calendar_connections
+    ):
+        raise GoogleCalendarDisableCleanupInProgress(
+            "Google Calendar workspace disable cleanup is still in progress"
+        )
+
+    commands = []
+    for calendar_connection in calendar_connections:
+        if calendar_connection.desired_state != GoogleCalendarConnection.DesiredState.DISCONNECTED:
+            continue
+        if not has_usable_google_calendar_grant(calendar_connection):
+            continue
+        _transition(
+            calendar_connection,
+            calendar_connection.lifecycle_generation,
+            GoogleCalendarConnection.DesiredState.CONNECTED,
+            GoogleCalendarConnection.Status.PENDING,
+            advance_generation=True,
+        )
+        calendar_connection.last_error = ""
+        calendar_connection.save(update_fields=["last_error", "updated_at"])
+        commands.append(
+            GoogleCalendarLifecycleCommand(calendar_connection.id, calendar_connection.lifecycle_generation)
+        )
+    return commands
+
+
+@transaction.atomic
+def request_google_calendar_workspace_policy_disable(workspace_id):
+    """Advance every present connection to an absent cleanup generation."""
+
+    commands = []
+    for calendar_connection in lock_google_calendar_workspace_connections(workspace_id):
+        if calendar_connection.desired_state != GoogleCalendarConnection.DesiredState.CONNECTED:
+            continue
+        _transition(
+            calendar_connection,
+            calendar_connection.lifecycle_generation,
+            GoogleCalendarConnection.DesiredState.DISCONNECTED,
+            GoogleCalendarConnection.Status.CLEANUP_PENDING,
+            advance_generation=True,
+        )
+        _clear_oauth_attempt(calendar_connection)
+        calendar_connection.last_error = ""
+        calendar_connection.save(update_fields=[*_OAUTH_ATTEMPT_FIELDS, "last_error", "updated_at"])
         commands.append(
             GoogleCalendarLifecycleCommand(calendar_connection.id, calendar_connection.lifecycle_generation)
         )
@@ -399,8 +466,8 @@ def record_google_calendar_cleanup_error(connection_id, expected_generation, err
 
 
 @transaction.atomic
-def complete_google_calendar_disconnect(connection_id, expected_generation):
-    """Retain a credential-free tombstone after provider cleanup succeeds."""
+def complete_google_calendar_disconnect(connection_id, expected_generation, *, retain_grant=False):
+    """Finish provider cleanup, optionally retaining the usable workspace grant."""
 
     calendar_connection = lock_google_calendar_connection(connection_id)
     _transition(
@@ -409,10 +476,12 @@ def complete_google_calendar_disconnect(connection_id, expected_generation):
         GoogleCalendarConnection.DesiredState.DISCONNECTED,
         GoogleCalendarConnection.Status.DISCONNECTED,
     )
-    _clear_provider_grant(calendar_connection)
+    calendar_connection.calendar_id = ""
+    if not retain_grant:
+        _clear_provider_grant(calendar_connection)
     _clear_oauth_attempt(calendar_connection)
     calendar_connection.last_error = ""
     calendar_connection.save(
-        update_fields=[*_PROVIDER_FIELDS, *_OAUTH_ATTEMPT_FIELDS, "last_error", "updated_at"]
+        update_fields=["calendar_id", *_PROVIDER_FIELDS, *_OAUTH_ATTEMPT_FIELDS, "last_error", "updated_at"]
     )
     return calendar_connection

@@ -13,7 +13,7 @@ from plane.tests.factories import (
 
 
 MIGRATE_FROM = ("db", "0122_alter_draftissue_assignees_alter_issue_assignees_and_more")
-MIGRATE_TO = ("db", "0123_google_calendar_integration")
+MIGRATE_TO = ("db", "0124_google_calendar_connection_calendar_id")
 
 
 def migrate_to(executor, target):
@@ -78,6 +78,7 @@ class TestGoogleCalendarConnectionMigration:
             oauth_state="attempt-state",
             oauth_code_verifier="attempt-verifier",
             oauth_redirect_uri="https://plane.example/calendar/callback",
+            calendar_id="plane-calendar",
             access_token="provider-access-token",
             refresh_token="provider-refresh-token",
         )
@@ -86,6 +87,7 @@ class TestGoogleCalendarConnectionMigration:
         assert connection_row.status == "disconnected"
         assert connection_row.lifecycle_generation == 0
         assert connection_row.oauth_state == "attempt-state"
+        assert connection_row.calendar_id == "plane-calendar"
 
         table = CalendarConnection._meta.db_table
         with connection.cursor() as cursor:
