@@ -24,6 +24,7 @@ from .integration import (
     GithubIssueSync,
     GithubRepository,
     GithubRepositorySync,
+    GoogleCalendarConnection,
     Integration,
     SlackProjectSync,
     WorkspaceIntegration,

@@ -49,7 +49,15 @@ docker compose -f docker-compose-test.yml run --rm api-tests \
   pytest plane/tests/unit/models/test_workspace.py -vv
 ```
 
-The available markers (`unit`, `contract`, `smoke`, `slow`) are declared in `apps/api/pytest.ini`.
+Migration tests must opt back into Django migrations because the default test
+configuration uses `--nomigrations`. Run them with a fresh database:
+
+```bash
+docker compose -f docker-compose-test.yml run --rm api-tests \
+  pytest --migrations --create-db -m migration plane/tests/migrations -vv
+```
+
+The available markers (`unit`, `migration`, `contract`, `smoke`, `slow`) are declared in `apps/api/pytest.ini`.
 
 ### Teardown
 
