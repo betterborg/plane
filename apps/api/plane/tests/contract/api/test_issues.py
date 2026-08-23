@@ -6,9 +6,7 @@ from unittest import mock
 
 import pytest
 from rest_framework import status
-from rest_framework.test import APIRequestFactory
 
-from plane.api.views.issue import IssueDetailAPIEndpoint
 from plane.app.serializers.issue import IssueCreateSerializer
 from plane.db.models import Issue, IssueAssignee, IssueLabel, Label, Project, ProjectMember, State
 from plane.db.signals import suppress_google_calendar_issue_signal_dispatch
@@ -74,16 +72,6 @@ class TestIssueCalendarDispatch:
     def public_collection_url(self, workspace_slug, project_id):
         return f"/api/v1/workspaces/{workspace_slug}/projects/{project_id}/work-items/"
 
-    def invoke_public_put(self, api_token, workspace, project, payload):
-        request = APIRequestFactory().put(
-            self.public_collection_url(workspace.slug, project.id),
-            payload,
-            format="json",
-            HTTP_X_API_KEY=api_token.token,
-        )
-        view = IssueDetailAPIEndpoint.as_view(http_method_names=["put"])
-        return view(request, slug=workspace.slug, project_id=project.id)
-
     def test_app_create_and_update_each_dispatch_once_after_relations(
         self, workspace, project, state, label, create_user
     ):
@@ -142,7 +130,7 @@ class TestIssueCalendarDispatch:
         assert_calendar_dispatch_sees_relations(enqueue, [create_user.id], [label.id])
 
     def test_public_create_on_upsert_dispatches_once_and_suppresses_audit_save(
-        self, api_token, workspace, project, state, label, create_user
+        self, api_key_client, workspace, project, state, label, create_user
     ):
         payload = {
             "name": "Public PUT-created work item",
@@ -155,13 +143,17 @@ class TestIssueCalendarDispatch:
         }
 
         with mock.patch("plane.db.signals.enqueue_google_calendar_task_on_commit") as enqueue:
-            response = self.invoke_public_put(api_token, workspace, project, payload)
+            response = api_key_client.put(
+                self.public_collection_url(workspace.slug, project.id),
+                payload,
+                format="json",
+            )
 
         assert response.status_code == status.HTTP_201_CREATED, response.data
         assert_calendar_dispatch_sees_relations(enqueue, [create_user.id], [label.id])
 
     def test_public_existing_upsert_dispatches_once_after_updated_relations(
-        self, api_token, workspace, project, state, label, create_user
+        self, api_key_client, workspace, project, state, label, create_user
     ):
         with suppress_google_calendar_issue_signal_dispatch():
             existing_issue = Issue.objects.create(
@@ -182,7 +174,11 @@ class TestIssueCalendarDispatch:
         }
 
         with mock.patch("plane.db.signals.enqueue_google_calendar_task_on_commit") as enqueue:
-            response = self.invoke_public_put(api_token, workspace, project, payload)
+            response = api_key_client.put(
+                self.public_collection_url(workspace.slug, project.id),
+                payload,
+                format="json",
+            )
 
         assert response.status_code == status.HTTP_200_OK, response.data
         assert_calendar_dispatch_sees_relations(enqueue, [create_user.id], [label.id])

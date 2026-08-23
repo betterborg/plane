@@ -34,7 +34,7 @@ old_url_patterns = [
     ),
     path(
         "workspaces/<str:slug>/projects/<uuid:project_id>/issues/",
-        IssueListCreateAPIEndpoint.as_view(http_method_names=["get", "post"]),
+        IssueListCreateAPIEndpoint.as_view(http_method_names=["get", "post", "put"]),
         name="issue",
     ),
     path(
@@ -98,7 +98,7 @@ new_url_patterns = [
     ),
     path(
         "workspaces/<str:slug>/projects/<uuid:project_id>/work-items/",
-        IssueListCreateAPIEndpoint.as_view(http_method_names=["get", "post"]),
+        IssueListCreateAPIEndpoint.as_view(http_method_names=["get", "post", "put"]),
         name="work-item-list",
     ),
     path(
