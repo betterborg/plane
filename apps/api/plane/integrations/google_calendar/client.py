@@ -253,7 +253,7 @@ class GoogleCalendarClient:
         """Delete an event, treating an already-absent event as converged."""
 
         response = self._calendar_request("delete", self._event_path(calendar_id, event_id))
-        if response.status_code == 404:
+        if response.status_code in {404, 410}:
             return
         try:
             response.raise_for_status()

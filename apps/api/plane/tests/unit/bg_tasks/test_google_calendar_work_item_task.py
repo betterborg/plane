@@ -3,11 +3,13 @@
 # See the LICENSE file for details.
 
 from concurrent.futures import ThreadPoolExecutor
+from datetime import timedelta
 from threading import Barrier, Event, current_thread, main_thread
 from unittest.mock import Mock, patch
 
 import pytest
 from django.db import close_old_connections
+from django.utils import timezone
 
 from plane.bgtasks.google_calendar_task import (
     _connection_ids_for_issue,
@@ -17,7 +19,7 @@ from plane.bgtasks.google_calendar_task import (
     synchronize_google_calendar_issue,
 )
 from plane.db.models import GoogleCalendarEvent
-from plane.integrations.google_calendar.client import GoogleCalendarClientConflict
+from plane.integrations.google_calendar.client import GoogleCalendarClient, GoogleCalendarClientConflict
 from plane.integrations.google_calendar.lifecycle import (
     request_google_calendar_workspace_policy_disable,
     request_google_calendar_workspace_policy_enable,
@@ -132,6 +134,44 @@ class TestGoogleCalendarWorkItemTask:
         assert result == ["deleted"]
         assert GoogleCalendarEvent.objects.filter(entity_id=self.issue.id).count() == 0
         client.delete_event.assert_called_once()
+
+    def test_delete_retry_converges_after_provider_success_and_database_rollback(self):
+        client = _provider_client()
+        with patch("plane.bgtasks.google_calendar_task.GoogleCalendarClient", return_value=client):
+            synchronize_google_calendar_issue.run(str(self.issue.id))
+
+        self.workspace_integration.config["update_on_completion"] = False
+        self.workspace_integration.save(update_fields=["config", "updated_at"])
+        self.issue.state = StateFactory(project=self.issue.project, group="cancelled", name="Cancelled")
+        self.issue.save(update_fields=["state", "completed_at"])
+
+        with (
+            patch("plane.bgtasks.google_calendar_task.GoogleCalendarClient", return_value=client),
+            patch.object(GoogleCalendarEvent, "delete", side_effect=RuntimeError("database write failed")),
+            pytest.raises(RuntimeError, match="database write failed"),
+        ):
+            synchronize_google_calendar_issue.run(str(self.issue.id))
+
+        assert GoogleCalendarEvent.objects.filter(entity_id=self.issue.id).count() == 1
+        client.delete_event.assert_called_once()
+
+        gone_response = Mock(status_code=410)
+        retry_client = GoogleCalendarClient(
+            access_token="access-token",
+            token_expires_at=timezone.now() + timedelta(hours=1),
+        )
+        with (
+            patch("plane.bgtasks.google_calendar_task.GoogleCalendarClient", return_value=retry_client),
+            patch(
+                "plane.integrations.google_calendar.client.requests.request",
+                return_value=gone_response,
+            ),
+        ):
+            result = synchronize_google_calendar_issue.run(str(self.issue.id))
+
+        assert result == ["deleted"]
+        assert GoogleCalendarEvent.objects.filter(entity_id=self.issue.id).count() == 0
+        gone_response.raise_for_status.assert_not_called()
 
     def test_assignment_loss_removes_the_affected_event(self):
         client = _provider_client()

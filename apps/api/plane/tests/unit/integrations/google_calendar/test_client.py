@@ -89,6 +89,19 @@ class TestGoogleCalendarClient:
         ):
             client.insert_event("calendar", "event", {"summary": "Created"})
 
+    @pytest.mark.parametrize("status_code", [404, 410])
+    def test_event_delete_treats_provider_absence_as_converged(self, status_code):
+        response = Mock(status_code=status_code)
+        client = GoogleCalendarClient(
+            access_token="access-token",
+            token_expires_at=timezone.now() + timedelta(hours=1),
+        )
+
+        with patch("plane.integrations.google_calendar.client.requests.request", return_value=response):
+            client.delete_event("calendar", "event")
+
+        response.raise_for_status.assert_not_called()
+
     def test_create_uses_the_dedicated_calendar_endpoint(self):
         response = Mock(status_code=200)
         response.json.return_value = {"id": "plane-calendar@example.com"}
