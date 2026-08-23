@@ -17,7 +17,7 @@ const useIntegrationPopup = ({
 }: {
   provider?: string;
   authUrl?: string;
-  onClose?: () => void;
+  onClose?: (callbackUrl?: string) => void;
   stateParams?: string;
   github_app_name?: string;
   slack_client_id?: string;
@@ -51,15 +51,24 @@ const useIntegrationPopup = ({
 
   const checkPopup = (openedPopup: Window) => {
     let hasHandledClose = false;
+    let lastAccessibleUrl: string | undefined;
 
     clearPopupPolling();
     pollingInterval.current = window.setInterval(() => {
+      if (!openedPopup.closed) {
+        try {
+          lastAccessibleUrl = openedPopup.location.href;
+        } catch {
+          // The provider page is cross-origin until it redirects back to Plane.
+        }
+      }
+
       if (openedPopup.closed && !hasHandledClose) {
         hasHandledClose = true;
         clearPopupPolling();
         popup.current = null;
         setAuthLoader(false);
-        onCloseRef.current?.();
+        onCloseRef.current?.(lastAccessibleUrl);
       }
     }, 1000);
   };
