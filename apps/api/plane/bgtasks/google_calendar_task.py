@@ -19,6 +19,7 @@ from plane.integrations.google_calendar.client import (
 from plane.integrations.google_calendar.dispatch import (
     GOOGLE_CALENDAR_ISSUE_SYNC_TASK,
     GOOGLE_CALENDAR_OPEN_BACKFILL_TASK,
+    GOOGLE_CALENDAR_WORKSPACE_ISSUE_RESYNC_TASK,
     enqueue_google_calendar_task_on_commit,
 )
 from plane.integrations.google_calendar.eligibility import (
@@ -281,6 +282,54 @@ def backfill_google_calendar_open_issues(connection_id, after_id=None, batch_siz
             int(batch_size),
         )
     return published
+
+
+def _workspace_issue_ids_for_resync(workspace_id, after_id=None):
+    issue_ids = Issue.all_objects.filter(workspace_id=workspace_id)
+    correlation_issue_ids = GoogleCalendarEvent.objects.filter(
+        connection__workspace_integration__workspace_id=workspace_id,
+        entity_type=GoogleCalendarEvent.EntityType.WORK_ITEM,
+    )
+    if after_id is not None:
+        issue_ids = issue_ids.filter(id__gt=after_id)
+        correlation_issue_ids = correlation_issue_ids.filter(entity_id__gt=after_id)
+    return (
+        issue_ids.order_by()
+        .values_list("id", flat=True)
+        .union(correlation_issue_ids.order_by().values_list("entity_id", flat=True))
+        .order_by("id")
+    )
+
+
+@shared_task(bind=True, max_retries=12)
+def resync_google_calendar_workspace_issues(task, workspace_id, after_id=None, batch_size=100):
+    """Publish a bounded, paced convergence pass for every workspace work item."""
+
+    if GoogleCalendarConnection.objects.filter(
+        workspace_integration__workspace_id=workspace_id,
+        desired_state=GoogleCalendarConnection.DesiredState.CONNECTED,
+        status=GoogleCalendarConnection.Status.PENDING,
+    ).exists():
+        raise task.retry(countdown=5)
+
+    issue_ids = list(_workspace_issue_ids_for_resync(workspace_id, after_id)[: int(batch_size) + 1])
+    current_batch = issue_ids[: int(batch_size)]
+
+    for index, issue_id in enumerate(current_batch):
+        sync_task = current_app.signature(GOOGLE_CALENDAR_ISSUE_SYNC_TASK).set(countdown=index)
+        enqueue_google_calendar_task_on_commit(sync_task, str(issue_id))
+
+    if len(issue_ids) > len(current_batch) and current_batch:
+        next_batch = current_app.signature(GOOGLE_CALENDAR_WORKSPACE_ISSUE_RESYNC_TASK).set(
+            countdown=len(current_batch)
+        )
+        enqueue_google_calendar_task_on_commit(
+            next_batch,
+            str(workspace_id),
+            str(current_batch[-1]),
+            int(batch_size),
+        )
+    return len(current_batch)
 
 
 def _record_present_error(connection, generation, error):

@@ -6,8 +6,10 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 from threading import Barrier, Event, current_thread, main_thread
 from unittest.mock import Mock, patch
+from uuid import uuid4
 
 import pytest
+from celery.exceptions import Retry
 from django.db import close_old_connections
 from django.utils import timezone
 
@@ -16,6 +18,7 @@ from plane.bgtasks.google_calendar_task import (
     _synchronize_issue_for_connection,
     backfill_google_calendar_open_issues,
     reconcile_google_calendar_connection,
+    resync_google_calendar_workspace_issues,
     synchronize_google_calendar_issue,
 )
 from plane.db.models import GoogleCalendarEvent
@@ -216,6 +219,78 @@ class TestGoogleCalendarWorkItemTask:
         assert second_sync.args[0].options["countdown"] == 1
         assert continuation.args[0].task == "plane.bgtasks.google_calendar_task.backfill_google_calendar_open_issues"
         assert continuation.args[0].options["countdown"] == 2
+
+    def test_workspace_resync_includes_current_and_ledger_only_issue_ids_once(self):
+        ledger_only_issue_id = uuid4()
+        GoogleCalendarEvent.objects.create(
+            connection=self.connection,
+            entity_type=GoogleCalendarEvent.EntityType.WORK_ITEM,
+            entity_id=self.issue.id,
+            google_event_id="current-issue-event",
+            payload_hash="current-issue-payload",
+        )
+        GoogleCalendarEvent.objects.create(
+            connection=self.connection,
+            entity_type=GoogleCalendarEvent.EntityType.WORK_ITEM,
+            entity_id=ledger_only_issue_id,
+            google_event_id="ledger-only-event",
+            payload_hash="ledger-only-payload",
+        )
+        IssueFactory()
+
+        with patch("plane.bgtasks.google_calendar_task.enqueue_google_calendar_task_on_commit") as publish:
+            published = resync_google_calendar_workspace_issues.run(self.workspace_integration.workspace_id)
+
+        assert published == 2
+        assert {call.args[1] for call in publish.call_args_list} == {
+            str(self.issue.id),
+            str(ledger_only_issue_id),
+        }
+        assert all(
+            call.args[0].task == "plane.bgtasks.google_calendar_task.synchronize_google_calendar_issue"
+            for call in publish.call_args_list
+        )
+
+    def test_workspace_resync_paces_pages(self):
+        second_issue = IssueFactory(project=self.issue.project)
+        third_issue = IssueFactory(project=self.issue.project)
+
+        with patch("plane.bgtasks.google_calendar_task.enqueue_google_calendar_task_on_commit") as publish:
+            published = resync_google_calendar_workspace_issues.run(
+                self.workspace_integration.workspace_id,
+                batch_size=2,
+            )
+
+        assert published == 2
+        assert publish.call_count == 3
+        first_sync, second_sync, continuation = publish.call_args_list
+        assert {first_sync.args[1], second_sync.args[1]} < {
+            str(self.issue.id),
+            str(second_issue.id),
+            str(third_issue.id),
+        }
+        assert first_sync.args[0].options["countdown"] == 0
+        assert second_sync.args[0].options["countdown"] == 1
+        assert continuation.args[0].task == (
+            "plane.bgtasks.google_calendar_task.resync_google_calendar_workspace_issues"
+        )
+        assert continuation.args[0].options["countdown"] == 2
+        assert continuation.args[1] == str(self.workspace_integration.workspace_id)
+        assert continuation.args[3] == 2
+
+    def test_workspace_resync_waits_for_policy_lifecycle_reconciliation(self):
+        self.connection.status = "pending"
+        self.connection.save(update_fields=["status", "updated_at"])
+
+        with (
+            patch.object(resync_google_calendar_workspace_issues, "retry", side_effect=Retry()) as retry,
+            patch("plane.bgtasks.google_calendar_task.enqueue_google_calendar_task_on_commit") as publish,
+            pytest.raises(Retry),
+        ):
+            resync_google_calendar_workspace_issues.run(self.workspace_integration.workspace_id)
+
+        retry.assert_called_once_with(countdown=5)
+        publish.assert_not_called()
 
     def test_successful_initial_provisioning_enqueues_open_item_backfill(self):
         connection = GoogleCalendarConnectionFactory(

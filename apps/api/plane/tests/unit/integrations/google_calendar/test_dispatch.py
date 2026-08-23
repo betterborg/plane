@@ -8,7 +8,11 @@ from unittest.mock import Mock, patch
 import pytest
 from django.db import transaction
 
-from plane.integrations.google_calendar.dispatch import enqueue_google_calendar_task_on_commit
+from plane.integrations.google_calendar.dispatch import (
+    GOOGLE_CALENDAR_WORKSPACE_ISSUE_RESYNC_TASK,
+    enqueue_google_calendar_task_on_commit,
+    enqueue_google_calendar_workspace_policy_resyncs_on_commit,
+)
 
 
 @pytest.mark.unit
@@ -74,3 +78,33 @@ class TestEnqueueGoogleCalendarTaskOnCommit:
 
         failed_task.delay.assert_called_once_with("connection-id")
         later_callback.assert_called_once_with()
+
+
+@pytest.mark.unit
+@pytest.mark.django_db(transaction=True)
+class TestEnqueueGoogleCalendarWorkspacePolicyResyncsOnCommit:
+    def test_completion_change_publishes_workspace_resync_only_after_commit(self):
+        task = Mock()
+
+        with patch("plane.integrations.google_calendar.dispatch.current_app.signature", return_value=task) as signature:
+            with transaction.atomic():
+                enqueue_google_calendar_workspace_policy_resyncs_on_commit(
+                    "workspace-id",
+                    {"update_on_completion": True},
+                    {"update_on_completion": False},
+                )
+                task.delay.assert_not_called()
+
+            task.delay.assert_called_once_with("workspace-id")
+
+        signature.assert_called_once_with(GOOGLE_CALENDAR_WORKSPACE_ISSUE_RESYNC_TASK)
+
+    def test_unchanged_completion_behavior_does_not_publish(self):
+        with patch("plane.integrations.google_calendar.dispatch.current_app.signature") as signature:
+            enqueue_google_calendar_workspace_policy_resyncs_on_commit(
+                "workspace-id",
+                {},
+                {"update_on_completion": True},
+            )
+
+        signature.assert_not_called()
