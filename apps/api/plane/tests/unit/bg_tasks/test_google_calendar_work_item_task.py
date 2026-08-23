@@ -199,6 +199,24 @@ class TestGoogleCalendarWorkItemTask:
         assert publish.call_count == 1
         assert publish.call_args.args[1:] == (str(overdue.id), str(self.connection.id))
 
+    def test_backfill_delays_the_next_page_until_the_current_page_pacing_window_ends(self):
+        for _ in range(2):
+            issue = IssueFactory(project=self.issue.project)
+            IssueAssigneeFactory(issue=issue, assignee=self.connection.member, project=self.issue.project)
+
+        with patch("plane.bgtasks.google_calendar_task.enqueue_google_calendar_task_on_commit") as publish:
+            published = backfill_google_calendar_open_issues.run(str(self.connection.id), batch_size=2)
+
+        assert published == 2
+        assert publish.call_count == 3
+        first_sync, second_sync, continuation = publish.call_args_list
+        assert first_sync.args[0].task == "plane.bgtasks.google_calendar_task.synchronize_google_calendar_issue"
+        assert first_sync.args[0].options["countdown"] == 0
+        assert second_sync.args[0].task == "plane.bgtasks.google_calendar_task.synchronize_google_calendar_issue"
+        assert second_sync.args[0].options["countdown"] == 1
+        assert continuation.args[0].task == "plane.bgtasks.google_calendar_task.backfill_google_calendar_open_issues"
+        assert continuation.args[0].options["countdown"] == 2
+
     def test_successful_initial_provisioning_enqueues_open_item_backfill(self):
         connection = GoogleCalendarConnectionFactory(
             workspace_integration=self.workspace_integration,

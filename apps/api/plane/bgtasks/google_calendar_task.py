@@ -272,7 +272,8 @@ def backfill_google_calendar_open_issues(connection_id, after_id=None, batch_siz
         published += 1
 
     if len(issues) > len(current_batch) and current_batch:
-        next_batch = current_app.signature(GOOGLE_CALENDAR_OPEN_BACKFILL_TASK).set(countdown=1)
+        # The continuation starts a fresh countdown sequence, so place it after this page's final pacing slot.
+        next_batch = current_app.signature(GOOGLE_CALENDAR_OPEN_BACKFILL_TASK).set(countdown=len(current_batch))
         enqueue_google_calendar_task_on_commit(
             next_batch,
             str(connection.id),
