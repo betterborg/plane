@@ -4,6 +4,9 @@
  * See the LICENSE file for details.
  */
 
+import type { TIssuePriorities } from "./issues";
+import type { IUserLite } from "./users";
+
 // All the app integrations that are available
 export interface IAppIntegration {
   author: string;
@@ -37,6 +40,36 @@ export interface IWorkspaceIntegration {
   updated_at: string;
   updated_by: string;
   workspace: string;
+}
+
+export type TGoogleCalendarConnectionStatus = "provisioning" | "healthy" | "broken" | "disconnecting";
+
+export interface IGoogleCalendarWorkspacePolicy {
+  enabled: boolean;
+  mode: "assignment" | "filter";
+  update_on_completion: boolean;
+  recipients: "cycle_members";
+  label_id: string | null;
+  priority: TIssuePriorities | null;
+}
+
+export interface IGoogleCalendarConnectionStatus {
+  status: TGoogleCalendarConnectionStatus;
+}
+
+export interface IGoogleCalendarWorkspaceStatus {
+  available: boolean;
+  policy: IGoogleCalendarWorkspacePolicy;
+  connection: IGoogleCalendarConnectionStatus | null;
+}
+
+export interface IGoogleCalendarConnectionRosterItem {
+  member: IUserLite;
+  connection: IGoogleCalendarConnectionStatus;
+}
+
+export interface IGoogleCalendarDisconnectResponse {
+  status: "disconnecting";
 }
 
 // slack integration

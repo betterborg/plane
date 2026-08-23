@@ -114,6 +114,10 @@ export const ISSUE_DETAILS = (issueId: string) => `ISSUE_DETAILS_${issueId.toUpp
 export const APP_INTEGRATIONS = "APP_INTEGRATIONS";
 export const WORKSPACE_INTEGRATIONS = (workspaceSlug: string) =>
   `WORKSPACE_INTEGRATIONS_${workspaceSlug.toUpperCase()}`;
+export const GOOGLE_CALENDAR_STATUS = (workspaceSlug: string) =>
+  `GOOGLE_CALENDAR_STATUS_${workspaceSlug.toUpperCase()}`;
+export const GOOGLE_CALENDAR_CONNECTION_ROSTER = (workspaceSlug: string) =>
+  `GOOGLE_CALENDAR_CONNECTION_ROSTER_${workspaceSlug.toUpperCase()}`;
 
 export const JIRA_IMPORTER_DETAIL = (workspaceSlug: string, params: IJiraMetadata) => {
   const { api_token, cloud_hostname, email, project_key } = params;
