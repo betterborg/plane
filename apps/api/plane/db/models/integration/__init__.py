@@ -3,7 +3,7 @@
 # See the LICENSE file for details.
 
 from .base import Integration, WorkspaceIntegration
-from .calendar import GoogleCalendarConnection
+from .calendar import GoogleCalendarConnection, GoogleCalendarEvent
 from .github import (
     GithubRepository,
     GithubRepositorySync,
