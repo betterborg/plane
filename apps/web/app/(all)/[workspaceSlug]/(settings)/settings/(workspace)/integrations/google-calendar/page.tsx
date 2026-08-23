@@ -15,10 +15,14 @@ import { SettingsHeading } from "@/components/settings/heading";
 // hooks
 import { useInstance } from "@/hooks/store/use-instance";
 import { useWorkspace } from "@/hooks/store/use-workspace";
+import type { Route } from "./+types/page";
 // local imports
 import { GoogleCalendarWorkspaceSettingsHeader } from "./header";
+import { GoogleCalendarMemberConnection } from "./member-connection";
 
-function GoogleCalendarSettingsPage() {
+function GoogleCalendarSettingsPage({ params }: Route.ComponentProps) {
+  // router
+  const { workspaceSlug } = params;
   // store hooks
   const { config } = useInstance();
   const { currentWorkspace } = useWorkspace();
@@ -35,10 +39,13 @@ function GoogleCalendarSettingsPage() {
   return (
     <SettingsContentWrapper header={<GoogleCalendarWorkspaceSettingsHeader />}>
       <PageHead title={pageTitle} />
-      <SettingsHeading
-        title={t("workspace_settings.settings.integrations.google_calendar.heading")}
-        description={t("workspace_settings.settings.integrations.google_calendar.description")}
-      />
+      <div className="flex w-full flex-col gap-y-6">
+        <SettingsHeading
+          title={t("workspace_settings.settings.integrations.google_calendar.heading")}
+          description={t("workspace_settings.settings.integrations.google_calendar.description")}
+        />
+        <GoogleCalendarMemberConnection workspaceSlug={workspaceSlug} />
+      </div>
     </SettingsContentWrapper>
   );
 }

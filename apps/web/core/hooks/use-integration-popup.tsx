@@ -7,6 +7,33 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useParams } from "next/navigation";
 
+const INTEGRATION_POPUP_CALLBACK_MESSAGE = "plane:integration-popup-callback";
+
+type TIntegrationPopupCallbackMessage = {
+  type: typeof INTEGRATION_POPUP_CALLBACK_MESSAGE;
+  callbackUrl: string;
+};
+
+const isIntegrationPopupCallbackMessage = (data: unknown): data is TIntegrationPopupCallbackMessage =>
+  typeof data === "object" &&
+  data !== null &&
+  "type" in data &&
+  data.type === INTEGRATION_POPUP_CALLBACK_MESSAGE &&
+  "callbackUrl" in data &&
+  typeof data.callbackUrl === "string";
+
+export const reportIntegrationPopupCallback = () => {
+  if (!window.opener) return;
+
+  window.opener.postMessage(
+    {
+      type: INTEGRATION_POPUP_CALLBACK_MESSAGE,
+      callbackUrl: window.location.href,
+    } satisfies TIntegrationPopupCallbackMessage,
+    window.location.origin
+  );
+};
+
 const useIntegrationPopup = ({
   provider,
   authUrl,
@@ -17,7 +44,7 @@ const useIntegrationPopup = ({
 }: {
   provider?: string;
   authUrl?: string;
-  onClose?: () => void;
+  onClose?: (callbackUrl?: string) => void;
   stateParams?: string;
   github_app_name?: string;
   slack_client_id?: string;
@@ -36,6 +63,8 @@ const useIntegrationPopup = ({
 
   const popup = useRef<Window | null>(null);
   const pollingInterval = useRef<number | null>(null);
+  const closeTimeout = useRef<number | null>(null);
+  const popupMessageListener = useRef<((event: MessageEvent) => void) | null>(null);
   const onCloseRef = useRef(onClose);
 
   useEffect(() => {
@@ -47,19 +76,58 @@ const useIntegrationPopup = ({
       window.clearInterval(pollingInterval.current);
       pollingInterval.current = null;
     }
+
+    if (closeTimeout.current !== null) {
+      window.clearTimeout(closeTimeout.current);
+      closeTimeout.current = null;
+    }
+
+    if (popupMessageListener.current) {
+      window.removeEventListener("message", popupMessageListener.current);
+      popupMessageListener.current = null;
+    }
   }, []);
 
   const checkPopup = (openedPopup: Window) => {
     let hasHandledClose = false;
+    let lastAccessibleUrl: string | undefined;
+    let reportedCallbackUrl: string | undefined;
 
     clearPopupPolling();
+    popupMessageListener.current = (event: MessageEvent) => {
+      if (
+        event.origin !== window.location.origin ||
+        event.source !== openedPopup ||
+        !isIntegrationPopupCallbackMessage(event.data)
+      )
+        return;
+
+      reportedCallbackUrl = event.data.callbackUrl;
+    };
+    window.addEventListener("message", popupMessageListener.current);
+
     pollingInterval.current = window.setInterval(() => {
+      if (!openedPopup.closed) {
+        try {
+          lastAccessibleUrl = openedPopup.location.href;
+        } catch {
+          // The provider page is cross-origin until it redirects back to Plane.
+        }
+      }
+
       if (openedPopup.closed && !hasHandledClose) {
         hasHandledClose = true;
-        clearPopupPolling();
-        popup.current = null;
-        setAuthLoader(false);
-        onCloseRef.current?.();
+        if (pollingInterval.current !== null) {
+          window.clearInterval(pollingInterval.current);
+          pollingInterval.current = null;
+        }
+        // Let a callback message already queued by the popup run before removing the listener.
+        closeTimeout.current = window.setTimeout(() => {
+          clearPopupPolling();
+          popup.current = null;
+          setAuthLoader(false);
+          onCloseRef.current?.(reportedCallbackUrl ?? lastAccessibleUrl);
+        }, 0);
       }
     }, 1000);
   };

@@ -182,7 +182,44 @@
           "title": "Google Calendar",
           "heading": "Google Calendar",
           "description": "Keep your assigned Plane work items in sync with Google Calendar.",
-          "card_description": "View and manage assigned work items from your Google Calendar."
+          "card_description": "View and manage assigned work items from your Google Calendar.",
+          "member_connection": {
+            "title": "Your calendar connection",
+            "consent": "Plane creates a dedicated calendar and never reads your existing Google Calendar content. Plane does not send invitations or reminders. Disconnecting deletes the dedicated calendar and cleans up the Google connection.",
+            "policy_disabled": "A workspace admin has disabled Google Calendar connections. You can still disconnect an existing connection.",
+            "unavailable": "Google Calendar is not configured for this Plane instance.",
+            "load_error": "Your Google Calendar connection status could not be loaded.",
+            "retry": "Retry",
+            "status": {
+              "disconnected": "Not connected",
+              "provisioning": "Creating your dedicated calendar",
+              "healthy": "Connected",
+              "broken": "Connection needs attention",
+              "disconnecting": "Disconnecting and cleaning up"
+            },
+            "actions": {
+              "connect": "Connect Google Calendar",
+              "reconnect": "Reconnect",
+              "disconnect": "Disconnect",
+              "disconnecting": "Disconnecting"
+            },
+            "callback": {
+              "success": "Google Calendar consent completed. Your refreshed connection status is shown below.",
+              "disabled": "The selected Google account was not connected because this workspace integration is disabled.",
+              "stale": "This Google Calendar connection attempt expired or was replaced. The refreshed connection status is shown below.",
+              "failed": "The selected Google account was not connected. Check the refreshed connection status below and try again.",
+              "account_switch": "The selected Google account was not connected. To use a different account:",
+              "account_switch_steps": {
+                "reconnect": "Reconnect your original Google account.",
+                "disconnect": "Disconnect it and wait for cleanup to finish.",
+                "connect": "Connect the different Google account."
+              }
+            },
+            "disconnect_error": {
+              "title": "Disconnect failed",
+              "message": "Your Google Calendar connection could not be disconnected. Please try again."
+            }
+          }
         }
       },
       "imports": {
