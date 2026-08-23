@@ -27,7 +27,9 @@ from plane.integrations.google_calendar.dispatch import (
 )
 from plane.integrations.google_calendar.lifecycle import (
     GoogleCalendarDisableCleanupInProgress,
+    lock_google_calendar_connection,
     lock_google_calendar_workspace_connections,
+    request_google_calendar_disconnect,
     request_google_calendar_workspace_policy_disable,
     request_google_calendar_workspace_policy_enable,
     request_google_calendar_workspace_reconciliation,
@@ -123,6 +125,49 @@ class GoogleCalendarConnectionRosterEndpoint(BaseAPIView):
             GoogleCalendarConnectionRosterSerializer(connections, many=True).data,
             status=status.HTTP_200_OK,
         )
+
+
+class GoogleCalendarConnectionEndpoint(BaseAPIView):
+    """Disconnect only the requesting member's Calendar connection."""
+
+    permission_classes = [WorkspaceMemberPermission]
+
+    def get_permissions(self):
+        if not settings.GOOGLE_CALENDAR_RELEASED:
+            return [IsAuthenticated()]
+        return super().get_permissions()
+
+    @transaction.atomic
+    def delete(self, request, slug, member_id):
+        if not settings.GOOGLE_CALENDAR_RELEASED:
+            return Response({"error": "Not found"}, status=status.HTTP_404_NOT_FOUND)
+        if member_id != request.user.id:
+            return Response({"error": "Forbidden"}, status=status.HTTP_403_FORBIDDEN)
+
+        connection = (
+            GoogleCalendarConnection.objects.filter(
+                workspace_integration__workspace__slug=slug,
+                workspace_integration__integration__provider="google_calendar",
+                member_id=member_id,
+            )
+            .order_by("id")
+            .first()
+        )
+        if connection is None:
+            return Response({"error": "Not found"}, status=status.HTTP_404_NOT_FOUND)
+
+        connection = lock_google_calendar_connection(connection.id)
+        command = request_google_calendar_disconnect(connection.id, connection.lifecycle_generation)
+        if command is None:
+            return Response({"error": "Not found"}, status=status.HTTP_404_NOT_FOUND)
+
+        lifecycle_task = current_app.signature(GOOGLE_CALENDAR_LIFECYCLE_TASK)
+        enqueue_google_calendar_task_on_commit(
+            lifecycle_task,
+            str(command.connection_id),
+            command.generation,
+        )
+        return Response({"status": "disconnecting"}, status=status.HTTP_202_ACCEPTED)
 
 
 class GoogleCalendarWorkspacePolicyEndpoint(BaseAPIView):
