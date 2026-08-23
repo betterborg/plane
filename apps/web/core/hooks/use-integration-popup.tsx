@@ -4,16 +4,20 @@
  * See the LICENSE file for details.
  */
 
-import { useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useParams } from "next/navigation";
 
 const useIntegrationPopup = ({
   provider,
+  authUrl,
+  onClose,
   stateParams,
   github_app_name,
   slack_client_id,
 }: {
-  provider: string | undefined;
+  provider?: string;
+  authUrl?: string;
+  onClose?: () => void;
   stateParams?: string;
   github_app_name?: string;
   slack_client_id?: string;
@@ -30,34 +34,70 @@ const useIntegrationPopup = ({
     }`,
   };
 
-  const popup = useRef<any>();
+  const popup = useRef<Window | null>(null);
+  const pollingInterval = useRef<number | null>(null);
+  const onCloseRef = useRef(onClose);
 
-  const checkPopup = () => {
-    const check = setInterval(() => {
-      if (!popup || popup.current.closed || popup.current.closed === undefined) {
-        clearInterval(check);
+  useEffect(() => {
+    onCloseRef.current = onClose;
+  }, [onClose]);
+
+  const clearPopupPolling = useCallback(() => {
+    if (pollingInterval.current !== null) {
+      window.clearInterval(pollingInterval.current);
+      pollingInterval.current = null;
+    }
+  }, []);
+
+  const checkPopup = (openedPopup: Window) => {
+    let hasHandledClose = false;
+
+    clearPopupPolling();
+    pollingInterval.current = window.setInterval(() => {
+      if (openedPopup.closed && !hasHandledClose) {
+        hasHandledClose = true;
+        clearPopupPolling();
+        popup.current = null;
         setAuthLoader(false);
+        onCloseRef.current?.();
       }
     }, 1000);
   };
 
   const openPopup = () => {
-    if (!provider) return;
+    if (!authUrl && !provider) return null;
 
     const width = 600,
       height = 600;
     const left = window.innerWidth / 2 - width / 2;
     const top = window.innerHeight / 2 - height / 2;
-    const url = providerUrls[provider];
+    const url = authUrl ?? providerUrls[provider ?? ""];
+
+    if (!url) return null;
 
     return window.open(url, "", `width=${width}, height=${height}, top=${top}, left=${left}`);
   };
 
   const startAuth = () => {
-    popup.current = openPopup();
-    checkPopup();
+    if (popup.current && !popup.current.closed) {
+      popup.current.focus();
+      return;
+    }
+
+    const openedPopup = openPopup();
+    if (!openedPopup) {
+      popup.current = null;
+      clearPopupPolling();
+      setAuthLoader(false);
+      return;
+    }
+
+    popup.current = openedPopup;
     setAuthLoader(true);
+    checkPopup(openedPopup);
   };
+
+  useEffect(() => clearPopupPolling, [clearPopupPolling]);
 
   return {
     startAuth,
