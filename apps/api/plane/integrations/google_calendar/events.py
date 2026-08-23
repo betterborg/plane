@@ -9,7 +9,7 @@ from datetime import timedelta
 from django.conf import settings
 from django.core.exceptions import ImproperlyConfigured
 
-from plane.db.models import GoogleCalendarEvent
+from plane.db.models import GoogleCalendarEvent, IssueLabel
 from plane.db.models.state import StateGroup
 
 
@@ -45,7 +45,10 @@ def _normal_summary(issue):
 
 
 def _description(issue):
-    label_names = sorted(issue.labels.values_list("name", flat=True), key=str.casefold)
+    label_names = sorted(
+        IssueLabel.objects.filter(issue_id=issue.id, deleted_at__isnull=True).values_list("label__name", flat=True),
+        key=str.casefold,
+    )
     return "\n".join(
         (
             f"Plane: {canonical_issue_browse_url(issue)}",

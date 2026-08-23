@@ -69,7 +69,7 @@ def _persist_refreshed_access_token(connection, client):
 
 
 def _issue_queryset():
-    return Issue.all_objects.select_related("workspace", "project", "state").prefetch_related("labels")
+    return Issue.all_objects.select_related("workspace", "project", "state")
 
 
 def _client_event_id_from_recovery(client, connection, issue, deterministic_event_id):
@@ -98,7 +98,7 @@ def _delete_work_item_event(connection, correlation):
 
 
 @transaction.atomic
-def _synchronize_issue_for_connection(issue, connection_id):
+def _synchronize_issue_for_connection(issue_id, connection_id):
     try:
         connection = (
             GoogleCalendarConnection.objects.select_for_update()
@@ -111,8 +111,16 @@ def _synchronize_issue_for_connection(issue, connection_id):
     correlation = GoogleCalendarEvent.objects.filter(
         connection=connection,
         entity_type=GoogleCalendarEvent.EntityType.WORK_ITEM,
-        entity_id=issue.id,
+        entity_id=issue_id,
     ).first()
+    try:
+        issue = _issue_queryset().get(id=issue_id)
+    except Issue.DoesNotExist:
+        if correlation is None:
+            return "missing"
+        _delete_work_item_event(connection, correlation)
+        return "deleted"
+
     eligible = is_issue_assignment_eligible(issue, connection)
     update_terminal = bool(connection.workspace_integration.config.get("update_on_completion", True))
     terminal = issue.state and issue.state.group in {StateGroup.COMPLETED, StateGroup.CANCELLED}
@@ -225,7 +233,7 @@ def synchronize_google_calendar_issue(issue_id, connection_id=None):
         return "missing"
 
     results = [
-        _synchronize_issue_for_connection(issue, target_connection_id)
+        _synchronize_issue_for_connection(issue.id, target_connection_id)
         for target_connection_id in _connection_ids_for_issue(issue, connection_id)
     ]
     return results

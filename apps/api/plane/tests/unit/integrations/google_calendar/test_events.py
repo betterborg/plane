@@ -7,6 +7,7 @@ from datetime import date
 import pytest
 from django.test import override_settings
 
+from plane.db.models import IssueLabel
 from plane.integrations.google_calendar.events import build_google_calendar_work_item_event
 from plane.tests.factories import IssueFactory, IssueLabelFactory, LabelFactory
 
@@ -56,6 +57,26 @@ class TestGoogleCalendarWorkItemEvents:
             },
         }
         assert "attendees" not in payload
+
+    @override_settings(APP_BASE_URL="https://plane.example")
+    def test_description_excludes_soft_deleted_issue_labels(self):
+        issue = IssueFactory()
+        IssueLabelFactory(
+            issue=issue,
+            label=LabelFactory(project=issue.project, name="Active"),
+            project=issue.project,
+        )
+        removed_label = IssueLabelFactory(
+            issue=issue,
+            label=LabelFactory(project=issue.project, name="Removed"),
+            project=issue.project,
+        )
+        IssueLabel.objects.filter(id=removed_label.id).delete()
+
+        payload = build_google_calendar_work_item_event(issue)
+
+        assert payload["description"].endswith("Labels: Active")
+        assert "Removed" not in payload["description"]
 
     @override_settings(APP_BASE_URL="https://plane.example")
     @pytest.mark.parametrize(

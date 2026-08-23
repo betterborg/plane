@@ -3,12 +3,14 @@
 # See the LICENSE file for details.
 
 from concurrent.futures import ThreadPoolExecutor
+from threading import Event, current_thread, main_thread
 from unittest.mock import Mock, patch
 
 import pytest
 from django.db import close_old_connections
 
 from plane.bgtasks.google_calendar_task import (
+    _connection_ids_for_issue,
     backfill_google_calendar_open_issues,
     reconcile_google_calendar_connection,
     synchronize_google_calendar_issue,
@@ -252,4 +254,60 @@ def test_concurrent_delivery_creates_one_provider_event_and_one_ledger_row():
 
     assert sorted(results) == [["created"], ["unchanged"]]
     assert client.insert_event.call_count == 1
+    assert GoogleCalendarEvent.objects.filter(connection=connection, entity_id=issue.id).count() == 1
+
+
+@pytest.mark.unit
+@pytest.mark.django_db(transaction=True)
+def test_older_delivery_cannot_overwrite_a_newer_issue_snapshot():
+    workspace_integration = WorkspaceIntegrationFactory(
+        config={"enabled": True, "mode": "assignment", "update_on_completion": True}
+    )
+    issue = IssueFactory(
+        project__workspace=workspace_integration.workspace,
+        name="Old title",
+    )
+    connection = GoogleCalendarConnectionFactory(
+        workspace_integration=workspace_integration,
+        active=True,
+    )
+    IssueAssigneeFactory(issue=issue, assignee=connection.member, project=issue.project)
+    client = _provider_client()
+    old_snapshot_loaded = Event()
+    release_old_delivery = Event()
+
+    def pause_old_delivery(stale_issue, connection_id=None):
+        if current_thread() is not main_thread():
+            assert stale_issue.name == "Old title"
+            old_snapshot_loaded.set()
+            assert release_old_delivery.wait(timeout=10)
+        return _connection_ids_for_issue(stale_issue, connection_id)
+
+    def synchronize_in_thread():
+        close_old_connections()
+        try:
+            return synchronize_google_calendar_issue.run(str(issue.id))
+        finally:
+            close_old_connections()
+
+    with (
+        patch("plane.bgtasks.google_calendar_task.GoogleCalendarClient", return_value=client),
+        patch(
+            "plane.bgtasks.google_calendar_task._connection_ids_for_issue",
+            side_effect=pause_old_delivery,
+        ),
+        ThreadPoolExecutor(max_workers=1) as executor,
+    ):
+        old_delivery = executor.submit(synchronize_in_thread)
+        assert old_snapshot_loaded.wait(timeout=10)
+        issue.name = "New title"
+        issue.save(update_fields=["name", "updated_at"])
+        newer_result = synchronize_google_calendar_issue.run(str(issue.id))
+        release_old_delivery.set()
+        older_result = old_delivery.result(timeout=10)
+
+    assert newer_result == ["created"]
+    assert older_result == ["unchanged"]
+    assert client.insert_event.call_count == 1
+    assert client.insert_event.call_args.args[2]["summary"].endswith("New title")
     assert GoogleCalendarEvent.objects.filter(connection=connection, entity_id=issue.id).count() == 1
