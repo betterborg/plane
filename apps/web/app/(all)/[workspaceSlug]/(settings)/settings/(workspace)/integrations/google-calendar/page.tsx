@@ -19,6 +19,7 @@ import type { Route } from "./+types/page";
 // local imports
 import { GoogleCalendarWorkspaceSettingsHeader } from "./header";
 import { GoogleCalendarMemberConnection } from "./member-connection";
+import { GoogleCalendarWorkspacePolicy } from "./workspace-policy";
 
 function GoogleCalendarSettingsPage({ params }: Route.ComponentProps) {
   // router
@@ -45,6 +46,7 @@ function GoogleCalendarSettingsPage({ params }: Route.ComponentProps) {
           description={t("workspace_settings.settings.integrations.google_calendar.description")}
         />
         <GoogleCalendarMemberConnection workspaceSlug={workspaceSlug} />
+        <GoogleCalendarWorkspacePolicy workspaceSlug={workspaceSlug} />
       </div>
     </SettingsContentWrapper>
   );
