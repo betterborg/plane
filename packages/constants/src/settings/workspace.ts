@@ -59,7 +59,7 @@ export const WORKSPACE_SETTINGS: Record<TWorkspaceSettingsTabs, TWorkspaceSettin
     key: "integrations",
     i18n_label: "workspace_settings.settings.integrations.title",
     href: `/settings/integrations`,
-    access: [EUserWorkspaceRoles.ADMIN],
+    access: [EUserWorkspaceRoles.ADMIN, EUserWorkspaceRoles.MEMBER, EUserWorkspaceRoles.GUEST],
     highlight: (pathname: string, baseUrl: string) => pathname.startsWith(`${baseUrl}/settings/integrations/`),
   },
   webhooks: {

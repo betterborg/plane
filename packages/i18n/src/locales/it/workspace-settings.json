@@ -177,7 +177,13 @@
         "heading": "Integrazioni",
         "description": "Connettiti a strumenti e servizi popolari per sincronizzare il tuo lavoro nell'intero ecosistema del tuo flusso di lavoro.",
         "page_title": "Lavora con i tuoi dati Plane nelle app disponibili o nelle tue.",
-        "page_description": "Visualizza tutte le integrazioni utilizzate da questo workspace o da te."
+        "page_description": "Visualizza tutte le integrazioni utilizzate da questo workspace o da te.",
+        "google_calendar": {
+          "title": "Google Calendar",
+          "heading": "Google Calendar",
+          "description": "Keep your assigned Plane work items in sync with Google Calendar.",
+          "card_description": "View and manage assigned work items from your Google Calendar."
+        }
       },
       "imports": {
         "title": "Importazioni",

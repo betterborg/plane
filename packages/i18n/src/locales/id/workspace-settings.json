@@ -177,7 +177,13 @@
         "heading": "Integrasi",
         "description": "Hubungkan dengan alat dan layanan populer untuk menyinkronkan pekerjaan Anda di seluruh ekosistem alur kerja Anda.",
         "page_title": "Gunakan data Plane Anda di aplikasi yang tersedia atau aplikasi Anda sendiri.",
-        "page_description": "Lihat semua integrasi yang digunakan oleh workspace ini atau oleh Anda."
+        "page_description": "Lihat semua integrasi yang digunakan oleh workspace ini atau oleh Anda.",
+        "google_calendar": {
+          "title": "Google Calendar",
+          "heading": "Google Calendar",
+          "description": "Keep your assigned Plane work items in sync with Google Calendar.",
+          "card_description": "View and manage assigned work items from your Google Calendar."
+        }
       },
       "imports": {
         "title": "Impor",

@@ -177,7 +177,13 @@
         "heading": "Integrácie",
         "description": "Prepojte sa s populárnymi nástrojmi a službami a synchronizujte svoju prácu v rámci celého ekosystému pracovného postupu.",
         "page_title": "Pracujte so svojimi údajmi Plane v dostupných aplikáciách alebo vo vlastných.",
-        "page_description": "Zobraziť všetky integrácie používané týmto pracovným priestorom alebo vami."
+        "page_description": "Zobraziť všetky integrácie používané týmto pracovným priestorom alebo vami.",
+        "google_calendar": {
+          "title": "Google Calendar",
+          "heading": "Google Calendar",
+          "description": "Keep your assigned Plane work items in sync with Google Calendar.",
+          "card_description": "View and manage assigned work items from your Google Calendar."
+        }
       },
       "imports": {
         "title": "Importy",
