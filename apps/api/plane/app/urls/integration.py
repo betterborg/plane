@@ -5,6 +5,7 @@
 from django.urls import path
 
 from plane.app.views import (
+    GoogleCalendarConnectionEndpoint,
     GoogleCalendarConnectionRosterEndpoint,
     GoogleCalendarOAuthStartEndpoint,
     GoogleCalendarWorkspacePolicyEndpoint,
@@ -32,5 +33,10 @@ urlpatterns = [
         "workspaces/<str:slug>/integrations/google-calendar/connections/",
         GoogleCalendarConnectionRosterEndpoint.as_view(),
         name="google-calendar-connection-roster",
+    ),
+    path(
+        "workspaces/<str:slug>/integrations/google-calendar/connections/<uuid:member_id>/",
+        GoogleCalendarConnectionEndpoint.as_view(),
+        name="google-calendar-connection",
     ),
 ]
