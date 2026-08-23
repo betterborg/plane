@@ -78,6 +78,7 @@ from plane.db.models import (
     CycleIssue,
     Workspace,
 )
+from plane.db.signals import suppress_google_calendar_issue_signal_dispatch
 from plane.settings.storage import S3Storage
 from plane.utils.path_validator import sanitize_filename
 from plane.utils.order_queryset import (
@@ -493,7 +494,8 @@ class IssueListCreateAPIEndpoint(BaseAPIView):
             issue = Issue.objects.filter(workspace__slug=slug, project_id=project_id, pk=serializer.data["id"]).first()
             issue.created_at = request.data.get("created_at", timezone.now())
             issue.created_by_id = request.data.get("created_by", request.user.id)
-            issue.save(update_fields=["created_at", "created_by"])
+            with suppress_google_calendar_issue_signal_dispatch():
+                issue.save(update_fields=["created_at", "created_by"])
 
             # Track the issue
             issue_activity.delay(
@@ -715,7 +717,8 @@ class IssueDetailAPIEndpoint(BaseAPIView):
                     # default states given.
                     issue.created_at = request.data.get("created_at", timezone.now())
                     issue.created_by_id = request.data.get("created_by", request.user.id)
-                    issue.save(update_fields=["created_at", "created_by"])
+                    with suppress_google_calendar_issue_signal_dispatch():
+                        issue.save(update_fields=["created_at", "created_by"])
 
                     issue_activity.delay(
                         type="issue.activity.created",
