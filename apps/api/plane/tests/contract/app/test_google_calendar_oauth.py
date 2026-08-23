@@ -21,13 +21,16 @@ from plane.app.views.google_calendar_oauth import (
     StaleGoogleCalendarOAuthAttempt,
     _complete_callback,
 )
+from plane.bgtasks.google_calendar_task import reconcile_google_calendar_connection
 from plane.db.models import GoogleCalendarConnection, WorkspaceMember
 from plane.integrations.google_calendar.lifecycle import (
     lock_google_calendar_connection,
     request_google_calendar_disconnect,
 )
 from plane.integrations.google_calendar.oauth import (
+    GOOGLE_CALENDAR_LIST_SCOPE,
     GOOGLE_CALENDAR_SCOPE,
+    GOOGLE_CALENDAR_SCOPES,
     GoogleCalendarOAuthCredentials,
     GoogleCalendarOAuthExchangeError,
     GoogleCalendarOAuthGrant,
@@ -62,7 +65,7 @@ def complete_grant():
         access_token="new-access-token",
         refresh_token="new-refresh-token",
         token_expires_at=timezone.now() + timedelta(hours=1),
-        scopes=frozenset({"openid", "email", GOOGLE_CALENDAR_SCOPE}),
+        scopes=frozenset({"openid", "email", GOOGLE_CALENDAR_SCOPE, GOOGLE_CALENDAR_LIST_SCOPE}),
     )
 
 
@@ -127,6 +130,32 @@ class TestGoogleCalendarOAuth:
         assert not GoogleCalendarConnection.objects.exists()
 
     @pytest.mark.django_db
+    def test_nonterminal_cleanup_blocks_a_fresh_account_start(
+        self,
+        session_client,
+        workspace,
+        calendar_workspace_integration,
+        oauth_credentials,
+        create_user,
+    ):
+        GoogleCalendarConnectionFactory(
+            workspace_integration=calendar_workspace_integration,
+            member=create_user,
+            provider_account_id="old-google-account",
+            calendar_id="old-plane-calendar",
+            refresh_token="old-refresh-token",
+            desired_state=GoogleCalendarConnection.DesiredState.DISCONNECTED,
+            status=GoogleCalendarConnection.Status.CLEANUP_PENDING,
+            lifecycle_generation=6,
+            last_error="Google Calendar deletion failed",
+        )
+
+        response = _start_consent(session_client, workspace, oauth_credentials)
+
+        assert response.status_code == status.HTTP_409_CONFLICT
+        assert response.data == {"error": "google_calendar_disconnect_in_progress"}
+
+    @pytest.mark.django_db
     def test_start_constructs_exact_offline_pkce_consent_and_one_bounded_attempt(
         self,
         session_client,
@@ -144,7 +173,12 @@ class TestGoogleCalendarOAuth:
         assert second_response.status_code == status.HTTP_302_FOUND
         assert first_state != second_state
         query = parse_qs(urlparse(second_response.url).query)
-        assert set(query["scope"][0].split()) == {"openid", "email", GOOGLE_CALENDAR_SCOPE}
+        assert set(query["scope"][0].split()) == {
+            "openid",
+            "email",
+            GOOGLE_CALENDAR_SCOPE,
+            GOOGLE_CALENDAR_LIST_SCOPE,
+        }
         assert query["access_type"] == ["offline"]
         assert query["prompt"] == ["consent"]
         assert query["code_challenge_method"] == ["S256"]
@@ -172,9 +206,7 @@ class TestGoogleCalendarOAuth:
         assert response.status_code == status.HTTP_302_FOUND
         assert _redirect_error(response) == "google_calendar_oauth_stale"
         connection = GoogleCalendarConnection.objects.get()
-        assert connection.oauth_state == session_client.session[GOOGLE_CALENDAR_OAUTH_SESSION_KEY][
-            "attempt_generation"
-        ]
+        assert connection.oauth_state == session_client.session[GOOGLE_CALENDAR_OAUTH_SESSION_KEY]["attempt_generation"]
         assert new_state
 
     @pytest.mark.django_db
@@ -541,6 +573,125 @@ class TestGoogleCalendarOAuth:
         assert connection.refresh_token == "old-refresh-token"
         assert connection.status == GoogleCalendarConnection.Status.ACTIVE
         assert connection.lifecycle_generation == 5
+
+    @pytest.mark.django_db(transaction=True)
+    def test_complete_account_switch_crosses_oauth_cleanup_tombstone_and_reprovisioning(
+        self,
+        session_client,
+        workspace,
+        calendar_workspace_integration,
+        oauth_credentials,
+        complete_grant,
+        create_user,
+    ):
+        connection = GoogleCalendarConnectionFactory(
+            workspace_integration=calendar_workspace_integration,
+            member=create_user,
+            provider_account_id="old-google-account",
+            provider_email="old@example.com",
+            calendar_id="old-plane-calendar",
+            access_token="old-access-token",
+            refresh_token="old-refresh-token",
+            desired_state=GoogleCalendarConnection.DesiredState.CONNECTED,
+            status=GoogleCalendarConnection.Status.ACTIVE,
+            lifecycle_generation=8,
+        )
+        lifecycle_task = Mock()
+        reconnect_client = Mock(access_token=None)
+        delete_client = Mock(access_token=None)
+        revoke_client = Mock(access_token=None)
+        create_client = Mock(access_token=None)
+        create_client.find_calendar.return_value = None
+        create_client.create_calendar.return_value = "new-plane-calendar"
+
+        def complete_callback(grant, identity, code):
+            callback_state = _state_from_response(_start_consent(session_client, workspace, oauth_credentials))
+            with (
+                override_settings(GOOGLE_CALENDAR_RELEASED=True, APP_BASE_URL="https://plane.example"),
+                patch(
+                    "plane.app.views.google_calendar_oauth.get_google_calendar_oauth_credentials",
+                    return_value=oauth_credentials,
+                ),
+                patch("plane.app.views.google_calendar_oauth.exchange_google_calendar_code", return_value=grant),
+                patch("plane.app.views.google_calendar_oauth.get_google_calendar_identity", return_value=identity),
+                patch("plane.app.views.google_calendar_oauth.current_app.signature", return_value=lifecycle_task),
+            ):
+                return session_client.get(_callback_url(), {"state": callback_state, "code": code})
+
+        with (
+            patch("plane.integrations.google_calendar.lifecycle._acquire_advisory_xact_lock"),
+            patch("plane.app.views.google_calendar_oauth.revoke_rejected_google_calendar_grant") as reject_grant,
+            patch(
+                "plane.bgtasks.google_calendar_task.GoogleCalendarClient",
+                side_effect=[reconnect_client, delete_client, revoke_client, create_client],
+            ),
+        ):
+            mismatch_response = complete_callback(
+                complete_grant,
+                GoogleCalendarOAuthIdentity("new-google-account", "new@example.com"),
+                "mismatch-code",
+            )
+
+            assert _redirect_error(mismatch_response) == "account_switch_requires_disconnect"
+            reject_grant.assert_called_once_with(complete_grant)
+            connection.refresh_from_db()
+            assert connection.provider_account_id == "old-google-account"
+            assert connection.calendar_id == "old-plane-calendar"
+            assert connection.lifecycle_generation == 8
+
+            old_account_grant = GoogleCalendarOAuthGrant(
+                access_token="reconnected-access-token",
+                refresh_token="reconnected-refresh-token",
+                token_expires_at=complete_grant.token_expires_at,
+                scopes=GOOGLE_CALENDAR_SCOPES,
+            )
+            reconnect_response = complete_callback(
+                old_account_grant,
+                GoogleCalendarOAuthIdentity("old-google-account", "old-reconnected@example.com"),
+                "reconnect-code",
+            )
+
+            assert not _redirect_error(reconnect_response)
+            connection.refresh_from_db()
+            assert reconcile_google_calendar_connection(str(connection.id), connection.lifecycle_generation) == "active"
+
+            connection.refresh_from_db()
+            disconnect = request_google_calendar_disconnect(connection.id, connection.lifecycle_generation)
+            assert disconnect is not None
+            assert reconcile_google_calendar_connection(str(connection.id), disconnect.generation) == "disconnected"
+
+            connection.refresh_from_db()
+            assert connection.provider_account_id == ""
+            assert connection.provider_email == ""
+            assert connection.calendar_id == ""
+            assert connection.access_token == ""
+            assert connection.refresh_token == ""
+            assert connection.status == GoogleCalendarConnection.Status.DISCONNECTED
+
+            new_account_grant = GoogleCalendarOAuthGrant(
+                access_token="new-access-token",
+                refresh_token="new-refresh-token",
+                token_expires_at=complete_grant.token_expires_at,
+                scopes=GOOGLE_CALENDAR_SCOPES,
+            )
+            new_account_response = complete_callback(
+                new_account_grant,
+                GoogleCalendarOAuthIdentity("new-google-account", "new@example.com"),
+                "new-account-code",
+            )
+
+            assert not _redirect_error(new_account_response)
+            connection.refresh_from_db()
+            assert reconcile_google_calendar_connection(str(connection.id), connection.lifecycle_generation) == "active"
+
+        connection.refresh_from_db()
+        reconnect_client.create_calendar.assert_not_called()
+        delete_client.delete_calendar.assert_called_once_with("old-plane-calendar")
+        revoke_client.revoke_grant.assert_called_once_with()
+        create_client.create_calendar.assert_called_once()
+        assert connection.provider_account_id == "new-google-account"
+        assert connection.calendar_id == "new-plane-calendar"
+        assert connection.status == GoogleCalendarConnection.Status.ACTIVE
 
     @pytest.mark.django_db
     def test_different_account_does_not_revoke_grant_used_by_another_connection(

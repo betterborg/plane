@@ -8,6 +8,7 @@ import pytest
 from django.utils import timezone
 
 from plane.integrations.google_calendar.oauth import (
+    GOOGLE_CALENDAR_LIST_SCOPE,
     GOOGLE_CALENDAR_SCOPE,
     GoogleCalendarOAuthCredentials,
     GoogleCalendarOAuthGrant,
@@ -28,7 +29,7 @@ class TestGoogleCalendarOAuthProvider:
             "access_token": "access-token",
             "refresh_token": "refresh-token",
             "expires_in": 3600,
-            "scope": f"openid email {GOOGLE_CALENDAR_SCOPE}",
+            "scope": f"openid email {GOOGLE_CALENDAR_SCOPE} {GOOGLE_CALENDAR_LIST_SCOPE}",
         }
 
         with patch("plane.integrations.google_calendar.oauth.requests.post", return_value=response) as post:
@@ -51,7 +52,7 @@ class TestGoogleCalendarOAuthProvider:
     def test_scope_validation_rejects_extra_or_missing_scope(self):
         for scopes in (
             frozenset({"openid", "email"}),
-            frozenset({"openid", "email", GOOGLE_CALENDAR_SCOPE, "profile"}),
+            frozenset({"openid", "email", GOOGLE_CALENDAR_SCOPE, GOOGLE_CALENDAR_LIST_SCOPE, "profile"}),
         ):
             grant = GoogleCalendarOAuthGrant(
                 access_token="access-token",
@@ -68,7 +69,7 @@ class TestGoogleCalendarOAuthProvider:
             access_token="access-token",
             refresh_token="refresh-token",
             token_expires_at=timezone.now(),
-            scopes=frozenset({"openid", "email", GOOGLE_CALENDAR_SCOPE}),
+            scopes=frozenset({"openid", "email", GOOGLE_CALENDAR_SCOPE, GOOGLE_CALENDAR_LIST_SCOPE}),
         )
         response = Mock()
         response.json.return_value = {

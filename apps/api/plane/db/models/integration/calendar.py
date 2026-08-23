@@ -59,6 +59,7 @@ class GoogleCalendarConnection(BaseModel):
     provider_account_id = models.CharField(max_length=255, blank=True)
     provider_email = models.EmailField(blank=True)
     calendar_id = models.CharField(max_length=255, blank=True)
+    calendar_operation_id = models.UUIDField(null=True, blank=True)
     access_token = EncryptedTextField(blank=True)
     refresh_token = EncryptedTextField(blank=True)
     token_expires_at = models.DateTimeField(null=True, blank=True)
@@ -68,6 +69,7 @@ class GoogleCalendarConnection(BaseModel):
     desired_state = models.CharField(max_length=32, choices=DesiredState.choices, default=DesiredState.DISCONNECTED)
     status = models.CharField(max_length=32, choices=Status.choices, default=Status.DISCONNECTED)
     lifecycle_generation = models.PositiveBigIntegerField(default=0)
+    retain_grant_after_cleanup = models.BooleanField(default=False)
     last_error = models.TextField(blank=True)
 
     # Short-lived OAuth attempt state is kept separate from the durable lifecycle.

@@ -28,7 +28,8 @@ GOOGLE_CALENDAR_TOKEN_URL = "https://oauth2.googleapis.com/token"
 GOOGLE_CALENDAR_USERINFO_URL = "https://openidconnect.googleapis.com/v1/userinfo"
 GOOGLE_CALENDAR_REVOCATION_URL = "https://oauth2.googleapis.com/revoke"
 GOOGLE_CALENDAR_SCOPE = "https://www.googleapis.com/auth/calendar.app.created"
-GOOGLE_CALENDAR_SCOPES = frozenset({"openid", "email", GOOGLE_CALENDAR_SCOPE})
+GOOGLE_CALENDAR_LIST_SCOPE = "https://www.googleapis.com/auth/calendar.calendarlist.readonly"
+GOOGLE_CALENDAR_SCOPES = frozenset({"openid", "email", GOOGLE_CALENDAR_SCOPE, GOOGLE_CALENDAR_LIST_SCOPE})
 GOOGLE_CALENDAR_OAUTH_TIMEOUT = 10
 
 
