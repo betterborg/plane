@@ -46,7 +46,11 @@ def _normal_summary(issue):
 
 def _description(issue):
     label_names = sorted(
-        IssueLabel.objects.filter(issue_id=issue.id, deleted_at__isnull=True).values_list("label__name", flat=True),
+        IssueLabel.objects.filter(
+            issue_id=issue.id,
+            deleted_at__isnull=True,
+            label__deleted_at__isnull=True,
+        ).values_list("label__name", flat=True),
         key=str.casefold,
     )
     return "\n".join(

@@ -3,7 +3,7 @@
 # See the LICENSE file for details.
 
 from concurrent.futures import ThreadPoolExecutor
-from threading import Event, current_thread, main_thread
+from threading import Barrier, Event, current_thread, main_thread
 from unittest.mock import Mock, patch
 
 import pytest
@@ -11,6 +11,7 @@ from django.db import close_old_connections
 
 from plane.bgtasks.google_calendar_task import (
     _connection_ids_for_issue,
+    _synchronize_issue_for_connection,
     backfill_google_calendar_open_issues,
     reconcile_google_calendar_connection,
     synchronize_google_calendar_issue,
@@ -255,6 +256,53 @@ def test_concurrent_delivery_creates_one_provider_event_and_one_ledger_row():
     assert sorted(results) == [["created"], ["unchanged"]]
     assert client.insert_event.call_count == 1
     assert GoogleCalendarEvent.objects.filter(connection=connection, entity_id=issue.id).count() == 1
+
+
+@pytest.mark.unit
+@pytest.mark.django_db(transaction=True)
+def test_concurrent_delivery_of_hard_deleted_issue_removes_one_correlation_without_error():
+    workspace_integration = WorkspaceIntegrationFactory(
+        config={"enabled": True, "mode": "assignment", "update_on_completion": True}
+    )
+    issue = IssueFactory(project__workspace=workspace_integration.workspace)
+    issue_id = issue.id
+    connection = GoogleCalendarConnectionFactory(
+        workspace_integration=workspace_integration,
+        active=True,
+    )
+    IssueAssigneeFactory(issue=issue, assignee=connection.member, project=issue.project)
+    client = _provider_client()
+
+    with patch("plane.bgtasks.google_calendar_task.GoogleCalendarClient", return_value=client):
+        synchronize_google_calendar_issue.run(str(issue_id))
+    issue.delete(soft=False)
+    deliveries_ready = Barrier(2)
+
+    def synchronize_after_both_deliveries_read_the_correlation(deleted_issue_id, connection_id):
+        deliveries_ready.wait(timeout=10)
+        return _synchronize_issue_for_connection(deleted_issue_id, connection_id)
+
+    def synchronize_in_thread():
+        close_old_connections()
+        try:
+            return synchronize_google_calendar_issue.run(str(issue_id))
+        finally:
+            close_old_connections()
+
+    client.reset_mock()
+    with (
+        patch("plane.bgtasks.google_calendar_task.GoogleCalendarClient", return_value=client),
+        patch(
+            "plane.bgtasks.google_calendar_task._synchronize_issue_for_connection",
+            side_effect=synchronize_after_both_deliveries_read_the_correlation,
+        ),
+        ThreadPoolExecutor(max_workers=2) as executor,
+    ):
+        results = [future.result(timeout=10) for future in [executor.submit(synchronize_in_thread) for _ in range(2)]]
+
+    assert results == ["missing", "missing"]
+    assert client.delete_event.call_count == 1
+    assert GoogleCalendarEvent.objects.filter(connection=connection, entity_id=issue_id).count() == 0
 
 
 @pytest.mark.unit

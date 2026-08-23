@@ -219,17 +219,17 @@ def synchronize_google_calendar_issue(issue_id, connection_id=None):
     try:
         issue = _issue_queryset().get(id=issue_id)
     except Issue.DoesNotExist:
-        correlations = GoogleCalendarEvent.objects.filter(
-            entity_type=GoogleCalendarEvent.EntityType.WORK_ITEM,
-            entity_id=issue_id,
-        ).select_related("connection")
-        for correlation in correlations:
-            with transaction.atomic():
-                locked_connection = GoogleCalendarConnection.objects.select_for_update().get(
-                    id=correlation.connection_id
-                )
-                locked_correlation = GoogleCalendarEvent.objects.get(id=correlation.id)
-                _delete_work_item_event(locked_connection, locked_correlation)
+        if connection_id is not None:
+            target_connection_ids = [UUID(str(connection_id))]
+        else:
+            target_connection_ids = list(
+                GoogleCalendarEvent.objects.filter(
+                    entity_type=GoogleCalendarEvent.EntityType.WORK_ITEM,
+                    entity_id=issue_id,
+                ).values_list("connection_id", flat=True)
+            )
+        for target_connection_id in target_connection_ids:
+            _synchronize_issue_for_connection(issue_id, target_connection_id)
         return "missing"
 
     results = [
