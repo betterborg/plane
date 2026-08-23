@@ -9,10 +9,18 @@ from rest_framework import status
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
-from plane.app.permissions import WorkspaceOwnerPermission
-from plane.app.serializers import GoogleCalendarWorkspacePolicySerializer
+from plane.app.permissions import WorkspaceMemberPermission, WorkspaceOwnerPermission
+from plane.app.serializers import (
+    GoogleCalendarConnectionRosterSerializer,
+    GoogleCalendarWorkspacePolicyReadSerializer,
+    GoogleCalendarWorkspacePolicySerializer,
+)
+from plane.app.serializers.integration import (
+    GOOGLE_CALENDAR_PUBLIC_STATUSES,
+    serialize_google_calendar_connection_status,
+)
 from plane.app.views.base import BaseAPIView
-from plane.db.models import Integration, Workspace, WorkspaceIntegration
+from plane.db.models import GoogleCalendarConnection, Integration, Workspace, WorkspaceIntegration
 from plane.integrations.google_calendar.dispatch import (
     GOOGLE_CALENDAR_LIFECYCLE_TASK,
     enqueue_google_calendar_task_on_commit,
@@ -36,6 +44,84 @@ def _has_complete_google_calendar_credentials():
     except GoogleCalendarOAuthConfigurationError:
         return False
     return True
+
+
+def _calendar_workspace_integration(workspace):
+    return (
+        WorkspaceIntegration.objects.filter(
+            workspace=workspace,
+            integration__provider="google_calendar",
+        )
+        .select_related("integration")
+        .first()
+    )
+
+
+class GoogleCalendarWorkspaceStatusEndpoint(BaseAPIView):
+    """Return Calendar availability, public policy, and the caller's status."""
+
+    permission_classes = [WorkspaceMemberPermission]
+
+    def get_permissions(self):
+        if not settings.GOOGLE_CALENDAR_RELEASED:
+            return [IsAuthenticated()]
+        return super().get_permissions()
+
+    def get(self, request, slug):
+        if not settings.GOOGLE_CALENDAR_RELEASED:
+            return Response({"error": "Not found"}, status=status.HTTP_404_NOT_FOUND)
+
+        workspace = Workspace.objects.get(slug=slug)
+        workspace_integration = _calendar_workspace_integration(workspace)
+        policy = GoogleCalendarWorkspacePolicyReadSerializer(
+            workspace_integration.config if workspace_integration is not None else {}
+        ).data
+        connection = None
+        if workspace_integration is not None:
+            connection = GoogleCalendarConnection.objects.filter(
+                workspace_integration=workspace_integration,
+                member=request.user,
+            ).first()
+
+        return Response(
+            {
+                "available": _has_complete_google_calendar_credentials(),
+                "policy": policy,
+                "connection": serialize_google_calendar_connection_status(connection),
+            },
+            status=status.HTTP_200_OK,
+        )
+
+
+class GoogleCalendarConnectionRosterEndpoint(BaseAPIView):
+    """Return active members with a non-tombstone Calendar connection."""
+
+    permission_classes = [WorkspaceOwnerPermission]
+
+    def get_permissions(self):
+        if not settings.GOOGLE_CALENDAR_RELEASED:
+            return [IsAuthenticated()]
+        return super().get_permissions()
+
+    def get(self, request, slug):
+        if not settings.GOOGLE_CALENDAR_RELEASED:
+            return Response({"error": "Not found"}, status=status.HTTP_404_NOT_FOUND)
+
+        connections = (
+            GoogleCalendarConnection.objects.filter(
+                workspace_integration__workspace__slug=slug,
+                workspace_integration__integration__provider="google_calendar",
+                member__member_workspace__workspace__slug=slug,
+                member__member_workspace__is_active=True,
+                status__in=GOOGLE_CALENDAR_PUBLIC_STATUSES,
+            )
+            .select_related("member")
+            .order_by("member__display_name", "member_id")
+        )
+        return Response(
+            GoogleCalendarConnectionRosterSerializer(connections, many=True).data,
+            status=status.HTTP_200_OK,
+        )
 
 
 class GoogleCalendarWorkspacePolicyEndpoint(BaseAPIView):
