@@ -2,10 +2,14 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # See the LICENSE file for details.
 
+from unittest import mock
+
 import pytest
 from rest_framework import status
 
-from plane.db.models import Issue, Project, ProjectMember, State
+from plane.app.serializers.issue import IssueCreateSerializer
+from plane.db.models import Issue, IssueAssignee, IssueLabel, Label, Project, ProjectMember, State
+from plane.db.signals import suppress_google_calendar_issue_signal_dispatch
 
 
 @pytest.fixture
@@ -46,6 +50,138 @@ def issue(db, workspace, project, state, create_user):
         state=state,
         created_by=create_user,
     )
+
+
+@pytest.fixture
+def label(db, workspace, project):
+    return Label.objects.create(name="Calendar", workspace=workspace, project=project, color="#60646C")
+
+
+def assert_calendar_dispatch_sees_relations(enqueue, assignee_ids, label_ids):
+    assert enqueue.call_count == 1
+    issue_id = enqueue.call_args.args[1]
+    assert set(IssueAssignee.objects.filter(issue_id=issue_id).values_list("assignee_id", flat=True)) == set(
+        assignee_ids
+    )
+    assert set(IssueLabel.objects.filter(issue_id=issue_id).values_list("label_id", flat=True)) == set(label_ids)
+
+
+@pytest.mark.contract
+@pytest.mark.django_db(transaction=True)
+class TestIssueCalendarDispatch:
+    def public_collection_url(self, workspace_slug, project_id):
+        return f"/api/v1/workspaces/{workspace_slug}/projects/{project_id}/work-items/"
+
+    def test_app_create_and_update_each_dispatch_once_after_relations(
+        self, workspace, project, state, label, create_user
+    ):
+        create_payload = {
+            "name": "App-created work item",
+            "state_id": str(state.id),
+            "target_date": "2026-09-01",
+            "assignee_ids": [str(create_user.id)],
+            "label_ids": [str(label.id)],
+        }
+        context = {
+            "project_id": project.id,
+            "workspace_id": workspace.id,
+            "default_assignee_id": None,
+        }
+        serializer = IssueCreateSerializer(data=create_payload, context=context)
+        assert serializer.is_valid(), serializer.errors
+
+        with mock.patch("plane.db.signals.enqueue_google_calendar_task_on_commit") as enqueue:
+            created_issue = serializer.save()
+
+        assert_calendar_dispatch_sees_relations(enqueue, [create_user.id], [label.id])
+
+        update_serializer = IssueCreateSerializer(
+            created_issue,
+            data={"name": "App-updated work item", "assignee_ids": [], "label_ids": []},
+            partial=True,
+            context={"project_id": project.id},
+        )
+        assert update_serializer.is_valid(), update_serializer.errors
+
+        with mock.patch("plane.db.signals.enqueue_google_calendar_task_on_commit") as enqueue:
+            update_serializer.save()
+
+        assert_calendar_dispatch_sees_relations(enqueue, [], [])
+
+    def test_public_post_dispatches_once_and_suppresses_audit_save(
+        self, api_key_client, workspace, project, state, label, create_user
+    ):
+        payload = {
+            "name": "Public POST work item",
+            "state": str(state.id),
+            "target_date": "2026-09-01",
+            "assignees": [str(create_user.id)],
+            "labels": [str(label.id)],
+        }
+
+        with mock.patch("plane.db.signals.enqueue_google_calendar_task_on_commit") as enqueue:
+            response = api_key_client.post(
+                self.public_collection_url(workspace.slug, project.id),
+                payload,
+                format="json",
+            )
+
+        assert response.status_code == status.HTTP_201_CREATED, response.data
+        assert_calendar_dispatch_sees_relations(enqueue, [create_user.id], [label.id])
+
+    def test_public_create_on_upsert_dispatches_once_and_suppresses_audit_save(
+        self, api_key_client, workspace, project, state, label, create_user
+    ):
+        payload = {
+            "name": "Public PUT-created work item",
+            "state": str(state.id),
+            "target_date": "2026-09-01",
+            "external_id": "calendar-create",
+            "external_source": "calendar-test",
+            "assignees": [str(create_user.id)],
+            "labels": [str(label.id)],
+        }
+
+        with mock.patch("plane.db.signals.enqueue_google_calendar_task_on_commit") as enqueue:
+            response = api_key_client.put(
+                self.public_collection_url(workspace.slug, project.id),
+                payload,
+                format="json",
+            )
+
+        assert response.status_code == status.HTTP_201_CREATED, response.data
+        assert_calendar_dispatch_sees_relations(enqueue, [create_user.id], [label.id])
+
+    def test_public_existing_upsert_dispatches_once_after_updated_relations(
+        self, api_key_client, workspace, project, state, label, create_user
+    ):
+        with suppress_google_calendar_issue_signal_dispatch():
+            existing_issue = Issue.objects.create(
+                name="Existing public work item",
+                project=project,
+                state=state,
+                target_date="2026-09-01",
+                external_id="calendar-update",
+                external_source="calendar-test",
+            )
+
+        payload = {
+            "name": "Updated public work item",
+            "external_id": existing_issue.external_id,
+            "external_source": existing_issue.external_source,
+            "assignees": [str(create_user.id)],
+            "labels": [str(label.id)],
+        }
+
+        with mock.patch("plane.db.signals.enqueue_google_calendar_task_on_commit") as enqueue:
+            response = api_key_client.put(
+                self.public_collection_url(workspace.slug, project.id),
+                payload,
+                format="json",
+            )
+
+        assert response.status_code == status.HTTP_200_OK, response.data
+        assert_calendar_dispatch_sees_relations(enqueue, [create_user.id], [label.id])
 
 
 @pytest.mark.contract

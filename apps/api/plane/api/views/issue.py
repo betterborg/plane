@@ -78,6 +78,7 @@ from plane.db.models import (
     CycleIssue,
     Workspace,
 )
+from plane.db.signals import suppress_google_calendar_issue_signal_dispatch
 from plane.settings.storage import S3Storage
 from plane.utils.path_validator import sanitize_filename
 from plane.utils.order_queryset import (
@@ -255,7 +256,7 @@ class WorkspaceIssueAPIEndpoint(BaseAPIView):
 
 class IssueListCreateAPIEndpoint(BaseAPIView):
     """
-    This viewset provides `list` and `create` on issue level
+    This viewset provides `list`, `create`, and `upsert` on issue level
     """
 
     model = Issue
@@ -493,7 +494,8 @@ class IssueListCreateAPIEndpoint(BaseAPIView):
             issue = Issue.objects.filter(workspace__slug=slug, project_id=project_id, pk=serializer.data["id"]).first()
             issue.created_at = request.data.get("created_at", timezone.now())
             issue.created_by_id = request.data.get("created_by", request.user.id)
-            issue.save(update_fields=["created_at", "created_by"])
+            with suppress_google_calendar_issue_signal_dispatch():
+                issue.save(update_fields=["created_at", "created_by"])
 
             # Track the issue
             issue_activity.delay(
@@ -520,75 +522,6 @@ class IssueListCreateAPIEndpoint(BaseAPIView):
             )
             return Response(serializer.data, status=status.HTTP_201_CREATED)
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-
-
-class IssueDetailAPIEndpoint(BaseAPIView):
-    """Issue Detail Endpoint"""
-
-    model = Issue
-    webhook_event = "issue"
-    permission_classes = [ProjectEntityPermission]
-    serializer_class = IssueSerializer
-    use_read_replica = True
-
-    def get_queryset(self):
-        return (
-            Issue.issue_objects.annotate(
-                sub_issues_count=Issue.issue_objects.filter(parent=OuterRef("id"))
-                .order_by()
-                .annotate(count=Func(F("id"), function="Count"))
-                .values("count")
-            )
-            .filter(project_id=self.kwargs.get("project_id"))
-            .filter(workspace__slug=self.kwargs.get("slug"))
-            .select_related("project")
-            .select_related("workspace")
-            .select_related("state")
-            .select_related("parent")
-            .prefetch_related("assignees")
-            .prefetch_related("labels")
-            .order_by(self.kwargs.get("order_by", "-created_at"))
-        ).distinct()
-
-    @work_item_docs(
-        operation_id="retrieve_work_item",
-        summary="Retrieve work item",
-        description="Retrieve details of a specific work item.",
-        parameters=[
-            PROJECT_ID_PARAMETER,
-            EXTERNAL_ID_PARAMETER,
-            EXTERNAL_SOURCE_PARAMETER,
-            ORDER_BY_PARAMETER,
-            FIELDS_PARAMETER,
-            EXPAND_PARAMETER,
-        ],
-        responses={
-            200: OpenApiResponse(
-                description="List of issues or issue details",
-                response=IssueSerializer,
-                examples=[ISSUE_EXAMPLE],
-            ),
-            400: INVALID_REQUEST_RESPONSE,
-            404: WORK_ITEM_NOT_FOUND_RESPONSE,
-        },
-    )
-    def get(self, request, slug, project_id, pk):
-        """Retrieve work item
-
-        Retrieve details of a specific work item.
-        Supports filtering, ordering, and field selection through query parameters.
-        """
-
-        issue = Issue.issue_objects.annotate(
-            sub_issues_count=Issue.issue_objects.filter(parent=OuterRef("id"))
-            .order_by()
-            .annotate(count=Func(F("id"), function="Count"))
-            .values("count")
-        ).get(workspace__slug=slug, project_id=project_id, pk=pk)
-        return Response(
-            IssueSerializer(issue, fields=self.fields, expand=self.expand).data,
-            status=status.HTTP_200_OK,
-        )
 
     @work_item_docs(
         operation_id="put_work_item",
@@ -715,7 +648,8 @@ class IssueDetailAPIEndpoint(BaseAPIView):
                     # default states given.
                     issue.created_at = request.data.get("created_at", timezone.now())
                     issue.created_by_id = request.data.get("created_by", request.user.id)
-                    issue.save(update_fields=["created_at", "created_by"])
+                    with suppress_google_calendar_issue_signal_dispatch():
+                        issue.save(update_fields=["created_at", "created_by"])
 
                     issue_activity.delay(
                         type="issue.activity.created",
@@ -745,6 +679,75 @@ class IssueDetailAPIEndpoint(BaseAPIView):
                 {"error": "external_id and external_source are required"},
                 status=status.HTTP_400_BAD_REQUEST,
             )
+
+
+class IssueDetailAPIEndpoint(BaseAPIView):
+    """Issue Detail Endpoint"""
+
+    model = Issue
+    webhook_event = "issue"
+    permission_classes = [ProjectEntityPermission]
+    serializer_class = IssueSerializer
+    use_read_replica = True
+
+    def get_queryset(self):
+        return (
+            Issue.issue_objects.annotate(
+                sub_issues_count=Issue.issue_objects.filter(parent=OuterRef("id"))
+                .order_by()
+                .annotate(count=Func(F("id"), function="Count"))
+                .values("count")
+            )
+            .filter(project_id=self.kwargs.get("project_id"))
+            .filter(workspace__slug=self.kwargs.get("slug"))
+            .select_related("project")
+            .select_related("workspace")
+            .select_related("state")
+            .select_related("parent")
+            .prefetch_related("assignees")
+            .prefetch_related("labels")
+            .order_by(self.kwargs.get("order_by", "-created_at"))
+        ).distinct()
+
+    @work_item_docs(
+        operation_id="retrieve_work_item",
+        summary="Retrieve work item",
+        description="Retrieve details of a specific work item.",
+        parameters=[
+            PROJECT_ID_PARAMETER,
+            EXTERNAL_ID_PARAMETER,
+            EXTERNAL_SOURCE_PARAMETER,
+            ORDER_BY_PARAMETER,
+            FIELDS_PARAMETER,
+            EXPAND_PARAMETER,
+        ],
+        responses={
+            200: OpenApiResponse(
+                description="List of issues or issue details",
+                response=IssueSerializer,
+                examples=[ISSUE_EXAMPLE],
+            ),
+            400: INVALID_REQUEST_RESPONSE,
+            404: WORK_ITEM_NOT_FOUND_RESPONSE,
+        },
+    )
+    def get(self, request, slug, project_id, pk):
+        """Retrieve work item
+
+        Retrieve details of a specific work item.
+        Supports filtering, ordering, and field selection through query parameters.
+        """
+
+        issue = Issue.issue_objects.annotate(
+            sub_issues_count=Issue.issue_objects.filter(parent=OuterRef("id"))
+            .order_by()
+            .annotate(count=Func(F("id"), function="Count"))
+            .values("count")
+        ).get(workspace__slug=slug, project_id=project_id, pk=pk)
+        return Response(
+            IssueSerializer(issue, fields=self.fields, expand=self.expand).data,
+            status=status.HTTP_200_OK,
+        )
 
     @work_item_docs(
         operation_id="update_work_item",

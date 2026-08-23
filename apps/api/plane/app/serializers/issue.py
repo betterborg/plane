@@ -43,6 +43,10 @@ from plane.db.models import (
     ProjectMember,
     EstimatePoint,
 )
+from plane.db.signals import (
+    dispatch_google_calendar_issue_sync,
+    suppress_google_calendar_issue_signal_dispatch,
+)
 from plane.utils.content_validator import (
     validate_html_content,
     validate_binary_data,
@@ -197,6 +201,13 @@ class IssueCreateSerializer(BaseSerializer):
         return attrs
 
     def create(self, validated_data):
+        with suppress_google_calendar_issue_signal_dispatch():
+            issue = self._create_issue_with_relations(validated_data)
+
+        dispatch_google_calendar_issue_sync(issue.id)
+        return issue
+
+    def _create_issue_with_relations(self, validated_data):
         assignees = validated_data.pop("assignee_ids", None)
         labels = validated_data.pop("label_ids", None)
 
@@ -274,6 +285,13 @@ class IssueCreateSerializer(BaseSerializer):
         return issue
 
     def update(self, instance, validated_data):
+        with suppress_google_calendar_issue_signal_dispatch():
+            instance = self._update_issue_with_relations(instance, validated_data)
+
+        dispatch_google_calendar_issue_sync(instance.id)
+        return instance
+
+    def _update_issue_with_relations(self, instance, validated_data):
         assignees = validated_data.pop("assignee_ids", None)
         labels = validated_data.pop("label_ids", None)
 
