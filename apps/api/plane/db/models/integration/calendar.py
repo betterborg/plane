@@ -93,3 +93,38 @@ class GoogleCalendarConnection(BaseModel):
         verbose_name_plural = "Google Calendar Connections"
         db_table = "google_calendar_connections"
         ordering = ("-created_at",)
+
+
+class GoogleCalendarEvent(BaseModel):
+    """A durable correlation between a Plane entity and a Google Calendar event."""
+
+    class EntityType(models.TextChoices):
+        WORK_ITEM = "work_item", "Work item"
+        CYCLE = "cycle", "Cycle"
+
+    connection = models.ForeignKey(
+        GoogleCalendarConnection,
+        related_name="events",
+        on_delete=models.CASCADE,
+    )
+    entity_type = models.CharField(max_length=32, choices=EntityType.choices)
+    entity_id = models.UUIDField()
+    google_event_id = models.CharField(max_length=1024)
+    payload_hash = models.CharField(max_length=64)
+    last_synced_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=("connection", "entity_type", "entity_id"),
+                name="google_calendar_event_unique_entity",
+            ),
+            models.UniqueConstraint(
+                fields=("connection", "google_event_id"),
+                name="google_calendar_event_unique_google_event",
+            ),
+        ]
+        verbose_name = "Google Calendar Event"
+        verbose_name_plural = "Google Calendar Events"
+        db_table = "google_calendar_events"
+        ordering = ("-created_at",)
