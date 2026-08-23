@@ -232,13 +232,10 @@ def _complete_absent(connection, generation):
         status=GoogleCalendarConnection.Status.CLEANUP_PENDING,
     ):
         return "stale"
-    connection.workspace_integration = WorkspaceIntegration.objects.select_for_update().get(
-        id=connection.workspace_integration_id
-    )
     if connection.calendar_id or connection.calendar_operation_id is not None:
         return "pending"
 
-    retain_grant = not bool(connection.workspace_integration.config.get("enabled", False))
+    retain_grant = connection.retain_grant_after_cleanup
     if not retain_grant and not _account_has_other_token_bearing_connection(connection):
         client = _client_for(connection)
         try:
@@ -252,7 +249,7 @@ def _complete_absent(connection, generation):
         status=GoogleCalendarConnection.Status.CLEANUP_PENDING,
     ):
         return "stale"
-    complete_google_calendar_disconnect(connection.id, generation, retain_grant=retain_grant)
+    complete_google_calendar_disconnect(connection.id, generation)
     return "disabled" if retain_grant else "disconnected"
 
 

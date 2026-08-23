@@ -194,7 +194,12 @@ class GoogleCalendarClient:
                 timeout=GOOGLE_CALENDAR_OAUTH_TIMEOUT,
             )
             if response.status_code == 400:
-                return
+                try:
+                    payload = response.json()
+                except (TypeError, ValueError):
+                    payload = None
+                if isinstance(payload, dict) and payload.get("error") == "invalid_token":
+                    return
             response.raise_for_status()
         except requests.RequestException as exc:
             raise GoogleCalendarClientError("Google Calendar grant revocation failed") from exc

@@ -207,6 +207,7 @@ class TestGoogleCalendarLifecycleTransitions:
 
             assert pending.status == GoogleCalendarConnection.Status.CLEANUP_PENDING
             assert pending.provider_account_id == "google-account"
+            assert pending.retain_grant_after_cleanup is False
             assert pending.last_error == "provider unavailable"
 
             with pytest.raises(StaleGoogleCalendarGeneration):
@@ -239,6 +240,52 @@ class TestGoogleCalendarLifecycleTransitions:
         with patch("plane.integrations.google_calendar.lifecycle._acquire_advisory_xact_lock"):
             with pytest.raises(IllegalGoogleCalendarTransition):
                 complete_google_calendar_disconnect(active.id, 2)
+
+    def test_terminal_disconnect_supersedes_retained_policy_cleanup(self):
+        pending_policy_cleanup = GoogleCalendarConnectionFactory(
+            provider_account_id="google-account",
+            refresh_token="refresh-token",
+            desired_state=GoogleCalendarConnection.DesiredState.DISCONNECTED,
+            status=GoogleCalendarConnection.Status.CLEANUP_PENDING,
+            lifecycle_generation=4,
+            retain_grant_after_cleanup=True,
+        )
+
+        with patch("plane.integrations.google_calendar.lifecycle._acquire_advisory_xact_lock"):
+            command = request_google_calendar_disconnect(pending_policy_cleanup.id, 4)
+
+            with pytest.raises(StaleGoogleCalendarGeneration):
+                complete_google_calendar_disconnect(pending_policy_cleanup.id, 4)
+            with pytest.raises(GoogleCalendarDisableCleanupInProgress):
+                request_google_calendar_workspace_policy_enable(
+                    pending_policy_cleanup.workspace_integration.workspace_id
+                )
+
+            tombstone = complete_google_calendar_disconnect(pending_policy_cleanup.id, command.generation)
+
+        assert command.generation == 5
+        assert tombstone.status == GoogleCalendarConnection.Status.DISCONNECTED
+        assert tombstone.retain_grant_after_cleanup is False
+        assert tombstone.provider_account_id == ""
+        assert tombstone.refresh_token == ""
+
+    def test_terminal_disconnect_reopens_a_completed_retained_policy_cleanup(self):
+        retained_grant = GoogleCalendarConnectionFactory(
+            provider_account_id="google-account",
+            refresh_token="refresh-token",
+            desired_state=GoogleCalendarConnection.DesiredState.DISCONNECTED,
+            status=GoogleCalendarConnection.Status.DISCONNECTED,
+            lifecycle_generation=4,
+            retain_grant_after_cleanup=True,
+        )
+
+        with patch("plane.integrations.google_calendar.lifecycle._acquire_advisory_xact_lock"):
+            command = request_google_calendar_disconnect(retained_grant.id, 4)
+
+        retained_grant.refresh_from_db()
+        assert command.generation == 5
+        assert retained_grant.status == GoogleCalendarConnection.Status.CLEANUP_PENDING
+        assert retained_grant.retain_grant_after_cleanup is False
 
     def test_policy_reconciliation_retains_grants_and_returns_stable_commands(self):
         workspace_integration = WorkspaceIntegrationFactory()
@@ -302,11 +349,8 @@ class TestGoogleCalendarLifecycleTransitions:
                 request_google_calendar_workspace_policy_enable(workspace_integration.workspace_id)
 
             active.refresh_from_db()
-            complete_google_calendar_disconnect(
-                active.id,
-                active.lifecycle_generation,
-                retain_grant=True,
-            )
+            assert active.retain_grant_after_cleanup is True
+            complete_google_calendar_disconnect(active.id, active.lifecycle_generation)
             enable_commands = request_google_calendar_workspace_policy_enable(workspace_integration.workspace_id)
 
         active.refresh_from_db()
@@ -334,6 +378,7 @@ class TestGoogleCalendarLifecycleTransitions:
             desired_state=GoogleCalendarConnection.DesiredState.DISCONNECTED,
             status=GoogleCalendarConnection.Status.CLEANUP_PENDING,
             lifecycle_generation=4,
+            retain_grant_after_cleanup=True,
         )
 
         with (
@@ -360,6 +405,7 @@ class TestGoogleCalendarWorkspacePolicyRaces:
             desired_state=GoogleCalendarConnection.DesiredState.DISCONNECTED,
             status=GoogleCalendarConnection.Status.CLEANUP_PENDING,
             lifecycle_generation=4,
+            retain_grant_after_cleanup=True,
         )
         cleanup_locked = Barrier(2)
         cleanup_can_finish = Event()
@@ -375,7 +421,6 @@ class TestGoogleCalendarWorkspacePolicyRaces:
                     return complete_google_calendar_disconnect(
                         locked_connection.id,
                         locked_connection.lifecycle_generation,
-                        retain_grant=True,
                     )
             finally:
                 close_old_connections()

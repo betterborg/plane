@@ -115,6 +115,35 @@ class TestGoogleCalendarClient:
 
         response.raise_for_status.assert_not_called()
 
+    def test_revoke_treats_only_invalid_token_as_already_converged(self):
+        response = Mock(status_code=400)
+        response.json.return_value = {"error": "invalid_token"}
+        client = GoogleCalendarClient(refresh_token="refresh-token")
+
+        with patch("plane.integrations.google_calendar.client.requests.post", return_value=response) as post:
+            client.revoke_grant()
+
+        post.assert_called_once_with(
+            "https://oauth2.googleapis.com/revoke",
+            data={"token": "refresh-token"},
+            timeout=10,
+        )
+        response.raise_for_status.assert_not_called()
+
+    def test_revoke_rejects_a_genuine_bad_request(self):
+        response = Mock(status_code=400)
+        response.json.return_value = {"error": "invalid_request"}
+        response.raise_for_status.side_effect = requests.HTTPError("provider response secret")
+        client = GoogleCalendarClient(refresh_token="refresh-token")
+
+        with (
+            patch("plane.integrations.google_calendar.client.requests.post", return_value=response),
+            pytest.raises(GoogleCalendarClientError, match="Google Calendar grant revocation failed") as error,
+        ):
+            client.revoke_grant()
+
+        assert "secret" not in str(error.value)
+
     def test_expired_access_token_is_refreshed_before_calendar_creation(self):
         refresh_response = Mock(status_code=200)
         refresh_response.json.return_value = {"access_token": "fresh-access-token", "expires_in": 3600}

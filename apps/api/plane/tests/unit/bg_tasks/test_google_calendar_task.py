@@ -18,6 +18,7 @@ from plane.integrations.google_calendar.lifecycle import (
     apply_google_calendar_oauth_success,
     lock_google_calendar_connection,
     request_google_calendar_disconnect,
+    request_google_calendar_workspace_policy_disable,
     request_google_calendar_workspace_policy_enable,
 )
 from plane.integrations.google_calendar.oauth import GOOGLE_CALENDAR_SCOPES
@@ -133,6 +134,7 @@ class TestGoogleCalendarConvergenceTask:
             desired_state=GoogleCalendarConnection.DesiredState.DISCONNECTED,
             status=GoogleCalendarConnection.Status.CLEANUP_PENDING,
             lifecycle_generation=4,
+            retain_grant_after_cleanup=True,
         )
         client = _provider_client()
         client.find_calendar.return_value = "created-before-crash"
@@ -161,6 +163,7 @@ class TestGoogleCalendarConvergenceTask:
             desired_state=GoogleCalendarConnection.DesiredState.DISCONNECTED,
             status=GoogleCalendarConnection.Status.CLEANUP_PENDING,
             lifecycle_generation=4,
+            retain_grant_after_cleanup=True,
         )
         delete_client = _provider_client()
         create_client = _provider_client()
@@ -172,9 +175,9 @@ class TestGoogleCalendarConvergenceTask:
                 side_effect=[delete_client, create_client],
             ),
         ):
-            assert reconcile_google_calendar_connection(str(connection.id), 4) == "disabled"
             workspace_integration.config = {"enabled": True}
             workspace_integration.save(update_fields=["config", "updated_at"])
+            assert reconcile_google_calendar_connection(str(connection.id), 4) == "disabled"
             command = request_google_calendar_workspace_policy_enable(workspace_integration.workspace_id)[0]
             assert reconcile_google_calendar_connection(str(connection.id), command.generation) == "active"
 
@@ -208,6 +211,9 @@ class TestGoogleCalendarConvergenceTask:
             patch("plane.bgtasks.google_calendar_task.GoogleCalendarClient", return_value=client),
         ):
             command = request_google_calendar_disconnect(connection.id, 6)
+            workspace_integration.config = {"enabled": False}
+            workspace_integration.save(update_fields=["config", "updated_at"])
+            assert request_google_calendar_workspace_policy_disable(workspace_integration.workspace_id) == []
             result = reconcile_google_calendar_connection(str(connection.id), command.generation)
 
         connection.refresh_from_db()
@@ -222,6 +228,7 @@ class TestGoogleCalendarConvergenceTask:
         assert connection.refresh_token == ""
         assert connection.oauth_state == ""
         assert connection.status == GoogleCalendarConnection.Status.DISCONNECTED
+        assert connection.retain_grant_after_cleanup is False
 
     def test_terminal_cleanup_commits_delete_before_attempting_revocation(self):
         workspace_integration = WorkspaceIntegrationFactory(config={"enabled": True})
@@ -307,6 +314,33 @@ class TestGoogleCalendarConvergenceTask:
         assert result == "disconnected"
         retry_client.revoke_grant.assert_called_once_with()
         assert connection.refresh_token == ""
+
+    def test_revocation_failure_keeps_terminal_cleanup_and_credentials_nonterminal(self):
+        workspace_integration = WorkspaceIntegrationFactory(config={"enabled": True})
+        connection = GoogleCalendarConnectionFactory(
+            workspace_integration=workspace_integration,
+            provider_account_id="old-google-account",
+            refresh_token="refresh-token",
+            desired_state=GoogleCalendarConnection.DesiredState.DISCONNECTED,
+            status=GoogleCalendarConnection.Status.CLEANUP_PENDING,
+            lifecycle_generation=7,
+            retain_grant_after_cleanup=False,
+        )
+        client = _provider_client()
+        client.revoke_grant.side_effect = GoogleCalendarClientError("Google Calendar grant revocation failed")
+
+        with (
+            patch("plane.integrations.google_calendar.lifecycle._acquire_advisory_xact_lock"),
+            patch("plane.bgtasks.google_calendar_task.GoogleCalendarClient", return_value=client),
+        ):
+            result = reconcile_google_calendar_connection(str(connection.id), 7)
+
+        connection.refresh_from_db()
+        assert result == "error"
+        assert connection.status == GoogleCalendarConnection.Status.CLEANUP_PENDING
+        assert connection.provider_account_id == "old-google-account"
+        assert connection.refresh_token == "refresh-token"
+        assert connection.last_error == "Google Calendar grant revocation failed"
 
     def test_calendar_delete_failure_keeps_old_account_cleanup_nonterminal(self):
         workspace_integration = WorkspaceIntegrationFactory(config={"enabled": True})
