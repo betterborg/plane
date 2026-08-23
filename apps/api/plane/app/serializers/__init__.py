@@ -128,7 +128,12 @@ from .exporter import ExporterHistorySerializer
 
 from .webhook import WebhookSerializer, WebhookLogSerializer
 
-from .integration import GoogleCalendarWorkspacePolicySerializer
+from .integration import (
+    GoogleCalendarConnectionRosterSerializer,
+    GoogleCalendarConnectionStatusSerializer,
+    GoogleCalendarWorkspacePolicyReadSerializer,
+    GoogleCalendarWorkspacePolicySerializer,
+)
 
 from .favorite import UserFavoriteSerializer
 
