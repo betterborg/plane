@@ -18,6 +18,7 @@ import { useWorkspace } from "@/hooks/store/use-workspace";
 import type { Route } from "./+types/page";
 // local imports
 import { GoogleCalendarWorkspaceSettingsHeader } from "./header";
+import { GoogleCalendarConnectionRoster } from "./connection-roster";
 import { GoogleCalendarMemberConnection } from "./member-connection";
 import { GoogleCalendarWorkspacePolicy } from "./workspace-policy";
 
@@ -47,6 +48,7 @@ function GoogleCalendarSettingsPage({ params }: Route.ComponentProps) {
         />
         <GoogleCalendarMemberConnection workspaceSlug={workspaceSlug} />
         <GoogleCalendarWorkspacePolicy workspaceSlug={workspaceSlug} />
+        <GoogleCalendarConnectionRoster workspaceSlug={workspaceSlug} />
       </div>
     </SettingsContentWrapper>
   );
