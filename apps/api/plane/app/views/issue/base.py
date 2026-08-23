@@ -61,6 +61,7 @@ from plane.db.models import (
     ProjectMember,
     UserRecentVisit,
 )
+from plane.db.signals import dispatch_google_calendar_issue_sync
 from plane.utils.filters import ComplexFilterBackend, IssueFilterSet
 from plane.utils.global_paginator import paginate
 from plane.utils.grouper import (
@@ -744,21 +745,11 @@ class ProjectUserDisplayPropertyEndpoint(BaseAPIView):
     @allow_permission([ROLE.ADMIN, ROLE.MEMBER, ROLE.GUEST])
     def patch(self, request, slug, project_id):
         try:
-            issue_property = ProjectUserProperty.objects.get(
-                user=request.user, 
-                project_id=project_id
-            )
+            issue_property = ProjectUserProperty.objects.get(user=request.user, project_id=project_id)
         except ProjectUserProperty.DoesNotExist:
-            issue_property = ProjectUserProperty.objects.create(
-                user=request.user, 
-                project_id=project_id
-            )
+            issue_property = ProjectUserProperty.objects.create(user=request.user, project_id=project_id)
 
-        serializer = ProjectUserPropertySerializer(
-            issue_property, 
-            data=request.data,
-            partial=True
-        )
+        serializer = ProjectUserPropertySerializer(issue_property, data=request.data, partial=True)
         serializer.is_valid(raise_exception=True)
         serializer.save()
         return Response(serializer.data, status=status.HTTP_200_OK)
@@ -780,7 +771,8 @@ class BulkDeleteIssuesEndpoint(BaseAPIView):
 
         issues = Issue.issue_objects.filter(workspace__slug=slug, project_id=project_id, pk__in=issue_ids)
 
-        total_issues = len(issues)
+        affected_issue_ids = list(issues.values_list("id", flat=True))
+        total_issues = len(affected_issue_ids)
 
         # First, delete all related cycle issues
         CycleIssue.objects.filter(issue__in=issues).delete()
@@ -790,6 +782,9 @@ class BulkDeleteIssuesEndpoint(BaseAPIView):
 
         # Finally, delete the issues themselves
         issues.delete()
+
+        for issue_id in affected_issue_ids:
+            dispatch_google_calendar_issue_sync(issue_id)
 
         return Response(
             {"message": f"{total_issues} issues were deleted"},
@@ -1177,8 +1172,13 @@ class IssueBulkUpdateDateEndpoint(BaseAPIView):
                 issue.target_date = target_date
                 issues_to_update.append(issue)
 
+        affected_issue_ids = list(dict.fromkeys(issue.id for issue in issues_to_update))
+
         # Bulk update issues
         Issue.objects.bulk_update(issues_to_update, ["start_date", "target_date"])
+
+        for issue_id in affected_issue_ids:
+            dispatch_google_calendar_issue_sync(issue_id)
 
         return Response({"message": "Issues updated successfully"}, status=status.HTTP_200_OK)
 
