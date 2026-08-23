@@ -293,6 +293,40 @@ class TestGoogleCalendarConnectionRoster:
             assert private_value not in serialized
 
     @pytest.mark.django_db
+    def test_roster_excludes_former_members_and_does_not_duplicate_rejoined_members(
+        self,
+        session_client,
+        workspace,
+        calendar_workspace_integration,
+    ):
+        former_member = UserFactory(display_name="Former member")
+        former_membership = WorkspaceMember.objects.create(workspace=workspace, member=former_member, role=15)
+        WorkspaceMember.objects.filter(id=former_membership.id).delete()
+        GoogleCalendarConnectionFactory(
+            workspace_integration=calendar_workspace_integration,
+            member=former_member,
+            status=GoogleCalendarConnection.Status.ACTIVE,
+        )
+
+        rejoined_member = UserFactory(display_name="Rejoined member")
+        previous_membership = WorkspaceMember.objects.create(workspace=workspace, member=rejoined_member, role=15)
+        WorkspaceMember.objects.filter(id=previous_membership.id).delete()
+        WorkspaceMember.objects.create(workspace=workspace, member=rejoined_member, role=15)
+        GoogleCalendarConnectionFactory(
+            workspace_integration=calendar_workspace_integration,
+            member=rejoined_member,
+            status=GoogleCalendarConnection.Status.ACTIVE,
+        )
+
+        with override_settings(GOOGLE_CALENDAR_RELEASED=True):
+            response = session_client.get(_roster_url(workspace))
+
+        assert response.status_code == status.HTTP_200_OK
+        member_names = [entry["member"]["display_name"] for entry in response.data]
+        assert "Former member" not in member_names
+        assert member_names.count("Rejoined member") == 1
+
+    @pytest.mark.django_db
     @pytest.mark.parametrize("membership", ("role_15", "role_5", "inactive", "outsider"))
     def test_only_active_role_20_can_read_roster(
         self,

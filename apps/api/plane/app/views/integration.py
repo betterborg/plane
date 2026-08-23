@@ -113,6 +113,7 @@ class GoogleCalendarConnectionRosterEndpoint(BaseAPIView):
                 workspace_integration__integration__provider="google_calendar",
                 member__member_workspace__workspace__slug=slug,
                 member__member_workspace__is_active=True,
+                member__member_workspace__deleted_at__isnull=True,
                 status__in=GOOGLE_CALENDAR_PUBLIC_STATUSES,
             )
             .select_related("member")
