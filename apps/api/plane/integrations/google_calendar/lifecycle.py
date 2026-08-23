@@ -476,8 +476,9 @@ def mark_google_calendar_connection_active(connection_id, expected_generation):
         GoogleCalendarConnection.DesiredState.CONNECTED,
         GoogleCalendarConnection.Status.ACTIVE,
     )
+    calendar_connection.last_success_at = timezone.now()
     calendar_connection.last_error = ""
-    calendar_connection.save(update_fields=["last_error", "updated_at"])
+    calendar_connection.save(update_fields=["last_success_at", "last_error", "updated_at"])
     return calendar_connection
 
 

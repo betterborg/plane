@@ -70,6 +70,7 @@ class GoogleCalendarConnection(BaseModel):
     status = models.CharField(max_length=32, choices=Status.choices, default=Status.DISCONNECTED)
     lifecycle_generation = models.PositiveBigIntegerField(default=0)
     retain_grant_after_cleanup = models.BooleanField(default=False)
+    last_success_at = models.DateTimeField(null=True, blank=True)
     last_error = models.TextField(blank=True)
 
     # Short-lived OAuth attempt state is kept separate from the durable lifecycle.

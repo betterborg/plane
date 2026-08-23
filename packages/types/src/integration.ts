@@ -65,7 +65,9 @@ export interface IGoogleCalendarWorkspaceStatus {
 
 export interface IGoogleCalendarConnectionRosterItem {
   member: IUserLite;
-  connection: IGoogleCalendarConnectionStatus;
+  connection: IGoogleCalendarConnectionStatus & {
+    last_success_at: string | null;
+  };
 }
 
 export interface IGoogleCalendarDisconnectResponse {

@@ -15,7 +15,7 @@ import { Button } from "@plane/propel/button";
 import type { IGoogleCalendarConnectionRosterItem } from "@plane/types";
 import { EUserWorkspaceRoles } from "@plane/types";
 import { Avatar, Loader } from "@plane/ui";
-import { getFileURL } from "@plane/utils";
+import { getFileURL, renderFormattedDate, renderFormattedTime } from "@plane/utils";
 // hooks
 import { useUserPermissions } from "@/hooks/store/user";
 // services
@@ -84,11 +84,14 @@ export const GoogleCalendarConnectionRoster = observer(function GoogleCalendarCo
           <table className="w-full table-fixed">
             <thead className="border-b border-subtle bg-layer-2 text-left text-caption-md-medium text-secondary">
               <tr>
-                <th className="w-1/2 px-4 py-2 font-medium" scope="col">
+                <th className="w-2/5 px-4 py-2 font-medium" scope="col">
                   {t("workspace_settings.settings.integrations.google_calendar.connection_roster.member")}
                 </th>
-                <th className="w-1/2 px-4 py-2 font-medium" scope="col">
+                <th className="w-[30%] px-4 py-2 font-medium" scope="col">
                   {t("workspace_settings.settings.integrations.google_calendar.connection_roster.status")}
+                </th>
+                <th className="w-[30%] px-4 py-2 font-medium" scope="col">
+                  {t("workspace_settings.settings.integrations.google_calendar.connection_roster.last_success")}
                 </th>
               </tr>
             </thead>
@@ -103,6 +106,16 @@ export const GoogleCalendarConnectionRoster = observer(function GoogleCalendarCo
                   </td>
                   <td className="px-4 py-3">
                     <GoogleCalendarConnectionStatus status={connection.status} />
+                  </td>
+                  <td className="px-4 py-3 text-body-sm-regular text-secondary">
+                    {connection.last_success_at ? (
+                      <time dateTime={connection.last_success_at}>
+                        {renderFormattedDate(connection.last_success_at)},{" "}
+                        {renderFormattedTime(connection.last_success_at)}
+                      </time>
+                    ) : (
+                      t("workspace_settings.settings.integrations.google_calendar.connection_roster.never")
+                    )}
                   </td>
                 </tr>
               ))}
