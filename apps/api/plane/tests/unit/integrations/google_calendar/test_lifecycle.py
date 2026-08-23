@@ -296,9 +296,7 @@ class TestGoogleCalendarLifecycleTransitions:
         )
 
         with patch("plane.integrations.google_calendar.lifecycle._acquire_advisory_xact_lock"):
-            disable_commands = request_google_calendar_workspace_policy_disable(
-                workspace_integration.workspace_id
-            )
+            disable_commands = request_google_calendar_workspace_policy_disable(workspace_integration.workspace_id)
 
             with pytest.raises(GoogleCalendarDisableCleanupInProgress):
                 request_google_calendar_workspace_policy_enable(workspace_integration.workspace_id)
@@ -309,9 +307,7 @@ class TestGoogleCalendarLifecycleTransitions:
                 active.lifecycle_generation,
                 retain_grant=True,
             )
-            enable_commands = request_google_calendar_workspace_policy_enable(
-                workspace_integration.workspace_id
-            )
+            enable_commands = request_google_calendar_workspace_policy_enable(workspace_integration.workspace_id)
 
         active.refresh_from_db()
         unusable.refresh_from_db()
@@ -319,9 +315,7 @@ class TestGoogleCalendarLifecycleTransitions:
             (active.id, 4),
             (unusable.id, 8),
         }
-        assert [(command.connection_id, command.generation) for command in enable_commands] == [
-            (active.id, 5)
-        ]
+        assert [(command.connection_id, command.generation) for command in enable_commands] == [(active.id, 5)]
         assert active.desired_state == GoogleCalendarConnection.DesiredState.CONNECTED
         assert active.status == GoogleCalendarConnection.Status.PENDING
         assert active.calendar_id == ""
@@ -405,9 +399,7 @@ class TestGoogleCalendarWorkspacePolicyRaces:
             commands = enable_future.result(timeout=5)
 
         calendar_connection.refresh_from_db()
-        assert [(command.connection_id, command.generation) for command in commands] == [
-            (calendar_connection.id, 5)
-        ]
+        assert [(command.connection_id, command.generation) for command in commands] == [(calendar_connection.id, 5)]
         assert calendar_connection.calendar_id == ""
         assert calendar_connection.desired_state == GoogleCalendarConnection.DesiredState.CONNECTED
         assert calendar_connection.status == GoogleCalendarConnection.Status.PENDING

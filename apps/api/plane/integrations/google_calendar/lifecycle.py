@@ -343,9 +343,7 @@ def request_google_calendar_workspace_policy_enable(workspace_id):
         and (calendar_connection.calendar_id or calendar_connection.calendar_operation_id is not None)
         for calendar_connection in calendar_connections
     ):
-        raise GoogleCalendarDisableCleanupInProgress(
-            "Google Calendar workspace disable cleanup is still in progress"
-        )
+        raise GoogleCalendarDisableCleanupInProgress("Google Calendar workspace disable cleanup is still in progress")
 
     commands = []
     for calendar_connection in calendar_connections:

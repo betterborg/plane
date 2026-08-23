@@ -206,9 +206,7 @@ class TestGoogleCalendarOAuth:
         assert response.status_code == status.HTTP_302_FOUND
         assert _redirect_error(response) == "google_calendar_oauth_stale"
         connection = GoogleCalendarConnection.objects.get()
-        assert connection.oauth_state == session_client.session[GOOGLE_CALENDAR_OAUTH_SESSION_KEY][
-            "attempt_generation"
-        ]
+        assert connection.oauth_state == session_client.session[GOOGLE_CALENDAR_OAUTH_SESSION_KEY]["attempt_generation"]
         assert new_state
 
     @pytest.mark.django_db
