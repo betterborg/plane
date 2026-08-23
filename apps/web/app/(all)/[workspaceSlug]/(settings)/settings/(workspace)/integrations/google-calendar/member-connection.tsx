@@ -5,7 +5,7 @@
  */
 
 import { useCallback, useMemo, useState } from "react";
-import { AlertCircle, CheckCircle2, CircleDashed, Unplug } from "lucide-react";
+import { AlertCircle, CheckCircle2 } from "lucide-react";
 import { observer } from "mobx-react";
 import { useSearchParams } from "next/navigation";
 import useSWR, { mutate as mutateSWR } from "swr";
@@ -18,12 +18,13 @@ import { TOAST_TYPE, setToast } from "@plane/propel/toast";
 import type { IGoogleCalendarWorkspaceStatus, TGoogleCalendarConnectionStatus } from "@plane/types";
 import { EUserWorkspaceRoles } from "@plane/types";
 import { Loader } from "@plane/ui";
-import { cn } from "@plane/utils";
 // hooks
 import useIntegrationPopup from "@/hooks/use-integration-popup";
 import { useUser, useUserPermissions } from "@/hooks/store/user";
 // services
 import { IntegrationService } from "@/services/integrations";
+// local imports
+import { GoogleCalendarConnectionStatus } from "./connection-status";
 
 type Props = {
   workspaceSlug: string;
@@ -34,32 +35,6 @@ type TCallbackResult = string | null;
 const integrationService = new IntegrationService();
 
 const ACTIVE_LIFECYCLE_STATUSES = new Set<TGoogleCalendarConnectionStatus>(["provisioning", "disconnecting"]);
-
-const STATUS_DETAILS: Record<
-  TGoogleCalendarConnectionStatus,
-  { icon: typeof CheckCircle2; iconClassName: string; labelKey: string }
-> = {
-  provisioning: {
-    icon: CircleDashed,
-    iconClassName: "animate-spin text-accent-primary",
-    labelKey: "workspace_settings.settings.integrations.google_calendar.member_connection.status.provisioning",
-  },
-  healthy: {
-    icon: CheckCircle2,
-    iconClassName: "text-success-primary",
-    labelKey: "workspace_settings.settings.integrations.google_calendar.member_connection.status.healthy",
-  },
-  broken: {
-    icon: AlertCircle,
-    iconClassName: "text-danger-primary",
-    labelKey: "workspace_settings.settings.integrations.google_calendar.member_connection.status.broken",
-  },
-  disconnecting: {
-    icon: CircleDashed,
-    iconClassName: "animate-spin text-secondary",
-    labelKey: "workspace_settings.settings.integrations.google_calendar.member_connection.status.disconnecting",
-  },
-};
 
 const getCallbackResult = (searchParams: URLSearchParams): TCallbackResult => {
   const error = searchParams.get("error");
@@ -75,28 +50,6 @@ const getCallbackResultFromUrl = (callbackUrl?: string): TCallbackResult => {
   } catch {
     return null;
   }
-};
-
-const ConnectionStatus = ({ status }: { status: TGoogleCalendarConnectionStatus | null }) => {
-  const { t } = useTranslation();
-
-  if (!status)
-    return (
-      <div className="flex items-center gap-2 text-body-sm-medium text-secondary">
-        <Unplug className="size-4" />
-        {t("workspace_settings.settings.integrations.google_calendar.member_connection.status.disconnected")}
-      </div>
-    );
-
-  const statusDetails = STATUS_DETAILS[status];
-  const Icon = statusDetails.icon;
-
-  return (
-    <div className="flex items-center gap-2 text-body-sm-medium text-primary">
-      <Icon className={cn("size-4", statusDetails.iconClassName)} />
-      {t(statusDetails.labelKey)}
-    </div>
-  );
 };
 
 const CallbackResultBanner = ({ result }: { result: TCallbackResult }) => {
@@ -290,7 +243,7 @@ export const GoogleCalendarMemberConnection = observer(function GoogleCalendarMe
         </div>
 
         <div className="flex flex-col items-start justify-between gap-3 border-t border-subtle pt-4 sm:flex-row sm:items-center">
-          <ConnectionStatus status={connectionStatus} />
+          <GoogleCalendarConnectionStatus status={connectionStatus} />
           <div className="flex items-center gap-2">
             {connectionStatus === "disconnecting" ? (
               <Button variant="secondary" disabled>

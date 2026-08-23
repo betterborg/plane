@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # See the LICENSE file for details.
 
+from datetime import UTC, datetime
 from unittest.mock import patch
 
 import pytest
@@ -225,6 +226,7 @@ class TestGoogleCalendarConnectionRoster:
         ):
             member = UserFactory(display_name=f"Calendar member {index}")
             WorkspaceMember.objects.create(workspace=workspace, member=member, role=15)
+            last_success_at = None if index == 0 else datetime(2026, 8, 23, 12, index, tzinfo=UTC)
             GoogleCalendarConnectionFactory(
                 workspace_integration=calendar_workspace_integration,
                 member=member,
@@ -236,6 +238,7 @@ class TestGoogleCalendarConnectionRoster:
                 scopes=["private-scope"],
                 status=internal_status,
                 lifecycle_generation=index + 1,
+                last_success_at=last_success_at,
                 oauth_state=f"private-state-{index}",
                 oauth_code_verifier=f"private-verifier-{index}",
                 last_error=f"private-error-{index}",
@@ -251,7 +254,10 @@ class TestGoogleCalendarConnectionRoster:
                         "is_bot": member.is_bot,
                         "display_name": member.display_name,
                     },
-                    "connection": {"status": public_status},
+                    "connection": {
+                        "status": public_status,
+                        "last_success_at": None if last_success_at is None else f"2026-08-23T12:0{index}:00Z",
+                    },
                 }
             )
 

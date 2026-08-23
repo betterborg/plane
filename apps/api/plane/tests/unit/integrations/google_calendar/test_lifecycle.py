@@ -168,6 +168,7 @@ class TestGoogleCalendarLifecycleTransitions:
         assert active.desired_state == GoogleCalendarConnection.DesiredState.CONNECTED
         assert active.status == GoogleCalendarConnection.Status.ACTIVE
         assert active.lifecycle_generation == 1
+        assert active.last_success_at is not None
         assert active.oauth_state == ""
 
     def test_unusable_oauth_result_does_not_change_attempt_state(self):

@@ -73,11 +73,18 @@ def serialize_google_calendar_connection_status(connection):
     return GoogleCalendarConnectionStatusSerializer(connection).data
 
 
+class GoogleCalendarConnectionRosterStatusSerializer(GoogleCalendarConnectionStatusSerializer):
+    """Expose roster health, including the most recent successful reconciliation."""
+
+    class Meta(GoogleCalendarConnectionStatusSerializer.Meta):
+        fields = ("status", "last_success_at")
+
+
 class GoogleCalendarConnectionRosterSerializer(serializers.ModelSerializer):
     """Name an active Plane member alongside their public Calendar state."""
 
     member = UserLiteSerializer(read_only=True)
-    connection = GoogleCalendarConnectionStatusSerializer(source="*", read_only=True)
+    connection = GoogleCalendarConnectionRosterStatusSerializer(source="*", read_only=True)
 
     class Meta:
         model = GoogleCalendarConnection

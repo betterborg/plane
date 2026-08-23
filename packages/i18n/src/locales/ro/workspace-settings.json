@@ -252,6 +252,17 @@
                 "cleanup": "Google Calendar cleanup is still in progress. Wait for it to finish before enabling again."
               }
             }
+          },
+          "connection_roster": {
+            "title": "Connection roster",
+            "description": "Review the current health of members' Google Calendar connections.",
+            "member": "Plane member",
+            "status": "Connection health",
+            "last_success": "Last success",
+            "never": "Never",
+            "empty": "No members have connected Google Calendar yet.",
+            "load_error": "Google Calendar connection health could not be loaded.",
+            "retry": "Retry"
           }
         }
       },
