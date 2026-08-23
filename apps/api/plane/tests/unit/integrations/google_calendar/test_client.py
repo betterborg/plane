@@ -10,12 +10,98 @@ import pytest
 import requests
 from django.utils import timezone
 
-from plane.integrations.google_calendar.client import GoogleCalendarClient, GoogleCalendarClientError
+from plane.integrations.google_calendar.client import (
+    GoogleCalendarClient,
+    GoogleCalendarClientConflict,
+    GoogleCalendarClientError,
+)
 from plane.integrations.google_calendar.oauth import GoogleCalendarOAuthCredentials
 
 
 @pytest.mark.unit
 class TestGoogleCalendarClient:
+    def test_event_crud_uses_encoded_paths_and_full_update(self):
+        get_response = Mock(status_code=200)
+        get_response.json.return_value = {"id": "event/id"}
+        insert_response = Mock(status_code=200)
+        insert_response.json.return_value = {"id": "event/id"}
+        update_response = Mock(status_code=200)
+        update_response.json.return_value = {"id": "event/id", "summary": "Updated"}
+        delete_response = Mock(status_code=204)
+        client = GoogleCalendarClient(
+            access_token="access-token",
+            token_expires_at=timezone.now() + timedelta(hours=1),
+        )
+
+        with patch(
+            "plane.integrations.google_calendar.client.requests.request",
+            side_effect=[get_response, insert_response, update_response, delete_response],
+        ) as request:
+            assert client.get_event("calendar/id", "event/id") == {"id": "event/id"}
+            client.insert_event("calendar/id", "event/id", {"summary": "Created"})
+            client.update_event("calendar/id", "event/id", {"summary": "Updated"})
+            client.delete_event("calendar/id", "event/id")
+
+        event_path = "https://www.googleapis.com/calendar/v3/calendars/calendar%2Fid/events/event%2Fid"
+        assert request.call_args_list[0].args[:2] == ("get", event_path)
+        assert request.call_args_list[1].args[:2] == (
+            "post",
+            "https://www.googleapis.com/calendar/v3/calendars/calendar%2Fid/events",
+        )
+        assert request.call_args_list[1].kwargs["json"] == {"summary": "Created", "id": "event/id"}
+        assert request.call_args_list[2].args[:2] == ("put", event_path)
+        assert request.call_args_list[3].args[:2] == ("delete", event_path)
+
+    def test_event_list_paginates_with_a_private_marker(self):
+        first_response = Mock(status_code=200)
+        first_response.json.return_value = {"items": [{"id": "first"}], "nextPageToken": "next"}
+        second_response = Mock(status_code=200)
+        second_response.json.return_value = {"items": [{"id": "second"}]}
+        client = GoogleCalendarClient(
+            access_token="access-token",
+            token_expires_at=timezone.now() + timedelta(hours=1),
+        )
+
+        with patch(
+            "plane.integrations.google_calendar.client.requests.request",
+            side_effect=[first_response, second_response],
+        ) as request:
+            events = client.list_events("calendar", private_extended_property="plane_entity_id=issue-id")
+
+        assert events == [{"id": "first"}, {"id": "second"}]
+        assert request.call_args_list[0].kwargs["params"] == {
+            "maxResults": 250,
+            "singleEvents": True,
+            "privateExtendedProperty": "plane_entity_id=issue-id",
+        }
+        assert request.call_args_list[1].kwargs["params"]["pageToken"] == "next"
+
+    def test_event_insert_surfaces_a_conflict_without_provider_content(self):
+        response = Mock(status_code=409)
+        client = GoogleCalendarClient(
+            access_token="access-token",
+            token_expires_at=timezone.now() + timedelta(hours=1),
+        )
+
+        with (
+            patch("plane.integrations.google_calendar.client.requests.request", return_value=response),
+            pytest.raises(GoogleCalendarClientConflict, match="already exists"),
+        ):
+            client.insert_event("calendar", "event", {"summary": "Created"})
+
+    @pytest.mark.parametrize("status_code", [404, 410])
+    def test_event_delete_treats_provider_absence_as_converged(self, status_code):
+        response = Mock(status_code=status_code)
+        client = GoogleCalendarClient(
+            access_token="access-token",
+            token_expires_at=timezone.now() + timedelta(hours=1),
+        )
+
+        with patch("plane.integrations.google_calendar.client.requests.request", return_value=response):
+            client.delete_event("calendar", "event")
+
+        response.raise_for_status.assert_not_called()
+
     def test_create_uses_the_dedicated_calendar_endpoint(self):
         response = Mock(status_code=200)
         response.json.return_value = {"id": "plane-calendar@example.com"}

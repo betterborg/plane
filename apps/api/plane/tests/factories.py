@@ -10,9 +10,15 @@ from django.utils import timezone
 
 from plane.db.models import (
     GoogleCalendarConnection,
+    GoogleCalendarEvent,
     Integration,
+    Issue,
+    IssueAssignee,
+    IssueLabel,
+    Label,
     Project,
     ProjectMember,
+    State,
     User,
     Workspace,
     WorkspaceIntegration,
@@ -76,6 +82,7 @@ class ProjectFactory(factory.django.DjangoModelFactory):
 
     id = factory.LazyFunction(uuid4)
     name = factory.Sequence(lambda n: f"Project {n}")
+    identifier = factory.Sequence(lambda n: f"PRJ{n}")
     workspace = factory.SubFactory(WorkspaceFactory)
     created_by = factory.SelfAttribute("workspace.owner")
     updated_by = factory.SelfAttribute("workspace.owner")
@@ -159,6 +166,89 @@ class GoogleCalendarConnectionFactory(factory.django.DjangoModelFactory):
             status=GoogleCalendarConnection.Status.CLEANUP_PENDING,
             lifecycle_generation=2,
         )
+        active = factory.Trait(
+            provider_account_id=factory.Sequence(lambda n: f"google-account-{n}"),
+            provider_email=factory.Sequence(lambda n: f"calendar-user-{n}@example.com"),
+            calendar_id=factory.Sequence(lambda n: f"plane-calendar-{n}"),
+            refresh_token="encrypted-at-rest-refresh-token",
+            desired_state=GoogleCalendarConnection.DesiredState.CONNECTED,
+            status=GoogleCalendarConnection.Status.ACTIVE,
+            lifecycle_generation=1,
+        )
+
+
+class StateFactory(factory.django.DjangoModelFactory):
+    """Factory for project states used by Calendar work-item scenarios."""
+
+    class Meta:
+        model = State
+
+    project = factory.SubFactory(ProjectFactory)
+    name = factory.Sequence(lambda n: f"State {n}")
+    color = "#60646C"
+    group = "unstarted"
+
+
+class LabelFactory(factory.django.DjangoModelFactory):
+    """Factory for labels included in Calendar event descriptions."""
+
+    class Meta:
+        model = Label
+
+    project = factory.SubFactory(ProjectFactory)
+    workspace = factory.SelfAttribute("project.workspace")
+    name = factory.Sequence(lambda n: f"Label {n}")
+    color = "#60646C"
+
+
+class IssueFactory(factory.django.DjangoModelFactory):
+    """Factory for due-dated work items synchronized with Calendar."""
+
+    class Meta:
+        model = Issue
+
+    project = factory.SubFactory(ProjectFactory)
+    state = factory.SubFactory(StateFactory, project=factory.SelfAttribute("..project"))
+    name = factory.Sequence(lambda n: f"Work item {n}")
+    target_date = factory.LazyFunction(lambda: timezone.localdate() + timedelta(days=7))
+
+
+class IssueAssigneeFactory(factory.django.DjangoModelFactory):
+    """Factory for assignment-mode Calendar eligibility."""
+
+    class Meta:
+        model = IssueAssignee
+
+    issue = factory.SubFactory(IssueFactory)
+    assignee = factory.SubFactory(UserFactory)
+    project = factory.SelfAttribute("issue.project")
+
+
+class IssueLabelFactory(factory.django.DjangoModelFactory):
+    """Factory for labels attached to Calendar work items."""
+
+    class Meta:
+        model = IssueLabel
+
+    issue = factory.SubFactory(IssueFactory)
+    label = factory.SubFactory(
+        LabelFactory,
+        project=factory.SelfAttribute("..issue.project"),
+    )
+    project = factory.SelfAttribute("issue.project")
+
+
+class GoogleCalendarEventFactory(factory.django.DjangoModelFactory):
+    """Factory for durable Calendar provider correlations."""
+
+    class Meta:
+        model = GoogleCalendarEvent
+
+    connection = factory.SubFactory(GoogleCalendarConnectionFactory, active=True)
+    entity_type = GoogleCalendarEvent.EntityType.WORK_ITEM
+    entity_id = factory.LazyFunction(uuid4)
+    google_event_id = factory.Sequence(lambda n: f"planeevent{n}")
+    payload_hash = "0" * 64
 
 
 def google_calendar_connection_scenario(state="absent", **kwargs):
@@ -166,7 +256,7 @@ def google_calendar_connection_scenario(state="absent", **kwargs):
 
     if state == "absent":
         return None
-    supported_states = {"attempt_only", "bound_broken", "tombstone", "pending_cleanup"}
+    supported_states = {"attempt_only", "bound_broken", "tombstone", "pending_cleanup", "active"}
     if state not in supported_states:
         raise ValueError(f"Unsupported Google Calendar connection state: {state}")
     return GoogleCalendarConnectionFactory(**{state: True}, **kwargs)

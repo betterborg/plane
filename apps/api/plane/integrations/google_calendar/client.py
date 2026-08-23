@@ -27,6 +27,10 @@ class GoogleCalendarClientError(Exception):
     """Raised when a generation-scoped Google Calendar provider operation fails."""
 
 
+class GoogleCalendarClientConflict(GoogleCalendarClientError):
+    """Raised when a deterministic provider event already exists."""
+
+
 @dataclass(frozen=True)
 class GoogleCalendarAccessToken:
     """The access token currently used by the Calendar client."""
@@ -180,6 +184,81 @@ class GoogleCalendarClient:
             response.raise_for_status()
         except requests.RequestException as exc:
             raise GoogleCalendarClientError("Google Calendar deletion failed") from exc
+
+    @staticmethod
+    def _event_path(calendar_id, event_id=""):
+        path = f"/calendars/{quote(calendar_id, safe='')}/events"
+        if event_id:
+            path += f"/{quote(event_id, safe='')}"
+        return path
+
+    @staticmethod
+    def _event_payload(response, error_message):
+        try:
+            response.raise_for_status()
+            payload = response.json()
+            if not isinstance(payload, dict):
+                raise ValueError("Calendar event response is not an object")
+            return payload
+        except (requests.RequestException, TypeError, ValueError) as exc:
+            raise GoogleCalendarClientError(error_message) from exc
+
+    def get_event(self, calendar_id, event_id):
+        """Get one event, returning ``None`` when it is already absent."""
+
+        response = self._calendar_request("get", self._event_path(calendar_id, event_id))
+        if response.status_code == 404:
+            return None
+        return self._event_payload(response, "Google Calendar event lookup failed")
+
+    def list_events(self, calendar_id, *, private_extended_property=None):
+        """List all matching events across provider pages."""
+
+        events = []
+        page_token = None
+        while True:
+            params = {"maxResults": 250, "singleEvents": True}
+            if private_extended_property:
+                params["privateExtendedProperty"] = private_extended_property
+            if page_token:
+                params["pageToken"] = page_token
+            response = self._calendar_request("get", self._event_path(calendar_id), params=params)
+            payload = self._event_payload(response, "Google Calendar event list failed")
+            items = payload.get("items", [])
+            if not isinstance(items, list) or not all(isinstance(item, dict) for item in items):
+                raise GoogleCalendarClientError("Google Calendar event list failed")
+            events.extend(items)
+            page_token = payload.get("nextPageToken")
+            if page_token is None:
+                return events
+            if not isinstance(page_token, str) or not page_token:
+                raise GoogleCalendarClientError("Google Calendar event list failed")
+
+    def insert_event(self, calendar_id, event_id, payload):
+        """Insert an event with Plane's deterministic provider ID."""
+
+        body = {**payload, "id": event_id}
+        response = self._calendar_request("post", self._event_path(calendar_id), json=body)
+        if response.status_code == 409:
+            raise GoogleCalendarClientConflict("Google Calendar event already exists")
+        return self._event_payload(response, "Google Calendar event insertion failed")
+
+    def update_event(self, calendar_id, event_id, payload):
+        """Replace an event using Google Calendar's full-update operation."""
+
+        response = self._calendar_request("put", self._event_path(calendar_id, event_id), json=payload)
+        return self._event_payload(response, "Google Calendar event update failed")
+
+    def delete_event(self, calendar_id, event_id):
+        """Delete an event, treating an already-absent event as converged."""
+
+        response = self._calendar_request("delete", self._event_path(calendar_id, event_id))
+        if response.status_code in {404, 410}:
+            return
+        try:
+            response.raise_for_status()
+        except requests.RequestException as exc:
+            raise GoogleCalendarClientError("Google Calendar event deletion failed") from exc
 
     def revoke_grant(self):
         """Revoke this connection's refresh grant, treating an absent grant as converged."""
