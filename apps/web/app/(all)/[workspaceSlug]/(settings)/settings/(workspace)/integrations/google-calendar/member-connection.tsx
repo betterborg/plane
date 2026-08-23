@@ -191,9 +191,15 @@ export const GoogleCalendarMemberConnection = observer(function GoogleCalendarMe
       const popupResult = getCallbackResultFromUrl(callbackUrl);
       if (popupResult) setCallbackResult(popupResult);
 
-      const revalidations: Promise<unknown>[] = [mutateStatus()];
-      if (isAdmin) revalidations.push(mutateSWR(GOOGLE_CALENDAR_CONNECTION_ROSTER(workspaceSlug)));
-      void Promise.all(revalidations);
+      const statusRevalidation = mutateStatus();
+      const rosterRevalidation = isAdmin
+        ? mutateSWR(GOOGLE_CALENDAR_CONNECTION_ROSTER(workspaceSlug))
+        : Promise.resolve();
+      void Promise.all([statusRevalidation, rosterRevalidation]).then(([refreshedStatus]) => {
+        if (!popupResult && refreshedStatus && !refreshedStatus.policy.enabled)
+          setCallbackResult("google_calendar_disabled");
+        return refreshedStatus;
+      });
     },
     [isAdmin, mutateStatus, workspaceSlug]
   );

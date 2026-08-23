@@ -4,9 +4,11 @@
  * See the LICENSE file for details.
  */
 
+import { useEffect } from "react";
 import { CalendarDays, ChevronRight } from "lucide-react";
 import { observer } from "mobx-react";
 import Link from "next/link";
+import { useSearchParams } from "next/navigation";
 // plane imports
 import { useTranslation } from "@plane/i18n";
 import { Card, ECardDirection, ECardSpacing } from "@plane/propel/card";
@@ -18,6 +20,7 @@ import { SettingsHeading } from "@/components/settings/heading";
 // hooks
 import { useInstance } from "@/hooks/store/use-instance";
 import { useWorkspace } from "@/hooks/store/use-workspace";
+import { reportIntegrationPopupCallback } from "@/hooks/use-integration-popup";
 // local imports
 import type { Route } from "./+types/page";
 import { IntegrationsWorkspaceSettingsHeader } from "./header";
@@ -25,6 +28,7 @@ import { IntegrationsWorkspaceSettingsHeader } from "./header";
 function WorkspaceIntegrationsPage({ params }: Route.ComponentProps) {
   // router
   const { workspaceSlug } = params;
+  const searchParams = useSearchParams();
   // store hooks
   const { config } = useInstance();
   const { currentWorkspace } = useWorkspace();
@@ -35,6 +39,12 @@ function WorkspaceIntegrationsPage({ params }: Route.ComponentProps) {
   const pageTitle = currentWorkspace?.name
     ? `${currentWorkspace.name} - ${t("workspace_settings.settings.integrations.title")}`
     : undefined;
+
+  useEffect(() => {
+    if (!searchParams.get("error") && searchParams.get("google_calendar_oauth") !== "success") return;
+
+    reportIntegrationPopupCallback();
+  }, [searchParams]);
 
   if (!isGoogleCalendarAvailable) return <NotAuthorizedView section="settings" className="h-auto" />;
 
