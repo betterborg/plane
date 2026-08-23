@@ -219,6 +219,39 @@
               "title": "Disconnect failed",
               "message": "Your Google Calendar connection could not be disconnected. Please try again."
             }
+          },
+          "workspace_policy": {
+            "title": "Workspace policy",
+            "description": "Manage how Google Calendar works for everyone in this workspace.",
+            "enabled": {
+              "title": "Enable Google Calendar",
+              "description": "Allow members to connect a Google account and create a dedicated Plane calendar.",
+              "label": "Enable Google Calendar for this workspace"
+            },
+            "completion": {
+              "title": "Update completed work items",
+              "description": "Keep Google Calendar events in sync when their Plane work items are completed.",
+              "label": "Update calendar events when work items are completed"
+            },
+            "disable": {
+              "title": "Disable Google Calendar?",
+              "description": "Members will no longer be able to connect. Plane will delete every dedicated calendar and clean up its connection. Cleanup can take time, and you cannot re-enable the integration until it finishes.",
+              "confirm": "Disable Google Calendar",
+              "disabling": "Disabling",
+              "cancel": "Cancel"
+            },
+            "toast": {
+              "success": {
+                "title": "Workspace policy updated",
+                "message": "Google Calendar settings were updated successfully."
+              },
+              "error": {
+                "title": "Workspace policy update failed",
+                "message": "Google Calendar settings could not be updated. Please try again.",
+                "credentials": "Google Calendar cannot be enabled until the instance credentials are complete.",
+                "cleanup": "Google Calendar cleanup is still in progress. Wait for it to finish before enabling again."
+              }
+            }
           }
         }
       },
