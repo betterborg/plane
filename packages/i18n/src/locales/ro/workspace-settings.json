@@ -177,7 +177,13 @@
         "heading": "Integrări",
         "description": "Conectează-te cu instrumente și servicii populare pentru a sincroniza munca ta în întregul ecosistem al fluxului de lucru.",
         "page_title": "Lucrează cu datele tale Plane în aplicațiile disponibile sau în ale tale proprii.",
-        "page_description": "Vizualizează toate integrările utilizate de acest spațiu de lucru sau de tine."
+        "page_description": "Vizualizează toate integrările utilizate de acest spațiu de lucru sau de tine.",
+        "google_calendar": {
+          "title": "Google Calendar",
+          "heading": "Google Calendar",
+          "description": "Keep your assigned Plane work items in sync with Google Calendar.",
+          "card_description": "View and manage assigned work items from your Google Calendar."
+        }
       },
       "imports": {
         "title": "Importuri",

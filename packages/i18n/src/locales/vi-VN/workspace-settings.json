@@ -177,7 +177,13 @@
         "heading": "Tích hợp",
         "description": "Kết nối với các công cụ và dịch vụ phổ biến để đồng bộ hóa công việc của bạn trong toàn bộ hệ sinh thái quy trình làm việc.",
         "page_title": "Làm việc với dữ liệu Plane của bạn trong các ứng dụng có sẵn hoặc ứng dụng riêng của bạn.",
-        "page_description": "Xem tất cả các tích hợp được workspace này hoặc bạn đang sử dụng."
+        "page_description": "Xem tất cả các tích hợp được workspace này hoặc bạn đang sử dụng.",
+        "google_calendar": {
+          "title": "Google Calendar",
+          "heading": "Google Calendar",
+          "description": "Keep your assigned Plane work items in sync with Google Calendar.",
+          "card_description": "View and manage assigned work items from your Google Calendar."
+        }
       },
       "imports": {
         "title": "Nhập dữ liệu",

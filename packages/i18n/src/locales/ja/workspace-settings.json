@@ -177,7 +177,13 @@
         "heading": "インテグレーション",
         "description": "人気のツールやサービスと接続して、ワークフローエコシステム全体で作業を同期します。",
         "page_title": "Plane のデータを利用可能なアプリや自分のアプリで利用できます。",
-        "page_description": "このワークスペースまたはあなたが使用しているすべての連携を表示します。"
+        "page_description": "このワークスペースまたはあなたが使用しているすべての連携を表示します。",
+        "google_calendar": {
+          "title": "Google Calendar",
+          "heading": "Google Calendar",
+          "description": "Keep your assigned Plane work items in sync with Google Calendar.",
+          "card_description": "View and manage assigned work items from your Google Calendar."
+        }
       },
       "imports": {
         "title": "インポート",
