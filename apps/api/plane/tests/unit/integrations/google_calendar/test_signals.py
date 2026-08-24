@@ -7,7 +7,15 @@ from unittest.mock import call, patch
 import pytest
 
 from plane.db.signals import suppress_google_calendar_issue_signal_dispatch
-from plane.tests.factories import IssueAssigneeFactory, IssueFactory, IssueLabelFactory, LabelFactory, StateFactory
+from plane.tests.factories import (
+    CycleFactory,
+    CycleIssueFactory,
+    IssueAssigneeFactory,
+    IssueFactory,
+    IssueLabelFactory,
+    LabelFactory,
+    StateFactory,
+)
 
 
 @pytest.mark.unit
@@ -108,3 +116,39 @@ class TestGoogleCalendarLabelSignals:
 
         enqueue.assert_called_once()
         assert enqueue.call_args.args[1:] == (str(label.id),)
+
+
+@pytest.mark.unit
+@pytest.mark.django_db
+class TestGoogleCalendarCycleSignals:
+    def test_cycle_creation_does_not_enqueue_convergence(self):
+        with patch("plane.db.signals.enqueue_google_calendar_task_on_commit") as enqueue:
+            CycleFactory()
+
+        enqueue.assert_not_called()
+
+    def test_existing_cycle_save_and_hard_delete_enqueue_convergence(self):
+        cycle = CycleFactory()
+        cycle_id = cycle.id
+
+        with patch("plane.db.signals.enqueue_google_calendar_task_on_commit") as enqueue:
+            cycle.name = "Release train"
+            cycle.save(update_fields=["name", "updated_at"])
+            cycle.delete(soft=False)
+
+        assert [queued.args[1:] for queued in enqueue.call_args_list] == [
+            (str(cycle_id),),
+            (str(cycle_id),),
+        ]
+
+    def test_issue_dispatch_also_enqueues_its_current_cycle(self):
+        cycle_issue = CycleIssueFactory()
+
+        with patch("plane.db.signals.enqueue_google_calendar_task_on_commit") as enqueue:
+            cycle_issue.issue.name = "Current cycle work item"
+            cycle_issue.issue.save(update_fields=["name", "updated_at"])
+
+        assert [queued.args[1:] for queued in enqueue.call_args_list] == [
+            (str(cycle_issue.issue_id),),
+            (str(cycle_issue.cycle_id),),
+        ]
