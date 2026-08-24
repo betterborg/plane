@@ -68,6 +68,7 @@ from plane.integrations.google_calendar.events import (
     google_calendar_provider_payload_hash,
 )
 from plane.integrations.google_calendar.lifecycle import (
+    clear_google_calendar_oauth_attempt,
     complete_google_calendar_disconnect,
     has_usable_google_calendar_grant,
     lock_google_calendar_connection,
@@ -87,6 +88,7 @@ GOOGLE_CALENDAR_HEALTHY_RECONCILIATION_INTERVAL = timedelta(hours=6)
 GOOGLE_CALENDAR_HEALTHY_RECONCILIATION_OVERDUE = timedelta(hours=18)
 GOOGLE_CALENDAR_SCHEDULER_LEASE = timedelta(hours=2)
 GOOGLE_CALENDAR_RECONCILIATION_MAX_STAGGER_SECONDS = 30 * 60
+GOOGLE_CALENDAR_OAUTH_ATTEMPT_EXPIRY_PAGE_SIZE = 100
 
 logger = logging.getLogger("plane.worker")
 
@@ -197,9 +199,55 @@ def _claim_present_recovery(connection_id):
     return connection.lifecycle_generation
 
 
+def _expired_oauth_attempt_pages(at):
+    after_id = None
+    while True:
+        candidates = GoogleCalendarConnection.objects.filter(oauth_attempt_expires_at__lte=at).exclude(oauth_state="")
+        if after_id is not None:
+            candidates = candidates.filter(id__gt=after_id)
+        page = list(
+            candidates.order_by("id").values_list(
+                "id",
+                "oauth_state",
+                "oauth_attempt_expires_at",
+                "lifecycle_generation",
+            )[:GOOGLE_CALENDAR_OAUTH_ATTEMPT_EXPIRY_PAGE_SIZE]
+        )
+        if not page:
+            return
+        yield page
+        after_id = page[-1][0]
+
+
+@transaction.atomic
+def _clear_expired_oauth_attempt(connection_id, attempt_generation, expires_at, lifecycle_generation, at):
+    try:
+        connection = lock_google_calendar_connection(connection_id)
+    except GoogleCalendarConnection.DoesNotExist:
+        return False
+    if (
+        connection.oauth_state != attempt_generation
+        or connection.oauth_attempt_expires_at != expires_at
+        or connection.lifecycle_generation != lifecycle_generation
+        or connection.oauth_attempt_expires_at is None
+        or connection.oauth_attempt_expires_at > at
+    ):
+        return False
+    clear_google_calendar_oauth_attempt(connection)
+    connection.save(
+        update_fields=[
+            "oauth_state",
+            "oauth_code_verifier",
+            "oauth_redirect_uri",
+            "oauth_attempt_expires_at",
+        ]
+    )
+    return True
+
+
 @shared_task
 def schedule_google_calendar_reconciliations():
-    """Publish due healthy inventory and recover unfinished present generations."""
+    """Reconcile healthy, present, and expired-attempt Calendar state."""
 
     at = timezone.now()
     due_connection_ids = (
@@ -252,6 +300,10 @@ def schedule_google_calendar_reconciliations():
             )
             continue
         published += 1
+
+    for page in _expired_oauth_attempt_pages(at):
+        for candidate in page:
+            _clear_expired_oauth_attempt(*candidate, at)
     return published
 
 
