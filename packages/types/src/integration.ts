@@ -68,7 +68,7 @@ export interface IGoogleCalendarFilterOptionLabel {
   id: string;
   name: string;
   color: string;
-  project_id: string;
+  project_id: string | null;
 }
 
 export interface IGoogleCalendarFilterOptions {
