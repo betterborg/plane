@@ -183,7 +183,9 @@ def _complete_callback(request, payload, grant, identity, credential_fingerprint
             revoke_rejected_google_calendar_grant(grant)
         return None
 
-    refresh_token = grant.refresh_token or connection.refresh_token
+    refresh_token = grant.refresh_token
+    if not refresh_token and connection.broken_notified_at is None:
+        refresh_token = connection.refresh_token
     command = apply_google_calendar_oauth_success(
         connection.id,
         payload["lifecycle_generation"],

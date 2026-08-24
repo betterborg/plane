@@ -1,0 +1,5 @@
+Google Calendar disconnected
+
+Plane can no longer access your Google Calendar for {{ workspace_name }}. Reconnect it to resume syncing.
+
+Reconnect Google Calendar: {{ settings_url }}
