@@ -236,6 +236,15 @@
                 "delete": "Delete calendar events"
               }
             },
+            "recipients": {
+              "title": "Cycle recipients",
+              "description": "Choose which connected members receive events for a cycle.",
+              "options": {
+                "cycle_members": "Members with work items in the cycle",
+                "project_members": "All connected project members",
+                "workspace_members": "All connected workspace members"
+              }
+            },
             "mode": {
               "title": "Work item selection",
               "description": "Choose whether each member sees assigned work items or work items matching a workspace filter.",
