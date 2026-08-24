@@ -21,6 +21,14 @@ class NotificationSerializer(BaseSerializer):
         model = Notification
         fields = "__all__"
 
+    def to_representation(self, instance):
+        response = super().to_representation(instance)
+        if instance.entity_name != "issue":
+            response.pop("is_inbox_issue", None)
+            response.pop("is_intake_issue", None)
+            response.pop("is_mentioned_notification", None)
+        return response
+
 
 class UserNotificationPreferenceSerializer(BaseSerializer):
     class Meta:
