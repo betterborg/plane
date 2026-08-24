@@ -61,7 +61,7 @@ from plane.db.models import (
     ProjectMember,
     UserRecentVisit,
 )
-from plane.db.signals import dispatch_google_calendar_cycle_syncs, dispatch_google_calendar_issue_sync
+from plane.db.signals import dispatch_google_calendar_cycle_syncs, dispatch_google_calendar_issue_syncs
 from plane.utils.filters import ComplexFilterBackend, IssueFilterSet
 from plane.utils.global_paginator import paginate
 from plane.utils.grouper import (
@@ -789,8 +789,7 @@ class BulkDeleteIssuesEndpoint(BaseAPIView):
         # Finally, delete the issues themselves
         issues.delete()
 
-        for issue_id in affected_issue_ids:
-            dispatch_google_calendar_issue_sync(issue_id)
+        dispatch_google_calendar_issue_syncs(affected_issue_ids)
         dispatch_google_calendar_cycle_syncs(affected_cycle_ids)
 
         return Response(
@@ -1184,8 +1183,7 @@ class IssueBulkUpdateDateEndpoint(BaseAPIView):
         # Bulk update issues
         Issue.objects.bulk_update(issues_to_update, ["start_date", "target_date"])
 
-        for issue_id in affected_issue_ids:
-            dispatch_google_calendar_issue_sync(issue_id)
+        dispatch_google_calendar_issue_syncs(affected_issue_ids)
 
         return Response({"message": "Issues updated successfully"}, status=status.HTTP_200_OK)
 

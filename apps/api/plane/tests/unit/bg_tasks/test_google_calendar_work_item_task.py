@@ -438,16 +438,17 @@ class TestGoogleCalendarWorkItemTask:
         expected_ids = sorted((issue.id for issue in matching_issues), key=str)
 
         with (
-            patch("plane.db.signals.dispatch_google_calendar_issue_sync") as dispatch,
+            patch("plane.db.signals.dispatch_google_calendar_issue_syncs") as dispatch,
             patch("plane.bgtasks.google_calendar_task.publish_google_calendar_task") as publish,
         ):
             published = resync_google_calendar_state_issues.run(str(state.id), batch_size=2)
 
         assert published == 2
-        assert [call.args[0] for call in dispatch.call_args_list] == expected_ids[:2]
+        dispatch.assert_called_once_with(expected_ids[:2])
         publish.assert_called_once()
         continuation = publish.call_args
         assert continuation.args[0].task == GOOGLE_CALENDAR_STATE_ISSUE_RESYNC_TASK
+        assert continuation.args[0].options["countdown"] == 2
         assert continuation.args[1:] == (
             str(state.id),
             str(expected_ids[1]),
@@ -455,7 +456,7 @@ class TestGoogleCalendarWorkItemTask:
         )
 
         with (
-            patch("plane.db.signals.dispatch_google_calendar_issue_sync") as dispatch,
+            patch("plane.db.signals.dispatch_google_calendar_issue_syncs") as dispatch,
             patch("plane.bgtasks.google_calendar_task.publish_google_calendar_task") as publish,
         ):
             published = resync_google_calendar_state_issues.run(
@@ -465,19 +466,19 @@ class TestGoogleCalendarWorkItemTask:
             )
 
         assert published == 1
-        dispatch.assert_called_once_with(expected_ids[2])
+        dispatch.assert_called_once_with(expected_ids[2:])
         publish.assert_not_called()
 
     def test_state_resync_converges_saved_terminal_and_reopened_definitions(self):
         client = _provider_client()
         state = self.issue.state
 
-        def synchronize_now(issue_id):
-            return synchronize_google_calendar_issue.run(str(issue_id))
+        def synchronize_now(issue_ids):
+            return [synchronize_google_calendar_issue.run(str(issue_id)) for issue_id in issue_ids]
 
         with (
             patch("plane.bgtasks.google_calendar_task.GoogleCalendarClient", return_value=client),
-            patch("plane.db.signals.dispatch_google_calendar_issue_sync", side_effect=synchronize_now),
+            patch("plane.db.signals.dispatch_google_calendar_issue_syncs", side_effect=synchronize_now),
         ):
             synchronize_google_calendar_issue.run(str(self.issue.id))
 
@@ -517,12 +518,12 @@ class TestGoogleCalendarWorkItemTask:
         client = _provider_client()
         state = self.issue.state
 
-        def synchronize_now(issue_id):
-            return synchronize_google_calendar_issue.run(str(issue_id))
+        def synchronize_now(issue_ids):
+            return [synchronize_google_calendar_issue.run(str(issue_id)) for issue_id in issue_ids]
 
         with (
             patch("plane.bgtasks.google_calendar_task.GoogleCalendarClient", return_value=client),
-            patch("plane.db.signals.dispatch_google_calendar_issue_sync", side_effect=synchronize_now),
+            patch("plane.db.signals.dispatch_google_calendar_issue_syncs", side_effect=synchronize_now),
         ):
             synchronize_google_calendar_issue.run(str(self.issue.id))
             self.workspace_integration.config["update_on_completion"] = False
@@ -547,20 +548,21 @@ class TestGoogleCalendarWorkItemTask:
         expected_ids = sorted((issue.id for issue in linked_issues), key=str)
 
         with (
-            patch("plane.db.signals.dispatch_google_calendar_issue_sync") as dispatch,
+            patch("plane.db.signals.dispatch_google_calendar_issue_syncs") as dispatch,
             patch("plane.bgtasks.google_calendar_task.publish_google_calendar_task") as publish,
         ):
             published = resync_google_calendar_label.run(str(label.id), batch_size=2)
 
         assert published == 2
-        assert [call.args[0] for call in dispatch.call_args_list] == expected_ids[:2]
+        dispatch.assert_called_once_with(expected_ids[:2])
         publish.assert_called_once()
         continuation = publish.call_args
         assert continuation.args[0].task == GOOGLE_CALENDAR_LABEL_ISSUE_RESYNC_TASK
+        assert continuation.args[0].options["countdown"] == 2
         assert continuation.args[1:] == (str(label.id), str(expected_ids[1]), 2)
 
         with (
-            patch("plane.db.signals.dispatch_google_calendar_issue_sync") as dispatch,
+            patch("plane.db.signals.dispatch_google_calendar_issue_syncs") as dispatch,
             patch("plane.bgtasks.google_calendar_task.publish_google_calendar_task") as publish,
         ):
             published = resync_google_calendar_label.run(
@@ -570,7 +572,7 @@ class TestGoogleCalendarWorkItemTask:
             )
 
         assert published == 1
-        dispatch.assert_called_once_with(expected_ids[2])
+        dispatch.assert_called_once_with(expected_ids[2:])
         publish.assert_not_called()
 
     def test_label_resync_converges_renamed_and_recursively_deleted_descriptions(self):
@@ -578,12 +580,12 @@ class TestGoogleCalendarWorkItemTask:
         label = LabelFactory(project=self.issue.project, name="Needs review")
         relation = IssueLabelFactory(issue=self.issue, label=label, project=self.issue.project)
 
-        def synchronize_now(issue_id):
-            return synchronize_google_calendar_issue.run(str(issue_id))
+        def synchronize_now(issue_ids):
+            return [synchronize_google_calendar_issue.run(str(issue_id)) for issue_id in issue_ids]
 
         with (
             patch("plane.bgtasks.google_calendar_task.GoogleCalendarClient", return_value=client),
-            patch("plane.db.signals.dispatch_google_calendar_issue_sync", side_effect=synchronize_now),
+            patch("plane.db.signals.dispatch_google_calendar_issue_syncs", side_effect=synchronize_now),
         ):
             synchronize_google_calendar_issue.run(str(self.issue.id))
 
@@ -621,12 +623,12 @@ class TestGoogleCalendarWorkItemTask:
         }
         self.workspace_integration.save(update_fields=["config", "updated_at"])
 
-        def synchronize_now(issue_id):
-            return synchronize_google_calendar_issue.run(str(issue_id))
+        def synchronize_now(issue_ids):
+            return [synchronize_google_calendar_issue.run(str(issue_id)) for issue_id in issue_ids]
 
         with (
             patch("plane.bgtasks.google_calendar_task.GoogleCalendarClient", return_value=client),
-            patch("plane.db.signals.dispatch_google_calendar_issue_sync", side_effect=synchronize_now),
+            patch("plane.db.signals.dispatch_google_calendar_issue_syncs", side_effect=synchronize_now),
         ):
             synchronize_google_calendar_issue.run(str(self.issue.id))
             Label.all_objects.filter(id=label.id).update(deleted_at=timezone.now())

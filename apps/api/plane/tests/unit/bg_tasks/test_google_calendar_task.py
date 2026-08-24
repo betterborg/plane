@@ -475,7 +475,6 @@ class TestGoogleCalendarConvergenceTask:
             refresh_token="refresh-token",
             calendar_id="recorded-plane-calendar",
             calendar_generation=4,
-            sync_token="retained-sync-token",
             desired_state=GoogleCalendarConnection.DesiredState.CONNECTED,
             status=GoogleCalendarConnection.Status.PENDING,
             lifecycle_generation=3,
@@ -496,15 +495,23 @@ class TestGoogleCalendarConvergenceTask:
         with (
             patch("plane.integrations.google_calendar.lifecycle._acquire_advisory_xact_lock"),
             patch("plane.bgtasks.google_calendar_task.GoogleCalendarClient", return_value=client),
-            patch("plane.bgtasks.google_calendar_task.enqueue_google_calendar_task_on_commit"),
+            patch("plane.bgtasks.google_calendar_task.enqueue_google_calendar_task_on_commit") as enqueue,
         ):
             assert reconcile_google_calendar_connection(str(connection.id), 3) == "active"
+
+        assert [call.args[0] for call in enqueue.call_args_list] == [
+            backfill_google_calendar_open_issues,
+            backfill_google_calendar_cycles,
+            reconcile_google_calendar_inventory,
+        ]
+        assert enqueue.call_args_list[-1].kwargs == {"force_local_scan": True}
 
         with (
             patch("plane.bgtasks.google_calendar_task.GoogleCalendarClient", return_value=client),
             patch("plane.bgtasks.google_calendar_task.publish_google_calendar_task") as publish,
         ):
             assert reconcile_google_calendar_inventory.run(str(connection.id), force_local_scan=True) == "continued"
+            assert client.list_event_page.call_args.kwargs["sync_token"] is None
             continuation = publish.call_args
             assert continuation.args[0].task == GOOGLE_CALENDAR_INVENTORY_TASK
             publish.reset_mock()

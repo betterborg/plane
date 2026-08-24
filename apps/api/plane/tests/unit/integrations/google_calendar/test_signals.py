@@ -6,7 +6,11 @@ from unittest.mock import call, patch
 
 import pytest
 
-from plane.db.signals import dispatch_google_calendar_cycle_syncs, suppress_google_calendar_issue_signal_dispatch
+from plane.db.signals import (
+    dispatch_google_calendar_cycle_syncs,
+    dispatch_google_calendar_issue_syncs,
+    suppress_google_calendar_issue_signal_dispatch,
+)
 from plane.tests.factories import (
     CycleFactory,
     CycleIssueFactory,
@@ -24,6 +28,42 @@ from plane.tests.factories import (
 @pytest.mark.unit
 @pytest.mark.django_db(transaction=True)
 class TestGoogleCalendarIssueSignals:
+    def test_multi_issue_dispatch_paces_each_connection_independently(self):
+        workspace_integration = WorkspaceIntegrationFactory(
+            integration__provider="google_calendar",
+            config={"enabled": True, "mode": "assignment", "recipients": "cycle_members"},
+        )
+        first_connection = GoogleCalendarConnectionFactory(
+            workspace_integration=workspace_integration,
+            active=True,
+        )
+        second_connection = GoogleCalendarConnectionFactory(
+            workspace_integration=workspace_integration,
+            member=UserFactory(),
+            active=True,
+        )
+        issues = [IssueFactory(project__workspace=workspace_integration.workspace) for _ in range(3)]
+        for issue in issues:
+            for connection in (first_connection, second_connection):
+                IssueAssigneeFactory(issue=issue, assignee=connection.member, project=issue.project)
+            CycleIssueFactory(
+                cycle=CycleFactory(project=issue.project),
+                issue=issue,
+                project=issue.project,
+            )
+
+        with patch("plane.db.signals.enqueue_google_calendar_task_on_commit") as enqueue:
+            dispatch_google_calendar_issue_syncs(issue.id for issue in issues)
+
+        countdowns_by_connection = {}
+        for queued in enqueue.call_args_list:
+            task, _, connection_id = queued.args
+            countdowns_by_connection.setdefault(connection_id, []).append(task.options["countdown"])
+        assert countdowns_by_connection == {
+            str(first_connection.id): [0, 1, 2, 3, 4, 5],
+            str(second_connection.id): [0, 1, 2, 3, 4, 5],
+        }
+
     def test_issue_dispatch_targets_each_connection_with_its_own_pacing_sequence(self):
         workspace_integration = WorkspaceIntegrationFactory(
             integration__provider="google_calendar",

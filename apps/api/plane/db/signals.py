@@ -57,15 +57,44 @@ def suppress_google_calendar_cycle_signal_dispatch():
 def dispatch_google_calendar_issue_sync(issue_id):
     """Enqueue convergence for one issue and its current cycle after commit."""
 
-    issue_tasks = list(paced_google_calendar_issue_sync_tasks([issue_id]))
-    if issue_tasks:
-        for sync_task, target_issue_id, connection_id in issue_tasks:
-            enqueue_google_calendar_task_on_commit(sync_task, target_issue_id, connection_id)
-    else:
-        enqueue_google_calendar_task_on_commit(synchronize_google_calendar_issue, str(issue_id))
-    cycle_id = CycleIssue.objects.filter(issue_id=issue_id).values_list("cycle_id", flat=True).first()
-    if cycle_id is not None:
-        dispatch_google_calendar_cycle_sync(cycle_id, countdown=1)
+    dispatch_google_calendar_issue_syncs([issue_id])
+
+
+def dispatch_google_calendar_issue_syncs(issue_ids):
+    """Enqueue affected issues and cycles with one pacing sequence per connection."""
+
+    unique_issue_ids = list(dict.fromkeys(str(issue_id) for issue_id in issue_ids))
+    paced_issue_tasks = list(paced_google_calendar_issue_sync_tasks(unique_issue_ids))
+    targeted_issue_ids = set()
+    next_countdown_by_connection = {}
+    for sync_task, issue_id, connection_id in paced_issue_tasks:
+        targeted_issue_ids.add(issue_id)
+        countdown = sync_task.options["countdown"]
+        next_countdown_by_connection[connection_id] = countdown + 1
+        enqueue_google_calendar_task_on_commit(sync_task, issue_id, connection_id)
+    for issue_id in unique_issue_ids:
+        if issue_id not in targeted_issue_ids:
+            enqueue_google_calendar_task_on_commit(synchronize_google_calendar_issue, issue_id)
+
+    cycle_ids = list(
+        CycleIssue.objects.filter(issue_id__in=unique_issue_ids)
+        .order_by()
+        .values_list("cycle_id", flat=True)
+        .distinct()
+    )
+    paced_cycle_tasks = list(paced_google_calendar_cycle_sync_tasks(cycle_ids))
+    targeted_cycle_ids = set()
+    for sync_task, cycle_id, connection_id in paced_cycle_tasks:
+        targeted_cycle_ids.add(cycle_id)
+        countdown = next_countdown_by_connection.get(connection_id, 0) + sync_task.options["countdown"]
+        enqueue_google_calendar_task_on_commit(
+            sync_task.set(countdown=countdown),
+            cycle_id,
+            connection_id,
+        )
+    for cycle_id in cycle_ids:
+        if str(cycle_id) not in targeted_cycle_ids:
+            enqueue_google_calendar_task_on_commit(synchronize_google_calendar_cycle, str(cycle_id))
 
 
 def dispatch_google_calendar_cycle_sync(cycle_id, countdown=0):

@@ -757,13 +757,12 @@ def resync_google_calendar_state_issues(state_id, after_id=None, batch_size=100)
 
     # Import locally because the signal module owns this shared dispatch boundary
     # and imports the task definitions while Django initializes receivers.
-    from plane.db.signals import dispatch_google_calendar_issue_sync
+    from plane.db.signals import dispatch_google_calendar_issue_syncs
 
-    for issue_id in current_batch:
-        dispatch_google_calendar_issue_sync(issue_id)
+    dispatch_google_calendar_issue_syncs(current_batch)
 
     if len(issue_ids) > len(current_batch) and current_batch:
-        continuation = current_app.signature(GOOGLE_CALENDAR_STATE_ISSUE_RESYNC_TASK)
+        continuation = current_app.signature(GOOGLE_CALENDAR_STATE_ISSUE_RESYNC_TASK).set(countdown=len(current_batch))
         publish_google_calendar_task(
             continuation,
             str(state_id),
@@ -785,13 +784,12 @@ def resync_google_calendar_label(label_id, after_id=None, batch_size=100):
 
     # Import locally because the signal module owns this shared dispatch boundary
     # and imports the task definitions while Django initializes receivers.
-    from plane.db.signals import dispatch_google_calendar_issue_sync
+    from plane.db.signals import dispatch_google_calendar_issue_syncs
 
-    for issue_id in current_batch:
-        dispatch_google_calendar_issue_sync(issue_id)
+    dispatch_google_calendar_issue_syncs(current_batch)
 
     if len(issue_ids) > len(current_batch) and current_batch:
-        continuation = current_app.signature(GOOGLE_CALENDAR_LABEL_ISSUE_RESYNC_TASK)
+        continuation = current_app.signature(GOOGLE_CALENDAR_LABEL_ISSUE_RESYNC_TASK).set(countdown=len(current_batch))
         publish_google_calendar_task(
             continuation,
             str(label_id),
@@ -1634,9 +1632,7 @@ def _converge_present(connection, generation):
     ):
         return "stale"
     client = _client_for(connection)
-    retained_inventory = bool(
-        connection.calendar_id and (connection.sync_token or connection.reconciliation_completed_at)
-    )
+    retained_inventory = bool(connection.calendar_id)
     try:
         client.validate_credentials()
         if not has_usable_google_calendar_grant(connection):

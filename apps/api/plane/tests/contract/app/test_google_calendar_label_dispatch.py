@@ -41,14 +41,15 @@ class TestGoogleCalendarLabelDispatch:
         def capture_on_commit(callback, robust=False):
             callbacks.append((callback, robust))
 
-        def inspect_saved_label(issue_id):
-            saved_issue = Issue.all_objects.get(id=issue_id)
-            active_labels = list(
-                IssueLabel.objects.filter(issue_id=issue_id, label__deleted_at__isnull=True).values_list(
-                    "label__name", flat=True
+        def inspect_saved_labels(issue_ids):
+            for issue_id in issue_ids:
+                saved_issue = Issue.all_objects.get(id=issue_id)
+                active_labels = list(
+                    IssueLabel.objects.filter(issue_id=issue_id, label__deleted_at__isnull=True).values_list(
+                        "label__name", flat=True
+                    )
                 )
-            )
-            observed.append((saved_issue.id, active_labels))
+                observed.append((saved_issue.id, active_labels))
 
         with (
             patch(
@@ -64,7 +65,7 @@ class TestGoogleCalendarLabelDispatch:
                 "plane.db.mixins.soft_delete_related_objects.delay",
                 side_effect=lambda *args, **kwargs: recursive_deletions.append((args, kwargs)),
             ),
-            patch("plane.db.signals.dispatch_google_calendar_issue_sync", side_effect=inspect_saved_label),
+            patch("plane.db.signals.dispatch_google_calendar_issue_syncs", side_effect=inspect_saved_labels),
         ):
             if method == "patch":
                 response = client.patch(url, {"name": "Customer request"}, format="json")
