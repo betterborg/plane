@@ -46,6 +46,7 @@ from plane.db.models import (
     ProjectMember,
     UserFavorite,
 )
+from plane.db.signals import dispatch_google_calendar_cycle_syncs
 from plane.utils.cycle_transfer_issues import transfer_cycle_issues
 from plane.utils.order_queryset import CYCLE_ORDER_BY_ALLOWLIST, ISSUE_ORDER_BY_ALLOWLIST, sanitize_order_by
 from plane.utils.host import base_host
@@ -989,7 +990,15 @@ class CycleIssueListCreateAPIEndpoint(BaseAPIView):
             )
 
         # Get all CycleWorkItems already created
-        cycle_issues = list(CycleIssue.objects.filter(~Q(cycle_id=cycle_id), issue_id__in=issues))
+        cycle_issues = list(
+            CycleIssue.objects.filter(
+                ~Q(cycle_id=cycle_id),
+                issue_id__in=issues,
+                workspace__slug=slug,
+                project_id=project_id,
+            )
+        )
+        affected_cycle_ids = [cycle_id, *(cycle_issue.cycle_id for cycle_issue in cycle_issues)]
         existing_issues = [
             str(cycle_issue.issue_id) for cycle_issue in cycle_issues if str(cycle_issue.issue_id) in issues
         ]
@@ -1041,6 +1050,7 @@ class CycleIssueListCreateAPIEndpoint(BaseAPIView):
 
         # Update the cycle issues
         CycleIssue.objects.bulk_update(updated_records, ["cycle_id"], batch_size=100)
+        dispatch_google_calendar_cycle_syncs(affected_cycle_ids)
 
         # Capture Issue Activity
         issue_activity.delay(
@@ -1153,6 +1163,7 @@ class CycleIssueDetailAPIEndpoint(BaseAPIView):
         )
         issue_id = cycle_issue.issue_id
         cycle_issue.delete()
+        dispatch_google_calendar_cycle_syncs([cycle_id])
         issue_activity.delay(
             type="cycle.activity.deleted",
             requested_data=json.dumps(
