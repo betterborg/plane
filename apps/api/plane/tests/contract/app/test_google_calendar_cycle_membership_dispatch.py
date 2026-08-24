@@ -36,7 +36,7 @@ def _transfer_url(api_prefix, workspace, project, cycle):
 
 
 def _capture_on_commit(callbacks):
-    def capture(callback, robust=False):
+    def capture(callback, using=None, robust=False):
         callbacks.append((callback, robust))
 
     return capture
