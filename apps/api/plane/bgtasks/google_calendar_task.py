@@ -15,6 +15,7 @@ from plane.db.models import (
     Issue,
     IssueAssignee,
     IssueLabel,
+    Project,
     WorkspaceIntegration,
 )
 from plane.db.models.state import StateGroup
@@ -28,6 +29,7 @@ from plane.integrations.google_calendar.dispatch import (
     GOOGLE_CALENDAR_LABEL_ISSUE_RESYNC_TASK,
     GOOGLE_CALENDAR_LIFECYCLE_TASK,
     GOOGLE_CALENDAR_OPEN_BACKFILL_TASK,
+    GOOGLE_CALENDAR_PROJECT_ISSUE_RESYNC_TASK,
     GOOGLE_CALENDAR_STATE_ISSUE_RESYNC_TASK,
     GOOGLE_CALENDAR_WORKSPACE_ISSUE_RESYNC_METADATA_KEY,
     GOOGLE_CALENDAR_WORKSPACE_ISSUE_RESYNC_RECONCILIATION_TASK,
@@ -347,6 +349,38 @@ def resync_google_calendar_label(label_id, after_id=None, batch_size=100):
         publish_google_calendar_task(
             continuation,
             str(label_id),
+            str(current_batch[-1]),
+            int(batch_size),
+        )
+    return len(current_batch)
+
+
+@shared_task
+def resync_google_calendar_project_issues(project_id, after_id=None, batch_size=100):
+    """Publish a bounded convergence batch for one project's work items."""
+
+    try:
+        project = Project.all_objects.get(id=project_id)
+    except Project.DoesNotExist:
+        return "missing"
+
+    issue_ids = Issue.all_objects.filter(project_id=project.id).order_by("id")
+    if after_id is not None:
+        issue_ids = issue_ids.filter(id__gt=after_id)
+    issue_ids = list(issue_ids.values_list("id", flat=True)[: int(batch_size) + 1])
+    current_batch = issue_ids[: int(batch_size)]
+
+    for index, issue_id in enumerate(current_batch):
+        sync_task = current_app.signature(GOOGLE_CALENDAR_ISSUE_SYNC_TASK).set(countdown=index)
+        publish_google_calendar_task(sync_task, str(issue_id))
+
+    if len(issue_ids) > len(current_batch) and current_batch:
+        continuation = current_app.signature(GOOGLE_CALENDAR_PROJECT_ISSUE_RESYNC_TASK).set(
+            countdown=len(current_batch)
+        )
+        publish_google_calendar_task(
+            continuation,
+            str(project.id),
             str(current_batch[-1]),
             int(batch_size),
         )

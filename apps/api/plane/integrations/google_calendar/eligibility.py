@@ -7,9 +7,12 @@ from plane.db.models.state import StateGroup
 
 
 def is_google_calendar_project_included(issue, connection):
-    """Extension point for project-level Calendar selection rules."""
+    """Return whether the issue's project is included for Calendar sync."""
 
-    return issue.project.workspace_id == connection.workspace_integration.workspace_id
+    return (
+        issue.project.workspace_id == connection.workspace_integration.workspace_id
+        and issue.project.google_calendar_sync_enabled
+    )
 
 
 def _policy_filter_values(policy, plural_key, singular_key):
