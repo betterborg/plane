@@ -142,10 +142,19 @@ def _cycle_queryset():
     return Cycle.all_objects.select_related("workspace", "project")
 
 
-def _client_event_id_from_recovery(client, connection, entity_id, deterministic_event_id):
-    existing_event = client.get_event(connection.calendar_id, deterministic_event_id)
-    if existing_event is not None:
-        return deterministic_event_id
+def _client_event_id_from_recovery(
+    client,
+    connection,
+    entity_type,
+    entity_id,
+    provider_event_id,
+    *,
+    provider_id_owned,
+):
+    expected_marker = (entity_type, UUID(str(entity_id)))
+    existing_event = client.get_event(connection.calendar_id, provider_event_id)
+    if existing_event is not None and (provider_id_owned or _provider_marker(existing_event) == expected_marker):
+        return provider_event_id
 
     marker = f"plane_entity_id={entity_id}"
     recovered_events = client.list_events(
@@ -153,6 +162,8 @@ def _client_event_id_from_recovery(client, connection, entity_id, deterministic_
         private_extended_property=marker,
     )
     for event in recovered_events:
+        if _provider_marker(event) != expected_marker:
+            continue
         recovered_id = event.get("id")
         if isinstance(recovered_id, str) and recovered_id:
             return recovered_id
@@ -258,8 +269,10 @@ def _converge_provider_event_with_client(
             provider_event_id = _client_event_id_from_recovery(
                 client,
                 connection,
+                entity_type,
                 entity_id,
                 deterministic_event_id,
+                provider_id_owned=False,
             )
             if provider_event_id is None:
                 provider_event = client.insert_event(connection.calendar_id, deterministic_event_id, payload)
@@ -267,10 +280,12 @@ def _converge_provider_event_with_client(
             else:
                 provider_event = _update_or_recreate_provider_event(
                     client,
-                    connection.calendar_id,
+                    connection,
                     deterministic_event_id,
                     provider_event_id,
                     payload,
+                    entity_type,
+                    entity_id,
                 )
                 provider_event_id = _provider_event_id(provider_event, provider_event_id)
         observation = _provider_observation(provider_event, payload_hash)
@@ -310,29 +325,46 @@ def _converge_provider_event_with_client(
     provider_event_id = _client_event_id_from_recovery(
         client,
         connection,
+        entity_type,
         entity_id,
         correlation.google_event_id,
+        provider_id_owned=True,
     )
     if provider_event_id is None:
         try:
             provider_event = client.insert_event(connection.calendar_id, deterministic_event_id, payload)
             provider_event_id = deterministic_event_id
         except GoogleCalendarClientConflict:
-            provider_event_id = deterministic_event_id
-            provider_event = _update_or_recreate_provider_event(
+            provider_event_id = _client_event_id_from_recovery(
                 client,
-                connection.calendar_id,
+                connection,
+                entity_type,
+                entity_id,
                 deterministic_event_id,
-                provider_event_id,
-                payload,
+                provider_id_owned=False,
             )
+            if provider_event_id is None:
+                provider_event = client.insert_event(connection.calendar_id, deterministic_event_id, payload)
+                provider_event_id = deterministic_event_id
+            else:
+                provider_event = _update_or_recreate_provider_event(
+                    client,
+                    connection,
+                    deterministic_event_id,
+                    provider_event_id,
+                    payload,
+                    entity_type,
+                    entity_id,
+                )
     else:
         provider_event = _update_or_recreate_provider_event(
             client,
-            connection.calendar_id,
+            connection,
             deterministic_event_id,
             provider_event_id,
             payload,
+            entity_type,
+            entity_id,
         )
         provider_event_id = _provider_event_id(provider_event, provider_event_id)
     observation = _provider_observation(provider_event, payload_hash)
@@ -380,7 +412,16 @@ def _provider_observation(provider_event, payload_hash):
     }
 
 
-def _update_or_recreate_provider_event(client, calendar_id, deterministic_event_id, provider_event_id, payload):
+def _update_or_recreate_provider_event(
+    client,
+    connection,
+    deterministic_event_id,
+    provider_event_id,
+    payload,
+    entity_type,
+    entity_id,
+):
+    calendar_id = connection.calendar_id
     try:
         return client.update_event(calendar_id, provider_event_id, payload)
     except (GoogleCalendarClientConflict, GoogleCalendarEventAbsent):
@@ -390,10 +431,17 @@ def _update_or_recreate_provider_event(client, calendar_id, deterministic_event_
         try:
             return client.insert_event(calendar_id, deterministic_event_id, payload)
         except GoogleCalendarClientConflict:
-            existing = client.get_event(calendar_id, deterministic_event_id)
-            if existing is None:
+            recovered_event_id = _client_event_id_from_recovery(
+                client,
+                connection,
+                entity_type,
+                entity_id,
+                deterministic_event_id,
+                provider_id_owned=False,
+            )
+            if recovered_event_id is None:
                 return client.insert_event(calendar_id, deterministic_event_id, payload)
-            return client.update_event(calendar_id, deterministic_event_id, payload)
+            return client.update_event(calendar_id, recovered_event_id, payload)
 
 
 @transaction.atomic

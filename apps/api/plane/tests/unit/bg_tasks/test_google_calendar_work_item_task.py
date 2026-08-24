@@ -54,6 +54,7 @@ from plane.integrations.google_calendar.oauth import GoogleCalendarOAuthCredenti
 from plane.license.utils.google_calendar_credentials import google_calendar_credential_fingerprint
 from plane.tests.factories import (
     GoogleCalendarConnectionFactory,
+    GoogleCalendarEventFactory,
     IssueAssigneeFactory,
     IssueFactory,
     IssueLabelFactory,
@@ -126,6 +127,15 @@ class TestGoogleCalendarWorkItemTask:
     def test_insert_conflict_recovers_the_deterministic_event_without_a_duplicate(self):
         client = _provider_client()
         client.insert_event.side_effect = GoogleCalendarClientConflict("already exists")
+        client.get_event.return_value = {
+            "id": "existing-event",
+            "extendedProperties": {
+                "private": {
+                    "plane_entity_type": GoogleCalendarEvent.EntityType.WORK_ITEM,
+                    "plane_entity_id": str(self.issue.id),
+                }
+            },
+        }
 
         with patch("plane.bgtasks.google_calendar_task.GoogleCalendarClient", return_value=client):
             result = synchronize_google_calendar_issue.run(str(self.issue.id))
@@ -134,6 +144,65 @@ class TestGoogleCalendarWorkItemTask:
         assert GoogleCalendarEvent.objects.filter(entity_id=self.issue.id).count() == 1
         client.get_event.assert_called_once()
         client.update_event.assert_called_once()
+
+    @pytest.mark.parametrize(
+        "private_marker",
+        [
+            None,
+            {"plane_entity_id": "issue-id"},
+            {
+                "plane_entity_type": GoogleCalendarEvent.EntityType.CYCLE,
+                "plane_entity_id": "issue-id",
+            },
+        ],
+    )
+    def test_insert_conflict_never_adopts_a_provider_event_without_exact_markers(self, private_marker):
+        client = _provider_client()
+        provider_event = {"id": "foreign-event"}
+        if private_marker is not None:
+            provider_event["extendedProperties"] = {
+                "private": {
+                    key: str(self.issue.id) if value == "issue-id" else value for key, value in private_marker.items()
+                }
+            }
+        client.insert_event.side_effect = GoogleCalendarClientConflict("foreign deterministic event")
+        client.get_event.return_value = provider_event
+        client.list_events.return_value = [provider_event]
+
+        with (
+            patch("plane.bgtasks.google_calendar_task.GoogleCalendarClient", return_value=client),
+            pytest.raises(GoogleCalendarClientConflict),
+        ):
+            synchronize_google_calendar_issue.run(str(self.issue.id), str(self.connection.id))
+
+        client.update_event.assert_not_called()
+        assert not GoogleCalendarEvent.objects.filter(connection=self.connection, entity_id=self.issue.id).exists()
+
+    def test_tombstone_conflict_does_not_adopt_a_partial_marker_match(self):
+        correlation = GoogleCalendarEventFactory(
+            connection=self.connection,
+            entity_id=self.issue.id,
+            google_event_id="missing-ledger-event",
+        )
+        client = _provider_client()
+        client.get_event.return_value = None
+        client.list_events.return_value = [
+            {
+                "id": "foreign-partial-marker",
+                "extendedProperties": {"private": {"plane_entity_id": str(self.issue.id)}},
+            }
+        ]
+        client.insert_event.side_effect = GoogleCalendarClientConflict("foreign deterministic event")
+
+        with (
+            patch("plane.bgtasks.google_calendar_task.GoogleCalendarClient", return_value=client),
+            pytest.raises(GoogleCalendarClientConflict),
+        ):
+            synchronize_google_calendar_issue.run(str(self.issue.id), str(self.connection.id))
+
+        client.update_event.assert_not_called()
+        correlation.refresh_from_db()
+        assert correlation.google_event_id == "missing-ledger-event"
 
     @pytest.mark.parametrize("status_code", [404, 410])
     def test_insert_absence_requests_calendar_replacement_without_a_ledger_row(self, status_code):
