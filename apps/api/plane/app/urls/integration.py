@@ -10,12 +10,18 @@ from plane.app.views import (
     GoogleCalendarFilterOptionsEndpoint,
     GoogleCalendarOAuthStartEndpoint,
     GoogleCalendarProjectSyncEndpoint,
+    GoogleCalendarReleaseReadinessEndpoint,
     GoogleCalendarWorkspacePolicyEndpoint,
     GoogleCalendarWorkspaceStatusEndpoint,
 )
 
 
 urlpatterns = [
+    path(
+        "integrations/google-calendar/readiness/",
+        GoogleCalendarReleaseReadinessEndpoint.as_view(),
+        name="google-calendar-release-readiness",
+    ),
     path(
         "workspaces/<str:slug>/integrations/google-calendar/oauth/start/",
         GoogleCalendarOAuthStartEndpoint.as_view(),

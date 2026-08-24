@@ -2,9 +2,14 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # See the LICENSE file for details.
 
+import hmac
+import logging
+
 from celery import current_app
 from django.conf import settings
 from django.db import transaction
+from django.db.models import Q
+from django.utils import timezone
 from rest_framework import status
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
@@ -50,6 +55,17 @@ from plane.integrations.google_calendar.oauth import (
     GoogleCalendarOAuthConfigurationError,
     get_google_calendar_oauth_credentials,
 )
+from plane.integrations.google_calendar.telemetry import (
+    log_google_calendar_operation,
+    publish_google_calendar_analytics,
+)
+from plane.license.api.permissions import InstanceAdminPermission
+from plane.license.utils.google_calendar_credentials import google_calendar_credential_fingerprint
+from plane.utils.analytics_events import GOOGLE_CALENDAR_ADOPTED
+
+
+logger = logging.getLogger(__name__)
+GOOGLE_CALENDAR_READINESS_OVERDUE_SECONDS = 18 * 60 * 60
 
 
 def _has_complete_google_calendar_credentials():
@@ -58,6 +74,92 @@ def _has_complete_google_calendar_credentials():
     except GoogleCalendarOAuthConfigurationError:
         return False
     return True
+
+
+def _google_calendar_release_readiness(at=None):
+    """Return aggregate release readiness without exposing provider or credential data."""
+
+    at = at or timezone.now()
+    try:
+        credentials = get_google_calendar_oauth_credentials()
+    except GoogleCalendarOAuthConfigurationError:
+        credentials = None
+
+    connections = GoogleCalendarConnection.all_objects.all()
+    provider_connections = connections.filter(
+        Q(provider_account_id__gt="")
+        | Q(provider_email__gt="")
+        | Q(calendar_id__gt="")
+        | Q(calendar_operation_id__isnull=False)
+        | Q(access_token__gt="")
+        | Q(refresh_token__gt="")
+        | Q(sync_token__gt="")
+        | Q(page_token__gt="")
+        | Q(token_expires_at__isnull=False)
+        | ~Q(scopes=[])
+        | Q(credential_fingerprint__gt="")
+    )
+    binding_fingerprints = list(provider_connections.values_list("credential_fingerprint", flat=True))
+    if credentials is None:
+        credential_mismatch_count = len(binding_fingerprints)
+    else:
+        effective_fingerprint = google_calendar_credential_fingerprint(
+            credentials.client_id,
+            credentials.client_secret,
+        )
+        credential_mismatch_count = sum(
+            not fingerprint or not hmac.compare_digest(fingerprint, effective_fingerprint)
+            for fingerprint in binding_fingerprints
+        )
+
+    incomplete_lifecycle_count = connections.filter(
+        Q(status__in=[GoogleCalendarConnection.Status.PENDING, GoogleCalendarConnection.Status.CLEANUP_PENDING])
+        | ~Q(reconciliation_phase="")
+    ).count()
+    required_verifications = connections.filter(
+        workspace_integration__config__enabled=True,
+        desired_state=GoogleCalendarConnection.DesiredState.CONNECTED,
+        status=GoogleCalendarConnection.Status.ACTIVE,
+    )
+    required_verification_states = list(
+        required_verifications.values_list("calendar_id", "reconciliation_completed_at")
+    )
+    completed_times = [
+        completed_at
+        for calendar_id, completed_at in required_verification_states
+        if calendar_id and completed_at is not None
+    ]
+    completion_ages = [max(0, int((at - completed_at).total_seconds())) for completed_at in completed_times]
+    overdue_count = sum(
+        not calendar_id
+        or completed_at is None
+        or (at - completed_at).total_seconds() >= GOOGLE_CALENDAR_READINESS_OVERDUE_SECONDS
+        for calendar_id, completed_at in required_verification_states
+    )
+
+    configuration_complete = credentials is not None
+    credential_binding_complete = configuration_complete and credential_mismatch_count == 0
+    lifecycle_recovery_complete = incomplete_lifecycle_count == 0
+    backend_verification_complete = bool(
+        lifecycle_recovery_complete and len(completed_times) == len(required_verification_states) and overdue_count == 0
+    )
+    ready = configuration_complete and credential_binding_complete and backend_verification_complete
+    return {
+        "ready": ready,
+        "released": settings.GOOGLE_CALENDAR_RELEASED,
+        "configuration_complete": configuration_complete,
+        "credential_binding_complete": credential_binding_complete,
+        "lifecycle_recovery_complete": lifecycle_recovery_complete,
+        "backend_verification_complete": backend_verification_complete,
+        "reconciliation_overdue": overdue_count > 0,
+        "provider_connection_count": len(binding_fingerprints),
+        "credential_mismatch_count": credential_mismatch_count,
+        "incomplete_lifecycle_count": incomplete_lifecycle_count,
+        "required_verification_count": len(required_verification_states),
+        "completed_verification_count": len(completed_times),
+        "overdue_reconciliation_count": overdue_count,
+        "last_completion_age_seconds": max(completion_ages, default=None),
+    }
 
 
 def _calendar_workspace_integration(workspace):
@@ -105,6 +207,32 @@ class GoogleCalendarWorkspaceStatusEndpoint(BaseAPIView):
             },
             status=status.HTTP_200_OK,
         )
+
+
+class GoogleCalendarReleaseReadinessEndpoint(BaseAPIView):
+    """Return secret-free Calendar backend readiness to instance administrators."""
+
+    permission_classes = [InstanceAdminPermission]
+
+    def get(self, request):
+        readiness = _google_calendar_release_readiness()
+        if not readiness["credential_binding_complete"]:
+            action = "credential_binding"
+        elif not readiness["lifecycle_recovery_complete"]:
+            action = "lifecycle_recovery"
+        elif not readiness["backend_verification_complete"]:
+            action = "backend_verification"
+        else:
+            action = "ready"
+        log_google_calendar_operation(
+            logger,
+            "release_readiness",
+            outcome="ready" if readiness["ready"] else "not_ready",
+            local_candidate_count=readiness["required_verification_count"],
+            reconciliation_action=action,
+            last_completion_age_seconds=readiness["last_completion_age_seconds"],
+        )
+        return Response(readiness, status=status.HTTP_200_OK)
 
 
 class GoogleCalendarConnectionRosterEndpoint(BaseAPIView):
@@ -309,4 +437,27 @@ class GoogleCalendarWorkspacePolicyEndpoint(BaseAPIView):
             previous_policy,
             serialized_policy,
         )
+        if policy["enabled"] and not was_enabled:
+
+            def _publish_adoption_telemetry():
+                log_google_calendar_operation(
+                    logger,
+                    "workspace_adoption",
+                    workspace_id=workspace.id,
+                    outcome="enabled",
+                    reconciliation_action="adopt",
+                )
+                publish_google_calendar_analytics(
+                    GOOGLE_CALENDAR_ADOPTED,
+                    user_id=request.user.id,
+                    workspace_id=workspace.id,
+                    workspace_slug=workspace.slug,
+                    outcome="enabled",
+                    reconciliation_action="adopt",
+                )
+
+            transaction.on_commit(
+                _publish_adoption_telemetry,
+                robust=True,
+            )
         return Response(serialized_policy, status=status.HTTP_200_OK)

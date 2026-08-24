@@ -2,10 +2,14 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # See the LICENSE file for details.
 
+import logging
+import time
 from uuid import uuid4
 
 from celery import current_app
 from django.db import transaction
+
+from plane.integrations.google_calendar.telemetry import log_google_calendar_operation
 
 
 GOOGLE_CALENDAR_LIFECYCLE_TASK = "plane.bgtasks.google_calendar_task.reconcile_google_calendar_connection"
@@ -38,6 +42,8 @@ _GOOGLE_CALENDAR_WORKSPACE_POLICY_RESYNC_FIELDS = (
 )
 _GOOGLE_CALENDAR_WORKSPACE_CYCLE_POLICY_RESYNC_FIELDS = ("recipients",)
 
+logger = logging.getLogger(__name__)
+
 
 def _workspace_policy_resync_value(policy, field):
     if field == "update_on_completion":
@@ -66,7 +72,27 @@ def _workspace_policy_resync_value(policy, field):
 def publish_google_calendar_task(task, *args, **kwargs):
     """Publish Calendar work immediately and surface broker failures."""
 
-    return task.delay(*args, **kwargs)
+    started_at = time.monotonic()
+    try:
+        result = task.delay(*args, **kwargs)
+    except Exception as exc:
+        log_google_calendar_operation(
+            logger,
+            "task_publication",
+            outcome="failed",
+            attempt=1,
+            enqueue_latency_ms=round((time.monotonic() - started_at) * 1000, 3),
+            publication_failure_class=type(exc).__name__,
+        )
+        raise
+    log_google_calendar_operation(
+        logger,
+        "task_publication",
+        outcome="published",
+        attempt=1,
+        enqueue_latency_ms=round((time.monotonic() - started_at) * 1000, 3),
+    )
+    return result
 
 
 def enqueue_google_calendar_task_on_commit(task, *args, **kwargs):
