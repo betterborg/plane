@@ -20,10 +20,14 @@ GOOGLE_CALENDAR_PROJECT_CYCLE_RESYNC_TASK = "plane.bgtasks.google_calendar_task.
 GOOGLE_CALENDAR_WORKSPACE_ISSUE_RESYNC_TASK = (
     "plane.bgtasks.google_calendar_task.resync_google_calendar_workspace_issues"
 )
+GOOGLE_CALENDAR_WORKSPACE_CYCLE_RESYNC_TASK = (
+    "plane.bgtasks.google_calendar_task.resync_google_calendar_workspace_cycles"
+)
 GOOGLE_CALENDAR_WORKSPACE_ISSUE_RESYNC_RECONCILIATION_TASK = (
     "plane.bgtasks.google_calendar_task.reconcile_google_calendar_workspace_issue_resyncs"
 )
 GOOGLE_CALENDAR_WORKSPACE_ISSUE_RESYNC_METADATA_KEY = "google_calendar_workspace_issue_resync"
+GOOGLE_CALENDAR_WORKSPACE_CYCLE_RESYNC_METADATA_KEY = "google_calendar_workspace_cycle_resync"
 _GOOGLE_CALENDAR_WORKSPACE_POLICY_RESYNC_FIELDS = (
     "update_on_completion",
     "mode",
@@ -31,6 +35,7 @@ _GOOGLE_CALENDAR_WORKSPACE_POLICY_RESYNC_FIELDS = (
     "label_ids",
     "label_match",
 )
+_GOOGLE_CALENDAR_WORKSPACE_CYCLE_POLICY_RESYNC_FIELDS = ("recipients",)
 
 
 def _workspace_policy_resync_value(policy, field):
@@ -52,6 +57,8 @@ def _workspace_policy_resync_value(policy, field):
         return frozenset(str(label_id) for label_id in label_ids)
     if field == "label_match":
         return policy.get(field, "any")
+    if field == "recipients":
+        return policy.get(field, "cycle_members")
     raise ValueError(f"Unsupported Google Calendar workspace policy field: {field}")
 
 
@@ -84,22 +91,38 @@ def enqueue_google_calendar_workspace_policy_resyncs_on_commit(
 ):
     """Durably request after-commit convergence for a workspace policy change."""
 
-    if all(
-        _workspace_policy_resync_value(previous_policy, field) == _workspace_policy_resync_value(current_policy, field)
+    issue_resync_required = any(
+        _workspace_policy_resync_value(previous_policy, field) != _workspace_policy_resync_value(current_policy, field)
         for field in _GOOGLE_CALENDAR_WORKSPACE_POLICY_RESYNC_FIELDS
-    ):
+    )
+    cycle_resync_required = any(
+        _workspace_policy_resync_value(previous_policy, field) != _workspace_policy_resync_value(current_policy, field)
+        for field in _GOOGLE_CALENDAR_WORKSPACE_CYCLE_POLICY_RESYNC_FIELDS
+    )
+    if not issue_resync_required and not cycle_resync_required:
         return None
 
     generation = str(uuid4())
     metadata = dict(workspace_integration.metadata or {})
-    metadata[GOOGLE_CALENDAR_WORKSPACE_ISSUE_RESYNC_METADATA_KEY] = generation
+    if issue_resync_required:
+        metadata[GOOGLE_CALENDAR_WORKSPACE_ISSUE_RESYNC_METADATA_KEY] = generation
+    if cycle_resync_required:
+        metadata[GOOGLE_CALENDAR_WORKSPACE_CYCLE_RESYNC_METADATA_KEY] = generation
     workspace_integration.metadata = metadata
     workspace_integration.save(update_fields=["metadata", "updated_at"])
 
-    workspace_issue_resync_task = current_app.signature(GOOGLE_CALENDAR_WORKSPACE_ISSUE_RESYNC_TASK)
-    enqueue_google_calendar_task_on_commit(
-        workspace_issue_resync_task,
-        str(workspace_integration.workspace_id),
-        policy_generation=generation,
-    )
+    if issue_resync_required:
+        workspace_issue_resync_task = current_app.signature(GOOGLE_CALENDAR_WORKSPACE_ISSUE_RESYNC_TASK)
+        enqueue_google_calendar_task_on_commit(
+            workspace_issue_resync_task,
+            str(workspace_integration.workspace_id),
+            policy_generation=generation,
+        )
+    if cycle_resync_required:
+        workspace_cycle_resync_task = current_app.signature(GOOGLE_CALENDAR_WORKSPACE_CYCLE_RESYNC_TASK)
+        enqueue_google_calendar_task_on_commit(
+            workspace_cycle_resync_task,
+            str(workspace_integration.workspace_id),
+            policy_generation=generation,
+        )
     return generation

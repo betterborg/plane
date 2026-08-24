@@ -37,7 +37,10 @@ class GoogleCalendarWorkspacePolicySerializer(serializers.Serializer):
     enabled = serializers.BooleanField()
     mode = serializers.ChoiceField(choices=("assignment", "filter"), default="assignment")
     update_on_completion = serializers.BooleanField(default=True)
-    recipients = serializers.ChoiceField(choices=("cycle_members",), default="cycle_members")
+    recipients = serializers.ChoiceField(
+        choices=("cycle_members", "project_members", "workspace_members"),
+        default="cycle_members",
+    )
     label_ids = serializers.ListField(
         child=serializers.UUIDField(),
         default=list,

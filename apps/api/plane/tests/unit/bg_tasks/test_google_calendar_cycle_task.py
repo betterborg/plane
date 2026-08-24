@@ -12,14 +12,18 @@ from plane.bgtasks.google_calendar_task import (
     backfill_google_calendar_cycles,
     backfill_google_calendar_open_issues,
     reconcile_google_calendar_connection,
+    reconcile_google_calendar_workspace_issue_resyncs,
     resync_google_calendar_project_cycles,
     resync_google_calendar_project_issues,
+    resync_google_calendar_workspace_cycles,
     synchronize_google_calendar_cycle,
 )
 from plane.db.models import GoogleCalendarConnection, GoogleCalendarEvent, IssueAssignee
 from plane.integrations.google_calendar.dispatch import (
     GOOGLE_CALENDAR_CYCLE_SYNC_TASK,
     GOOGLE_CALENDAR_PROJECT_CYCLE_RESYNC_TASK,
+    GOOGLE_CALENDAR_WORKSPACE_CYCLE_RESYNC_METADATA_KEY,
+    GOOGLE_CALENDAR_WORKSPACE_CYCLE_RESYNC_TASK,
 )
 from plane.tests.factories import (
     CycleFactory,
@@ -27,8 +31,10 @@ from plane.tests.factories import (
     GoogleCalendarConnectionFactory,
     IssueAssigneeFactory,
     IssueFactory,
+    ProjectMemberFactory,
     UserFactory,
     WorkspaceIntegrationFactory,
+    WorkspaceMemberFactory,
 )
 
 
@@ -197,6 +203,90 @@ class TestGoogleCalendarCycleTask:
 
         assert client.insert_event.call_count == 3
         assert client.delete_event.call_count == 2
+
+    def test_workspace_resync_converges_all_recipient_modes_and_applies_project_exclusion_first(self):
+        project_member_connection = GoogleCalendarConnectionFactory(
+            workspace_integration=self.workspace_integration,
+            member=UserFactory(),
+            active=True,
+        )
+        ProjectMemberFactory(project=self.cycle.project, member=project_member_connection.member)
+        workspace_member_connection = GoogleCalendarConnectionFactory(
+            workspace_integration=self.workspace_integration,
+            member=UserFactory(),
+            active=True,
+        )
+        WorkspaceMemberFactory(
+            workspace=self.workspace_integration.workspace,
+            member=workspace_member_connection.member,
+        )
+        client = _provider_client()
+
+        def publish_cycle_immediately(task, cycle_id):
+            assert task.task == GOOGLE_CALENDAR_CYCLE_SYNC_TASK
+            return synchronize_google_calendar_cycle.run(cycle_id)
+
+        with (
+            patch("plane.bgtasks.google_calendar_task.GoogleCalendarClient", return_value=client),
+            patch(
+                "plane.bgtasks.google_calendar_task.publish_google_calendar_task",
+                side_effect=publish_cycle_immediately,
+            ),
+        ):
+            synchronize_google_calendar_cycle.run(str(self.cycle.id))
+            assert set(
+                GoogleCalendarEvent.objects.filter(entity_id=self.cycle.id).values_list("connection_id", flat=True)
+            ) == {self.connection.id}
+
+            for recipient_mode, expected_connection_id in (
+                ("project_members", project_member_connection.id),
+                ("workspace_members", workspace_member_connection.id),
+            ):
+                self.workspace_integration.config["recipients"] = recipient_mode
+                self.workspace_integration.save(update_fields=["config", "updated_at"])
+                assert resync_google_calendar_workspace_cycles.run(self.workspace_integration.workspace_id) == 1
+                assert set(
+                    GoogleCalendarEvent.objects.filter(entity_id=self.cycle.id).values_list("connection_id", flat=True)
+                ) == {expected_connection_id}
+
+            self.cycle.project.google_calendar_sync_enabled = False
+            self.cycle.project.save(update_fields=["google_calendar_sync_enabled", "updated_at"])
+            self.workspace_integration.config["recipients"] = "cycle_members"
+            self.workspace_integration.save(update_fields=["config", "updated_at"])
+            assert resync_google_calendar_workspace_cycles.run(self.workspace_integration.workspace_id) == 1
+
+        assert not GoogleCalendarEvent.objects.filter(entity_id=self.cycle.id).exists()
+        assert client.insert_event.call_count == 3
+        assert client.delete_event.call_count == 3
+
+    def test_workspace_cycle_resync_generation_is_recoverable_by_periodic_reconciliation(self):
+        generation = "cycle-policy-generation"
+        self.workspace_integration.metadata = {
+            "existing": "metadata",
+            GOOGLE_CALENDAR_WORKSPACE_CYCLE_RESYNC_METADATA_KEY: generation,
+        }
+        self.workspace_integration.save(update_fields=["metadata", "updated_at"])
+
+        with patch("plane.bgtasks.google_calendar_task.publish_google_calendar_task") as publish:
+            discovered = reconcile_google_calendar_workspace_issue_resyncs.run()
+
+        assert discovered == 1
+        task, workspace_id = publish.call_args.args
+        assert task.task == GOOGLE_CALENDAR_WORKSPACE_CYCLE_RESYNC_TASK
+        assert workspace_id == str(self.workspace_integration.workspace_id)
+        assert publish.call_args.kwargs == {"policy_generation": generation}
+
+        with patch("plane.bgtasks.google_calendar_task.publish_google_calendar_task"):
+            assert (
+                resync_google_calendar_workspace_cycles.run(
+                    self.workspace_integration.workspace_id,
+                    policy_generation=generation,
+                )
+                == 1
+            )
+
+        self.workspace_integration.refresh_from_db()
+        assert self.workspace_integration.metadata == {"existing": "metadata"}
 
     def test_successful_provisioning_enqueues_work_item_and_cycle_backfills(self):
         pending_connection = GoogleCalendarConnectionFactory(
