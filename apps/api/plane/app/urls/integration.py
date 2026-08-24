@@ -9,6 +9,7 @@ from plane.app.views import (
     GoogleCalendarConnectionRosterEndpoint,
     GoogleCalendarFilterOptionsEndpoint,
     GoogleCalendarOAuthStartEndpoint,
+    GoogleCalendarProjectSyncEndpoint,
     GoogleCalendarWorkspacePolicyEndpoint,
     GoogleCalendarWorkspaceStatusEndpoint,
 )
@@ -39,6 +40,11 @@ urlpatterns = [
         "workspaces/<str:slug>/integrations/google-calendar/filter-options/",
         GoogleCalendarFilterOptionsEndpoint.as_view(),
         name="google-calendar-filter-options",
+    ),
+    path(
+        "workspaces/<str:slug>/projects/<uuid:project_id>/integrations/google-calendar/",
+        GoogleCalendarProjectSyncEndpoint.as_view(),
+        name="google-calendar-project-sync",
     ),
     path(
         "workspaces/<str:slug>/integrations/google-calendar/connections/<uuid:member_id>/",

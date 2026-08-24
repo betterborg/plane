@@ -9,7 +9,7 @@ from rest_framework import status
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
-from plane.app.permissions import WorkspaceMemberPermission, WorkspaceOwnerPermission
+from plane.app.permissions import ProjectAdminPermission, WorkspaceMemberPermission, WorkspaceOwnerPermission
 from plane.app.serializers import (
     GoogleCalendarConnectionRosterSerializer,
     GoogleCalendarWorkspacePolicyReadSerializer,
@@ -18,12 +18,22 @@ from plane.app.serializers import (
 from plane.app.serializers.integration import (
     GOOGLE_CALENDAR_PUBLIC_STATUSES,
     GoogleCalendarFilterOptionLabelSerializer,
+    GoogleCalendarProjectSyncSerializer,
     serialize_google_calendar_connection_status,
 )
 from plane.app.views.base import BaseAPIView
-from plane.db.models import GoogleCalendarConnection, Integration, Issue, Label, Workspace, WorkspaceIntegration
+from plane.db.models import (
+    GoogleCalendarConnection,
+    Integration,
+    Issue,
+    Label,
+    Project,
+    Workspace,
+    WorkspaceIntegration,
+)
 from plane.integrations.google_calendar.dispatch import (
     GOOGLE_CALENDAR_LIFECYCLE_TASK,
+    enqueue_google_calendar_project_resync_on_commit,
     enqueue_google_calendar_task_on_commit,
     enqueue_google_calendar_workspace_policy_resyncs_on_commit,
 )
@@ -155,6 +165,37 @@ class GoogleCalendarFilterOptionsEndpoint(BaseAPIView):
             },
             status=status.HTTP_200_OK,
         )
+
+
+class GoogleCalendarProjectSyncEndpoint(BaseAPIView):
+    """Read or mutate Calendar inclusion for one project."""
+
+    permission_classes = [ProjectAdminPermission]
+
+    def get_permissions(self):
+        if not settings.GOOGLE_CALENDAR_RELEASED:
+            return [IsAuthenticated()]
+        return super().get_permissions()
+
+    def get(self, request, slug, project_id):
+        if not settings.GOOGLE_CALENDAR_RELEASED:
+            return Response({"error": "Not found"}, status=status.HTTP_404_NOT_FOUND)
+
+        project = Project.objects.get(pk=project_id, workspace__slug=slug)
+        return Response(GoogleCalendarProjectSyncSerializer(project).data, status=status.HTTP_200_OK)
+
+    @transaction.atomic
+    def patch(self, request, slug, project_id):
+        if not settings.GOOGLE_CALENDAR_RELEASED:
+            return Response({"error": "Not found"}, status=status.HTTP_404_NOT_FOUND)
+
+        project = Project.objects.get(pk=project_id, workspace__slug=slug)
+        serializer = GoogleCalendarProjectSyncSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        project.google_calendar_sync_enabled = serializer.validated_data["google_calendar_sync_enabled"]
+        project.save(update_fields=["google_calendar_sync_enabled", "updated_at"])
+        enqueue_google_calendar_project_resync_on_commit(project.id)
+        return Response(GoogleCalendarProjectSyncSerializer(project).data, status=status.HTTP_200_OK)
 
 
 class GoogleCalendarConnectionEndpoint(BaseAPIView):

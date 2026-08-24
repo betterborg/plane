@@ -37,6 +37,7 @@ from .integration import (
     GoogleCalendarConnectionEndpoint,
     GoogleCalendarConnectionRosterEndpoint,
     GoogleCalendarFilterOptionsEndpoint,
+    GoogleCalendarProjectSyncEndpoint,
     GoogleCalendarWorkspacePolicyEndpoint,
     GoogleCalendarWorkspaceStatusEndpoint,
 )
