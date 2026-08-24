@@ -619,10 +619,16 @@ class TestGoogleCalendarConvergenceTask:
         assert connection.calendar_operation_id is None
         assert connection.calendar_generation == 5
 
-    def test_missing_calendar_replacement_backfills_only_current_open_entities(self):
+    def test_missing_calendar_replacement_backfills_filter_mode_open_entities(self):
         workspace_integration = WorkspaceIntegrationFactory(
             integration__provider="google_calendar",
-            config={"enabled": True, "mode": "assignment", "recipients": "cycle_members"},
+            config={
+                "enabled": True,
+                "mode": "filter",
+                "priorities": ["urgent"],
+                "label_ids": [],
+                "recipients": "cycle_members",
+            },
         )
         connection = GoogleCalendarConnectionFactory(
             workspace_integration=workspace_integration,
@@ -634,14 +640,16 @@ class TestGoogleCalendarConvergenceTask:
             status=GoogleCalendarConnection.Status.PENDING,
             lifecycle_generation=4,
         )
-        open_issue = IssueFactory(project__workspace=workspace_integration.workspace)
+        open_issue = IssueFactory(project__workspace=workspace_integration.workspace, priority="urgent")
         completed_issue = IssueFactory(
             project=open_issue.project,
+            priority="urgent",
             state=StateFactory(project=open_issue.project, group="completed"),
         )
-        cycle_issue = IssueFactory(project=open_issue.project)
-        for issue in (open_issue, completed_issue, cycle_issue):
-            IssueAssigneeFactory(issue=issue, assignee=connection.member, project=issue.project)
+        cycle_issue = IssueFactory(project=open_issue.project, priority="urgent")
+        filtered_out_issue = IssueFactory(project=open_issue.project, priority="low")
+        IssueAssigneeFactory(issue=cycle_issue, assignee=connection.member, project=cycle_issue.project)
+        assert not open_issue.issue_assignee.filter(assignee=connection.member).exists()
         active_cycle = CycleFactory(project=open_issue.project)
         ended_cycle = CycleFactory(
             project=open_issue.project,
@@ -672,6 +680,7 @@ class TestGoogleCalendarConvergenceTask:
         }
         assert issue_ids == {str(open_issue.id), str(cycle_issue.id)}
         assert str(completed_issue.id) not in issue_ids
+        assert str(filtered_out_issue.id) not in issue_ids
         assert cycle_ids == {str(active_cycle.id)}
         assert str(ended_cycle.id) not in cycle_ids
 

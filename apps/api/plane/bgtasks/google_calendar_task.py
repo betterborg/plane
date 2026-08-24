@@ -710,16 +710,14 @@ def backfill_google_calendar_open_issues(connection_id, after_id=None, batch_siz
     except GoogleCalendarConnection.DoesNotExist:
         return "missing"
 
-    queryset = (
-        _issue_queryset()
-        .filter(
-            workspace_id=connection.workspace_integration.workspace_id,
-            target_date__isnull=False,
-            issue_assignee__assignee_id=connection.member_id,
-        )
-        .distinct()
-        .order_by("id")
+    queryset = _issue_queryset().filter(
+        workspace_id=connection.workspace_integration.workspace_id,
+        target_date__isnull=False,
     )
+    policy = connection.workspace_integration.config or {}
+    if policy.get("mode", "assignment") != "filter":
+        queryset = queryset.filter(issue_assignee__assignee_id=connection.member_id)
+    queryset = queryset.distinct().order_by("id")
     if after_id is not None:
         queryset = queryset.filter(id__gt=after_id)
     issues = list(queryset[: int(batch_size) + 1])
