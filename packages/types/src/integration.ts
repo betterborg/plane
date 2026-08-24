@@ -64,6 +64,21 @@ export interface IGoogleCalendarWorkspaceStatus {
   connection: IGoogleCalendarConnectionStatus | null;
 }
 
+export interface IGoogleCalendarFilterOptionLabel {
+  id: string;
+  name: string;
+  color: string;
+  project_id: string | null;
+}
+
+export interface IGoogleCalendarFilterOptions {
+  labels: IGoogleCalendarFilterOptionLabel[];
+  priorities: {
+    key: TIssuePriorities;
+    title: string;
+  }[];
+}
+
 export interface IGoogleCalendarConnectionRosterItem {
   member: IUserLite;
   connection: IGoogleCalendarConnectionStatus & {

@@ -10,6 +10,7 @@ import type {
   IExportServiceResponse,
   IGoogleCalendarConnectionRosterItem,
   IGoogleCalendarDisconnectResponse,
+  IGoogleCalendarFilterOptions,
   IGoogleCalendarWorkspacePolicy,
   IGoogleCalendarWorkspaceStatus,
   IImporterService,
@@ -61,6 +62,14 @@ export class IntegrationService extends APIService {
     policy: IGoogleCalendarWorkspacePolicy
   ): Promise<IGoogleCalendarWorkspacePolicy> {
     return this.patch(`/api/workspaces/${workspaceSlug}/integrations/google-calendar/policy/`, policy)
+      .then((response) => response?.data)
+      .catch((error) => {
+        throw error?.response?.data;
+      });
+  }
+
+  async getGoogleCalendarFilterOptions(workspaceSlug: string): Promise<IGoogleCalendarFilterOptions> {
+    return this.get(`/api/workspaces/${workspaceSlug}/integrations/google-calendar/filter-options/`)
       .then((response) => response?.data)
       .catch((error) => {
         throw error?.response?.data;

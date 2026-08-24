@@ -116,6 +116,8 @@ export const WORKSPACE_INTEGRATIONS = (workspaceSlug: string) =>
   `WORKSPACE_INTEGRATIONS_${workspaceSlug.toUpperCase()}`;
 export const GOOGLE_CALENDAR_STATUS = (workspaceSlug: string) =>
   `GOOGLE_CALENDAR_STATUS_${workspaceSlug.toUpperCase()}`;
+export const GOOGLE_CALENDAR_FILTER_OPTIONS = (workspaceSlug: string) =>
+  `GOOGLE_CALENDAR_FILTER_OPTIONS_${workspaceSlug.toUpperCase()}`;
 export const GOOGLE_CALENDAR_CONNECTION_ROSTER = (workspaceSlug: string) =>
   `GOOGLE_CALENDAR_CONNECTION_ROSTER_${workspaceSlug.toUpperCase()}`;
 
