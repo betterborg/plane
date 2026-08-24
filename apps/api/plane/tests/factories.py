@@ -172,6 +172,7 @@ class GoogleCalendarConnectionFactory(factory.django.DjangoModelFactory):
             provider_account_id=factory.Sequence(lambda n: f"google-account-{n}"),
             provider_email=factory.Sequence(lambda n: f"calendar-user-{n}@example.com"),
             calendar_id=factory.Sequence(lambda n: f"plane-calendar-{n}"),
+            calendar_generation=1,
             refresh_token="encrypted-at-rest-refresh-token",
             desired_state=GoogleCalendarConnection.DesiredState.CONNECTED,
             status=GoogleCalendarConnection.Status.ACTIVE,
@@ -276,6 +277,7 @@ class GoogleCalendarEventFactory(factory.django.DjangoModelFactory):
     entity_id = factory.LazyFunction(uuid4)
     google_event_id = factory.Sequence(lambda n: f"planeevent{n}")
     payload_hash = "0" * 64
+    calendar_generation = factory.SelfAttribute("connection.calendar_generation")
 
 
 def google_calendar_connection_scenario(state="absent", **kwargs):

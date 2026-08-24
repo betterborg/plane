@@ -62,8 +62,18 @@ class GoogleCalendarConnection(BaseModel):
     calendar_operation_id = models.UUIDField(null=True, blank=True)
     access_token = EncryptedTextField(blank=True)
     refresh_token = EncryptedTextField(blank=True)
+    sync_token = EncryptedTextField(blank=True)
+    page_token = EncryptedTextField(blank=True)
     token_expires_at = models.DateTimeField(null=True, blank=True)
     scopes = models.JSONField(default=list, blank=True)
+    credential_fingerprint = models.CharField(max_length=64, blank=True)
+
+    # Inventory state is private worker custody and must never be serialized.
+    reconciliation_lease_expires_at = models.DateTimeField(null=True, blank=True)
+    reconciliation_completed_at = models.DateTimeField(null=True, blank=True)
+    reconciliation_phase = models.CharField(max_length=32, blank=True)
+    reconciliation_cursor = models.TextField(blank=True)
+    calendar_generation = models.PositiveBigIntegerField(default=0)
 
     # Durable lifecycle state. OAuth attempts must not mutate these fields.
     desired_state = models.CharField(max_length=32, choices=DesiredState.choices, default=DesiredState.DISCONNECTED)
@@ -111,6 +121,10 @@ class GoogleCalendarEvent(BaseModel):
     entity_id = models.UUIDField()
     google_event_id = models.CharField(max_length=1024)
     payload_hash = models.CharField(max_length=64)
+    calendar_generation = models.PositiveBigIntegerField(default=0)
+    provider_etag = models.CharField(max_length=1024, blank=True)
+    provider_payload_hash = models.CharField(max_length=64, blank=True)
+    provider_status = models.CharField(max_length=32, blank=True)
     last_synced_at = models.DateTimeField(null=True, blank=True)
 
     class Meta:

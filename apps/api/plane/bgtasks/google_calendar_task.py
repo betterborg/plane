@@ -157,6 +157,7 @@ def _converge_provider_event(connection, entity_type, entity_id, payload, correl
             entity_id=entity_id,
             google_event_id=provider_event_id,
             payload_hash=payload_hash,
+            calendar_generation=connection.calendar_generation,
             last_synced_at=timezone.now(),
         )
         _persist_refreshed_access_token(connection, client)
@@ -927,6 +928,7 @@ def _converge_present(connection, generation):
                     return "stale"
                 calendar_id = client.create_calendar(connection.calendar_operation_id)
             connection.calendar_id = calendar_id
+            connection.calendar_generation += 1
             _persist_refreshed_access_token(connection, client)
             if not _owns_generation(
                 connection,
@@ -935,7 +937,7 @@ def _converge_present(connection, generation):
                 status=GoogleCalendarConnection.Status.PENDING,
             ):
                 return "stale"
-            connection.save(update_fields=["calendar_id", "updated_at"])
+            connection.save(update_fields=["calendar_id", "calendar_generation", "updated_at"])
     except (GoogleCalendarClientError, GoogleCalendarOAuthConfigurationError) as exc:
         _persist_refreshed_access_token(connection, client)
         return _record_present_error(connection, generation, exc)

@@ -75,6 +75,7 @@ class TestGoogleCalendarConvergenceTask:
         assert first_result == "active"
         assert delayed_result == "stale"
         assert connection.calendar_id == "new-plane-calendar"
+        assert connection.calendar_generation == 1
         assert connection.status == GoogleCalendarConnection.Status.ACTIVE
         client.find_calendar.assert_called_once()
         client.create_calendar.assert_called_once_with(client.find_calendar.call_args.args[0])
@@ -122,6 +123,32 @@ class TestGoogleCalendarConvergenceTask:
         recovered_client.create_calendar.assert_not_called()
         assert connection.calendar_id == "new-plane-calendar"
         assert connection.calendar_operation_id is None
+        assert connection.calendar_generation == 1
+
+    def test_present_generation_keeps_generation_for_the_recorded_calendar(self):
+        connection = GoogleCalendarConnectionFactory(
+            provider_account_id="google-account",
+            refresh_token="refresh-token",
+            calendar_id="recorded-plane-calendar",
+            calendar_generation=4,
+            desired_state=GoogleCalendarConnection.DesiredState.CONNECTED,
+            status=GoogleCalendarConnection.Status.PENDING,
+            lifecycle_generation=3,
+        )
+        client = _provider_client()
+
+        with (
+            patch("plane.integrations.google_calendar.lifecycle._acquire_advisory_xact_lock"),
+            patch("plane.bgtasks.google_calendar_task.GoogleCalendarClient", return_value=client),
+        ):
+            result = reconcile_google_calendar_connection(str(connection.id), 3)
+
+        connection.refresh_from_db()
+        assert result == "active"
+        assert connection.calendar_id == "recorded-plane-calendar"
+        assert connection.calendar_generation == 4
+        client.find_calendar.assert_not_called()
+        client.create_calendar.assert_not_called()
 
     def test_disable_recovers_and_deletes_an_unrecorded_created_calendar(self):
         workspace_integration = WorkspaceIntegrationFactory(config={"enabled": False})
@@ -188,6 +215,7 @@ class TestGoogleCalendarConvergenceTask:
         assert connection.provider_account_id == "google-account"
         assert connection.refresh_token == "refresh-token"
         assert connection.calendar_id == "new-plane-calendar"
+        assert connection.calendar_generation == 1
 
     def test_terminal_disconnect_deletes_old_calendar_then_retains_tombstone(self):
         workspace_integration = WorkspaceIntegrationFactory(config={"enabled": True})
