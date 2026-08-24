@@ -13,7 +13,7 @@ import { useTranslation } from "@plane/i18n";
 import { TOAST_TYPE, setToast } from "@plane/propel/toast";
 import type { IGoogleCalendarWorkspacePolicy, IGoogleCalendarWorkspaceStatus } from "@plane/types";
 import { EUserWorkspaceRoles } from "@plane/types";
-import { AlertModalCore, Loader, ToggleSwitch } from "@plane/ui";
+import { AlertModalCore, CustomSelect, Loader, ToggleSwitch } from "@plane/ui";
 // components
 import { SettingsBoxedControlItem } from "@/components/settings/boxed-control-item";
 // hooks
@@ -175,13 +175,30 @@ export const GoogleCalendarWorkspacePolicy = observer(function GoogleCalendarWor
               "workspace_settings.settings.integrations.google_calendar.workspace_policy.completion.description"
             )}
             control={
-              <ToggleSwitch
+              <CustomSelect
                 value={workspaceStatus.policy.update_on_completion}
-                onChange={(updateOnCompletion) => void handleCompletionChange(updateOnCompletion)}
-                label={t("workspace_settings.settings.integrations.google_calendar.workspace_policy.completion.label")}
+                onChange={(updateOnCompletion: boolean) => void handleCompletionChange(updateOnCompletion)}
+                label={t(
+                  workspaceStatus.policy.update_on_completion
+                    ? "workspace_settings.settings.integrations.google_calendar.workspace_policy.completion.options.update"
+                    : "workspace_settings.settings.integrations.google_calendar.workspace_policy.completion.options.delete"
+                )}
                 disabled={isMutating}
-                size="sm"
-              />
+                buttonClassName="min-w-44 border border-subtle-1"
+                input
+                placement="bottom-end"
+              >
+                <CustomSelect.Option value={true}>
+                  {t(
+                    "workspace_settings.settings.integrations.google_calendar.workspace_policy.completion.options.update"
+                  )}
+                </CustomSelect.Option>
+                <CustomSelect.Option value={false}>
+                  {t(
+                    "workspace_settings.settings.integrations.google_calendar.workspace_policy.completion.options.delete"
+                  )}
+                </CustomSelect.Option>
+              </CustomSelect>
             }
           />
         </div>

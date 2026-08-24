@@ -229,9 +229,12 @@
               "label": "Enable Google Calendar for this workspace"
             },
             "completion": {
-              "title": "Update completed work items",
-              "description": "Keep Google Calendar events in sync when their Plane work items are completed.",
-              "label": "Update calendar events when work items are completed"
+              "title": "Completed and cancelled work items",
+              "description": "Choose what happens to Google Calendar events when their Plane work items are completed or cancelled.",
+              "options": {
+                "update": "Update calendar events",
+                "delete": "Delete calendar events"
+              }
             },
             "disable": {
               "title": "Disable Google Calendar?",
