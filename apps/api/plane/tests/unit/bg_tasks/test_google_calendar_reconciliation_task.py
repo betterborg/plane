@@ -16,7 +16,7 @@ from plane.bgtasks.google_calendar_task import (
     reconcile_google_calendar_inventory,
     synchronize_google_calendar_issue,
 )
-from plane.db.models import GoogleCalendarEvent
+from plane.db.models import GoogleCalendarConnection, GoogleCalendarEvent
 from plane.integrations.google_calendar.client import GoogleCalendarEventPage, GoogleCalendarSyncTokenExpired
 from plane.integrations.google_calendar.dispatch import GOOGLE_CALENDAR_INVENTORY_TASK, GOOGLE_CALENDAR_ISSUE_SYNC_TASK
 from plane.tests.factories import (
@@ -123,6 +123,49 @@ class TestGoogleCalendarReconciliationTask:
         assert correlation.provider_payload_hash == correlation.payload_hash
         assert GoogleCalendarEvent.objects.filter(connection=connection).count() == 1
         client.update_event.assert_called_once()
+
+    def test_inventory_provider_id_ownership_wins_over_a_copied_marker(self):
+        connection = GoogleCalendarConnectionFactory(active=True, sync_token="current-sync-token")
+        correlation = GoogleCalendarEventFactory(
+            connection=connection,
+            google_event_id="ledger-owned-provider-id",
+            provider_status="confirmed",
+        )
+        marker = {
+            "private": {
+                "plane_entity_type": correlation.entity_type,
+                "plane_entity_id": str(correlation.entity_id),
+            }
+        }
+        page = GoogleCalendarEventPage(
+            (
+                {
+                    "id": "ledger-owned-provider-id",
+                    "status": "confirmed",
+                    "etag": '"owned"',
+                    "extendedProperties": marker,
+                },
+                {
+                    "id": "foreign-copied-marker",
+                    "status": "confirmed",
+                    "etag": '"foreign"',
+                    "extendedProperties": marker,
+                },
+            ),
+            None,
+            "next-sync-token",
+        )
+        client = _provider_client(page)
+
+        with (
+            patch("plane.bgtasks.google_calendar_task.GoogleCalendarClient", return_value=client),
+            patch("plane.bgtasks.google_calendar_task.publish_google_calendar_task"),
+        ):
+            assert reconcile_google_calendar_inventory.run(str(connection.id)) == "continued"
+
+        correlation.refresh_from_db()
+        assert correlation.google_event_id == "ledger-owned-provider-id"
+        assert correlation.provider_etag == '"owned"'
 
     def test_provider_invocation_stops_after_five_pages_and_persists_continuation_first(self):
         connection = GoogleCalendarConnectionFactory(active=True, sync_token="current-sync-token")
@@ -361,3 +404,27 @@ class TestGoogleCalendarReconciliationTask:
         assert current_state["lease_token"] == takeover["lease_token"]
         assert connection.reconciliation_lease_expires_at > timezone.now()
         assert connection.sync_token == "current-sync-token"
+
+    def test_expired_lease_holder_cannot_advance_without_a_takeover(self):
+        connection = GoogleCalendarConnectionFactory(active=True, sync_token="current-sync-token")
+        page = GoogleCalendarEventPage((), None, "stale-worker-sync-token")
+
+        def expire_lease_during_provider_request(*args, **kwargs):
+            GoogleCalendarConnection.objects.filter(id=connection.id).update(
+                reconciliation_lease_expires_at=timezone.now() - timedelta(seconds=1)
+            )
+            return page
+
+        client = _provider_client()
+        client.list_event_page.side_effect = expire_lease_during_provider_request
+
+        with (
+            patch("plane.bgtasks.google_calendar_task.GoogleCalendarClient", return_value=client),
+            patch("plane.bgtasks.google_calendar_task.publish_google_calendar_task") as publish,
+        ):
+            assert reconcile_google_calendar_inventory.run(str(connection.id)) == "stale"
+
+        connection.refresh_from_db()
+        assert connection.sync_token == "current-sync-token"
+        assert connection.reconciliation_completed_at is None
+        publish.assert_not_called()

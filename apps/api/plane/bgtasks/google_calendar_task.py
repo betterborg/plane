@@ -1140,6 +1140,8 @@ def _owns_reconciliation_lease(connection, state, run_id, lease_token, *, phase=
         and state["run_id"] == str(run_id)
         and bool(lease_token)
         and state.get("lease_token") == str(lease_token)
+        and connection.reconciliation_lease_expires_at is not None
+        and connection.reconciliation_lease_expires_at > timezone.now()
         and (phase is None or connection.reconciliation_phase == phase)
         and state.get("calendar_generation") == connection.calendar_generation
         and state.get("lifecycle_generation") == connection.lifecycle_generation
@@ -1270,6 +1272,10 @@ def _record_inventory_page(connection_id, run_id, lease_token, page):
         )
     )
     by_provider_id = {correlation.google_event_id: correlation for correlation in correlations}
+    # Provider-ID ownership is stronger than a copied private marker, regardless
+    # of event order within the page. Reserve every ID-matched ledger row before
+    # considering marker recovery so a foreign duplicate cannot replace it.
+    resolved_correlation_ids = {correlation.id for correlation in correlations}
     marker_keys = [_provider_marker(event) for event in page.events]
     valid_marker_keys = [marker for marker in marker_keys if marker is not None]
     by_marker = {
@@ -1296,9 +1302,12 @@ def _record_inventory_page(connection_id, run_id, lease_token, page):
         event_id = event.get("id")
         correlation = by_provider_id.get(event_id)
         if correlation is None and marker is not None:
-            correlation = by_marker.get(marker)
+            marker_correlation = by_marker.get(marker)
+            if marker_correlation is not None and marker_correlation.id not in resolved_correlation_ids:
+                correlation = marker_correlation
         if correlation is None:
             continue
+        resolved_correlation_ids.add(correlation.id)
         etag = event.get("etag", "")
         status = event.get("status", "")
         provider_hash = google_calendar_provider_payload_hash(event)
