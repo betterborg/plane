@@ -1298,6 +1298,45 @@ def _provider_marker(event):
         return None
 
 
+def _inventory_marker_candidates(state):
+    candidates = state.get("provider_marker_candidates", {})
+    if not isinstance(candidates, dict):
+        return {}
+    return {
+        correlation_id: candidate
+        for correlation_id, candidate in candidates.items()
+        if isinstance(correlation_id, str) and isinstance(candidate, dict)
+    }
+
+
+def _apply_inventory_marker_candidates(connection, candidates):
+    candidate_ids = set(candidates)
+    if not candidate_ids:
+        return
+    correlations = GoogleCalendarEvent.objects.filter(
+        id__in=candidate_ids,
+        connection=connection,
+        calendar_generation=connection.calendar_generation,
+        provider_payload_hash="",
+    ).exclude(provider_status="cancelled")
+    changed = []
+    for correlation in correlations:
+        candidate = candidates[str(correlation.id)]
+        event_id = candidate.get("event_id")
+        if not isinstance(event_id, str) or not event_id:
+            continue
+        correlation.google_event_id = event_id
+        correlation.provider_etag = candidate.get("etag", "")
+        correlation.provider_payload_hash = candidate.get("provider_hash", "")
+        correlation.provider_status = candidate.get("status", "")
+        changed.append(correlation)
+    if changed:
+        GoogleCalendarEvent.objects.bulk_update(
+            changed,
+            ["google_event_id", "provider_etag", "provider_payload_hash", "provider_status"],
+        )
+
+
 @transaction.atomic
 def _record_inventory_page(connection_id, run_id, lease_token, page):
     connection = GoogleCalendarConnection.objects.select_for_update().get(id=connection_id)
@@ -1320,10 +1359,16 @@ def _record_inventory_page(connection_id, run_id, lease_token, page):
         )
     )
     by_provider_id = {correlation.google_event_id: correlation for correlation in correlations}
-    # Provider-ID ownership is stronger than a copied private marker, regardless
-    # of event order within the page. Reserve every ID-matched ledger row before
-    # considering marker recovery so a foreign duplicate cannot replace it.
-    resolved_correlation_ids = {correlation.id for correlation in correlations}
+    # Provider-ID ownership is stronger than a copied private marker across the
+    # entire full-inventory run, including worker continuations. Marker recovery
+    # is deferred until the last page so provider page ordering cannot replace an
+    # ID-owned ledger row. Full inventory clears provider observations before its
+    # first page, making a payload hash or cancelled status a durable direct-ID
+    # observation across later pages.
+    page_owned_correlation_ids = {str(correlation.id) for correlation in correlations}
+    marker_candidates = _inventory_marker_candidates(state)
+    for correlation_id in page_owned_correlation_ids:
+        marker_candidates.pop(correlation_id, None)
     marker_keys = [_provider_marker(event) for event in page.events]
     valid_marker_keys = [marker for marker in marker_keys if marker is not None]
     by_marker = {
@@ -1349,13 +1394,25 @@ def _record_inventory_page(connection_id, run_id, lease_token, page):
     for event, marker in zip(page.events, marker_keys, strict=True):
         event_id = event.get("id")
         correlation = by_provider_id.get(event_id)
-        if correlation is None and marker is not None:
+        if correlation is None and marker is not None and state.get("full_inventory"):
             marker_correlation = by_marker.get(marker)
-            if marker_correlation is not None and marker_correlation.id not in resolved_correlation_ids:
-                correlation = marker_correlation
+            marker_correlation_id = str(marker_correlation.id) if marker_correlation is not None else None
+            if (
+                marker_correlation_id is not None
+                and marker_correlation_id not in page_owned_correlation_ids
+                and not marker_correlation.provider_payload_hash
+                and marker_correlation.provider_status != "cancelled"
+            ):
+                etag = event.get("etag", "")
+                status = event.get("status", "")
+                marker_candidates[marker_correlation_id] = {
+                    "event_id": event_id,
+                    "etag": etag if isinstance(etag, str) else "",
+                    "provider_hash": google_calendar_provider_payload_hash(event),
+                    "status": status if isinstance(status, str) else "",
+                }
         if correlation is None:
             continue
-        resolved_correlation_ids.add(correlation.id)
         etag = event.get("etag", "")
         status = event.get("status", "")
         provider_hash = google_calendar_provider_payload_hash(event)
@@ -1382,11 +1439,15 @@ def _record_inventory_page(connection_id, run_id, lease_token, page):
             ["google_event_id", "provider_etag", "provider_payload_hash", "provider_status"],
         )
 
+    state["provider_marker_candidates"] = marker_candidates
     state["saw_delta"] = state.get("saw_delta", False) or bool(page.events)
     if page.next_page_token:
         _save_reconciliation_state(connection, state, page_token=page.next_page_token)
         return "more"
 
+    if state.get("full_inventory"):
+        _apply_inventory_marker_candidates(connection, marker_candidates)
+    state.pop("provider_marker_candidates", None)
     connection.sync_token = page.next_sync_token or connection.sync_token
     connection.page_token = ""
     connection.save(update_fields=["sync_token", "page_token", "updated_at"])
@@ -1417,6 +1478,7 @@ def _expire_inventory_sync_token(connection_id, run_id, lease_token):
     connection.sync_token = ""
     connection.page_token = ""
     state["full_inventory"] = True
+    state.pop("provider_marker_candidates", None)
     GoogleCalendarEvent.objects.filter(
         connection=connection,
         calendar_generation=connection.calendar_generation,

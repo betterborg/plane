@@ -167,6 +167,166 @@ class TestGoogleCalendarReconciliationTask:
         assert correlation.google_event_id == "ledger-owned-provider-id"
         assert correlation.provider_etag == '"owned"'
 
+    def test_inventory_provider_id_ownership_survives_pages_and_worker_continuations(self):
+        workspace_integration = WorkspaceIntegrationFactory(
+            integration__provider="google_calendar",
+            config={"enabled": True, "mode": "assignment"},
+        )
+        connection = GoogleCalendarConnectionFactory(
+            workspace_integration=workspace_integration,
+            active=True,
+            sync_token="",
+        )
+        issue = IssueFactory(project__workspace=workspace_integration.workspace)
+        IssueAssigneeFactory(issue=issue, assignee=connection.member, project=issue.project)
+        correlation = GoogleCalendarEventFactory(
+            connection=connection,
+            entity_id=issue.id,
+            google_event_id="ledger-owned-provider-id",
+            provider_status="confirmed",
+        )
+        marker = {
+            "private": {
+                "plane_entity_type": correlation.entity_type,
+                "plane_entity_id": str(correlation.entity_id),
+            }
+        }
+        pages = [
+            GoogleCalendarEventPage(
+                (
+                    {
+                        "id": "ledger-owned-provider-id",
+                        "status": "confirmed",
+                        "etag": '"owned"',
+                        "extendedProperties": marker,
+                    },
+                ),
+                "page-1",
+                None,
+            ),
+            GoogleCalendarEventPage((), "page-2", None),
+            GoogleCalendarEventPage((), "page-3", None),
+            GoogleCalendarEventPage((), "page-4", None),
+            GoogleCalendarEventPage((), "page-5", None),
+            GoogleCalendarEventPage(
+                (
+                    {
+                        "id": "foreign-copied-marker",
+                        "status": "confirmed",
+                        "etag": '"foreign"',
+                        "extendedProperties": marker,
+                    },
+                ),
+                None,
+                "next-sync-token",
+            ),
+        ]
+        client = _provider_client(*pages)
+        client.get_event.return_value = {"id": "ledger-owned-provider-id"}
+        client.update_event.return_value = {"id": "ledger-owned-provider-id", "status": "confirmed"}
+
+        with (
+            patch("plane.bgtasks.google_calendar_task.GoogleCalendarClient", return_value=client),
+            patch("plane.bgtasks.google_calendar_task.publish_google_calendar_task") as publish,
+        ):
+            assert reconcile_google_calendar_inventory.run(str(connection.id)) == "continued"
+            provider_continuation = publish.call_args
+
+            publish.reset_mock()
+            assert reconcile_google_calendar_inventory.run(*provider_continuation.args[1:]) == "continued"
+            local_continuation = publish.call_args
+
+            def run_targeted_sync(task, entity_id, connection_id):
+                assert task.task == GOOGLE_CALENDAR_ISSUE_SYNC_TASK
+                synchronize_google_calendar_issue.run(entity_id, connection_id)
+
+            publish.reset_mock()
+            publish.side_effect = run_targeted_sync
+            assert reconcile_google_calendar_inventory.run(*local_continuation.args[1:]) == "complete"
+
+        correlation.refresh_from_db()
+        assert correlation.google_event_id == "ledger-owned-provider-id"
+        assert correlation.provider_etag != '"foreign"'
+        assert client.update_event.call_args.args[1] == "ledger-owned-provider-id"
+
+    def test_full_inventory_cancelled_id_ownership_wins_across_pages(self):
+        connection = GoogleCalendarConnectionFactory(active=True, sync_token="")
+        correlation = GoogleCalendarEventFactory(
+            connection=connection,
+            google_event_id="ledger-owned-cancelled-id",
+        )
+        marker = {
+            "private": {
+                "plane_entity_type": correlation.entity_type,
+                "plane_entity_id": str(correlation.entity_id),
+            }
+        }
+        client = _provider_client(
+            GoogleCalendarEventPage(
+                ({"id": "ledger-owned-cancelled-id", "status": "cancelled"},),
+                "page-1",
+                None,
+            ),
+            GoogleCalendarEventPage(
+                (
+                    {
+                        "id": "foreign-copied-marker",
+                        "status": "confirmed",
+                        "extendedProperties": marker,
+                    },
+                ),
+                None,
+                "next-sync-token",
+            ),
+        )
+
+        with (
+            patch("plane.bgtasks.google_calendar_task.GoogleCalendarClient", return_value=client),
+            patch("plane.bgtasks.google_calendar_task.publish_google_calendar_task"),
+        ):
+            assert reconcile_google_calendar_inventory.run(str(connection.id)) == "continued"
+
+        correlation.refresh_from_db()
+        assert correlation.google_event_id == "ledger-owned-cancelled-id"
+        assert correlation.provider_status == "cancelled"
+
+    def test_full_inventory_recovers_an_exact_marker_only_after_the_final_page(self):
+        connection = GoogleCalendarConnectionFactory(active=True, sync_token="")
+        correlation = GoogleCalendarEventFactory(
+            connection=connection,
+            google_event_id="absent-ledger-provider-id",
+        )
+        marker = {
+            "private": {
+                "plane_entity_type": correlation.entity_type,
+                "plane_entity_id": str(correlation.entity_id),
+            }
+        }
+        client = _provider_client(
+            GoogleCalendarEventPage(
+                (
+                    {
+                        "id": "recovered-exact-marker",
+                        "status": "confirmed",
+                        "etag": '"recovered"',
+                        "extendedProperties": marker,
+                    },
+                ),
+                None,
+                "next-sync-token",
+            )
+        )
+
+        with (
+            patch("plane.bgtasks.google_calendar_task.GoogleCalendarClient", return_value=client),
+            patch("plane.bgtasks.google_calendar_task.publish_google_calendar_task"),
+        ):
+            assert reconcile_google_calendar_inventory.run(str(connection.id)) == "continued"
+
+        correlation.refresh_from_db()
+        assert correlation.google_event_id == "recovered-exact-marker"
+        assert correlation.provider_etag == '"recovered"'
+
     def test_provider_invocation_stops_after_five_pages_and_persists_continuation_first(self):
         connection = GoogleCalendarConnectionFactory(active=True, sync_token="current-sync-token")
         pages = [GoogleCalendarEventPage((), f"page-{index}", None) for index in range(1, 6)]
