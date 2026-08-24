@@ -10,3 +10,4 @@ class DbConfig(AppConfig):
 
     def ready(self):
         from . import signals  # noqa: F401
+        from plane.integrations.google_calendar import signals as google_calendar_signals  # noqa: F401
