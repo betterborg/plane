@@ -9,6 +9,8 @@ import pytest
 from django.db import transaction
 
 from plane.integrations.google_calendar.dispatch import (
+    GOOGLE_CALENDAR_WORKSPACE_CYCLE_RESYNC_METADATA_KEY,
+    GOOGLE_CALENDAR_WORKSPACE_CYCLE_RESYNC_TASK,
     GOOGLE_CALENDAR_WORKSPACE_ISSUE_RESYNC_METADATA_KEY,
     GOOGLE_CALENDAR_WORKSPACE_ISSUE_RESYNC_TASK,
     enqueue_google_calendar_task_on_commit,
@@ -85,6 +87,34 @@ class TestEnqueueGoogleCalendarTaskOnCommit:
 @pytest.mark.unit
 @pytest.mark.django_db(transaction=True)
 class TestEnqueueGoogleCalendarWorkspacePolicyResyncsOnCommit:
+    def test_recipient_change_publishes_cycle_resync_only_after_commit(self):
+        task = Mock()
+        workspace_integration = WorkspaceIntegrationFactory(
+            integration__provider="google_calendar",
+            metadata={"existing": "metadata"},
+        )
+
+        with patch("plane.integrations.google_calendar.dispatch.current_app.signature", return_value=task) as signature:
+            with transaction.atomic():
+                generation = enqueue_google_calendar_workspace_policy_resyncs_on_commit(
+                    workspace_integration,
+                    {"recipients": "cycle_members"},
+                    {"recipients": "project_members"},
+                )
+                task.delay.assert_not_called()
+
+            task.delay.assert_called_once_with(
+                str(workspace_integration.workspace_id),
+                policy_generation=generation,
+            )
+
+        signature.assert_called_once_with(GOOGLE_CALENDAR_WORKSPACE_CYCLE_RESYNC_TASK)
+        workspace_integration.refresh_from_db()
+        assert workspace_integration.metadata == {
+            "existing": "metadata",
+            GOOGLE_CALENDAR_WORKSPACE_CYCLE_RESYNC_METADATA_KEY: generation,
+        }
+
     def test_completion_change_publishes_workspace_resync_only_after_commit(self):
         task = Mock()
         workspace_integration = WorkspaceIntegrationFactory(
@@ -203,3 +233,42 @@ class TestEnqueueGoogleCalendarWorkspacePolicyResyncsOnCommit:
         signature.assert_not_called()
         workspace_integration.refresh_from_db()
         assert GOOGLE_CALENDAR_WORKSPACE_ISSUE_RESYNC_METADATA_KEY not in workspace_integration.metadata
+
+    def test_completion_filter_and_recipient_changes_share_one_dispatch(self):
+        issue_task = Mock()
+        cycle_task = Mock()
+        workspace_integration = WorkspaceIntegrationFactory(integration__provider="google_calendar")
+
+        def signature(task_name):
+            if task_name == GOOGLE_CALENDAR_WORKSPACE_ISSUE_RESYNC_TASK:
+                return issue_task
+            if task_name == GOOGLE_CALENDAR_WORKSPACE_CYCLE_RESYNC_TASK:
+                return cycle_task
+            raise AssertionError(f"Unexpected task: {task_name}")
+
+        with patch("plane.integrations.google_calendar.dispatch.current_app.signature", side_effect=signature):
+            with transaction.atomic():
+                generation = enqueue_google_calendar_workspace_policy_resyncs_on_commit(
+                    workspace_integration,
+                    {
+                        "update_on_completion": True,
+                        "mode": "assignment",
+                        "recipients": "cycle_members",
+                    },
+                    {
+                        "update_on_completion": False,
+                        "mode": "filter",
+                        "priorities": ["urgent"],
+                        "recipients": "workspace_members",
+                    },
+                )
+                issue_task.delay.assert_not_called()
+                cycle_task.delay.assert_not_called()
+
+            expected_call = ((str(workspace_integration.workspace_id),), {"policy_generation": generation})
+            assert (issue_task.delay.call_args.args, issue_task.delay.call_args.kwargs) == expected_call
+            assert (cycle_task.delay.call_args.args, cycle_task.delay.call_args.kwargs) == expected_call
+
+        workspace_integration.refresh_from_db()
+        assert workspace_integration.metadata[GOOGLE_CALENDAR_WORKSPACE_ISSUE_RESYNC_METADATA_KEY] == generation
+        assert workspace_integration.metadata[GOOGLE_CALENDAR_WORKSPACE_CYCLE_RESYNC_METADATA_KEY] == generation

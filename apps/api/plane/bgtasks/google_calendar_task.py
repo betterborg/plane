@@ -35,6 +35,8 @@ from plane.integrations.google_calendar.dispatch import (
     GOOGLE_CALENDAR_PROJECT_CYCLE_RESYNC_TASK,
     GOOGLE_CALENDAR_PROJECT_ISSUE_RESYNC_TASK,
     GOOGLE_CALENDAR_STATE_ISSUE_RESYNC_TASK,
+    GOOGLE_CALENDAR_WORKSPACE_CYCLE_RESYNC_METADATA_KEY,
+    GOOGLE_CALENDAR_WORKSPACE_CYCLE_RESYNC_TASK,
     GOOGLE_CALENDAR_WORKSPACE_ISSUE_RESYNC_METADATA_KEY,
     GOOGLE_CALENDAR_WORKSPACE_ISSUE_RESYNC_RECONCILIATION_TASK,
     GOOGLE_CALENDAR_WORKSPACE_ISSUE_RESYNC_TASK,
@@ -597,6 +599,27 @@ def _workspace_issue_ids_for_resync(workspace_id, after_id=None):
 
 
 def _workspace_issue_resync_generation(workspace_id):
+    return _workspace_resync_generation(workspace_id, GOOGLE_CALENDAR_WORKSPACE_ISSUE_RESYNC_METADATA_KEY)
+
+
+def _workspace_cycle_ids_for_resync(workspace_id, after_id=None):
+    cycle_ids = Cycle.all_objects.filter(workspace_id=workspace_id)
+    correlation_cycle_ids = GoogleCalendarEvent.objects.filter(
+        connection__workspace_integration__workspace_id=workspace_id,
+        entity_type=GoogleCalendarEvent.EntityType.CYCLE,
+    )
+    if after_id is not None:
+        cycle_ids = cycle_ids.filter(id__gt=after_id)
+        correlation_cycle_ids = correlation_cycle_ids.filter(entity_id__gt=after_id)
+    return (
+        cycle_ids.order_by()
+        .values_list("id", flat=True)
+        .union(correlation_cycle_ids.order_by().values_list("entity_id", flat=True))
+        .order_by("id")
+    )
+
+
+def _workspace_resync_generation(workspace_id, metadata_key):
     metadata = (
         WorkspaceIntegration.objects.filter(
             workspace_id=workspace_id,
@@ -606,11 +629,19 @@ def _workspace_issue_resync_generation(workspace_id):
         .first()
         or {}
     )
-    return metadata.get(GOOGLE_CALENDAR_WORKSPACE_ISSUE_RESYNC_METADATA_KEY)
+    return metadata.get(metadata_key)
+
+
+def _complete_workspace_issue_resync(workspace_id, policy_generation):
+    return _complete_workspace_resync(
+        workspace_id,
+        policy_generation,
+        GOOGLE_CALENDAR_WORKSPACE_ISSUE_RESYNC_METADATA_KEY,
+    )
 
 
 @transaction.atomic
-def _complete_workspace_issue_resync(workspace_id, policy_generation):
+def _complete_workspace_resync(workspace_id, policy_generation, metadata_key):
     workspace_integration = (
         WorkspaceIntegration.objects.select_for_update()
         .filter(
@@ -622,9 +653,9 @@ def _complete_workspace_issue_resync(workspace_id, policy_generation):
     if workspace_integration is None:
         return False
     metadata = dict(workspace_integration.metadata or {})
-    if metadata.get(GOOGLE_CALENDAR_WORKSPACE_ISSUE_RESYNC_METADATA_KEY) != policy_generation:
+    if metadata.get(metadata_key) != policy_generation:
         return False
-    metadata.pop(GOOGLE_CALENDAR_WORKSPACE_ISSUE_RESYNC_METADATA_KEY)
+    metadata.pop(metadata_key)
     workspace_integration.metadata = metadata
     workspace_integration.save(update_fields=["metadata", "updated_at"])
     return True
@@ -677,13 +708,76 @@ def resync_google_calendar_workspace_issues(
 
 
 @shared_task(bind=True, max_retries=12)
-def reconcile_google_calendar_workspace_issue_resyncs(task, after_id=None, batch_size=100):
-    """Rediscover and publish durable workspace issue resync requests."""
+def resync_google_calendar_workspace_cycles(
+    task,
+    workspace_id,
+    after_id=None,
+    batch_size=100,
+    policy_generation=None,
+):
+    """Publish a bounded, paced convergence pass for every workspace cycle."""
 
-    workspace_integrations = WorkspaceIntegration.objects.filter(
-        integration__provider="google_calendar",
-        metadata__has_key=GOOGLE_CALENDAR_WORKSPACE_ISSUE_RESYNC_METADATA_KEY,
-    ).order_by("id")
+    if (
+        policy_generation is not None
+        and _workspace_resync_generation(
+            workspace_id,
+            GOOGLE_CALENDAR_WORKSPACE_CYCLE_RESYNC_METADATA_KEY,
+        )
+        != policy_generation
+    ):
+        return "stale"
+
+    if GoogleCalendarConnection.objects.filter(
+        workspace_integration__workspace_id=workspace_id,
+        desired_state=GoogleCalendarConnection.DesiredState.CONNECTED,
+        status=GoogleCalendarConnection.Status.PENDING,
+    ).exists():
+        raise task.retry(countdown=5)
+
+    cycle_ids = list(_workspace_cycle_ids_for_resync(workspace_id, after_id)[: int(batch_size) + 1])
+    current_batch = cycle_ids[: int(batch_size)]
+
+    try:
+        for index, cycle_id in enumerate(current_batch):
+            sync_task = current_app.signature(GOOGLE_CALENDAR_CYCLE_SYNC_TASK).set(countdown=index)
+            publish_google_calendar_task(sync_task, str(cycle_id))
+
+        if len(cycle_ids) > len(current_batch) and current_batch:
+            next_batch = current_app.signature(GOOGLE_CALENDAR_WORKSPACE_CYCLE_RESYNC_TASK).set(
+                countdown=len(current_batch)
+            )
+            publish_google_calendar_task(
+                next_batch,
+                str(workspace_id),
+                str(current_batch[-1]),
+                int(batch_size),
+                policy_generation=policy_generation,
+            )
+        elif policy_generation is not None:
+            _complete_workspace_resync(
+                workspace_id,
+                policy_generation,
+                GOOGLE_CALENDAR_WORKSPACE_CYCLE_RESYNC_METADATA_KEY,
+            )
+    except Exception as exc:
+        raise task.retry(exc=exc, countdown=5) from exc
+    return len(current_batch)
+
+
+@shared_task(bind=True, max_retries=12)
+def reconcile_google_calendar_workspace_issue_resyncs(task, after_id=None, batch_size=100):
+    """Rediscover and publish durable workspace policy resync requests."""
+
+    workspace_integrations = (
+        WorkspaceIntegration.objects.filter(
+            integration__provider="google_calendar",
+        )
+        .filter(
+            Q(metadata__has_key=GOOGLE_CALENDAR_WORKSPACE_ISSUE_RESYNC_METADATA_KEY)
+            | Q(metadata__has_key=GOOGLE_CALENDAR_WORKSPACE_CYCLE_RESYNC_METADATA_KEY)
+        )
+        .order_by("id")
+    )
     if after_id is not None:
         workspace_integrations = workspace_integrations.filter(id__gt=after_id)
     pending = list(workspace_integrations[: int(batch_size) + 1])
@@ -691,7 +785,6 @@ def reconcile_google_calendar_workspace_issue_resyncs(task, after_id=None, batch
 
     try:
         for workspace_integration in current_batch:
-            policy_generation = workspace_integration.metadata[GOOGLE_CALENDAR_WORKSPACE_ISSUE_RESYNC_METADATA_KEY]
             pending_lifecycle_generations = (
                 GoogleCalendarConnection.objects.filter(
                     workspace_integration=workspace_integration,
@@ -708,12 +801,22 @@ def reconcile_google_calendar_workspace_issue_resyncs(task, after_id=None, batch
                     str(connection_id),
                     lifecycle_generation,
                 )
-            resync_task = current_app.signature(GOOGLE_CALENDAR_WORKSPACE_ISSUE_RESYNC_TASK)
-            publish_google_calendar_task(
-                resync_task,
-                str(workspace_integration.workspace_id),
-                policy_generation=policy_generation,
-            )
+            issue_generation = workspace_integration.metadata.get(GOOGLE_CALENDAR_WORKSPACE_ISSUE_RESYNC_METADATA_KEY)
+            if issue_generation is not None:
+                issue_resync_task = current_app.signature(GOOGLE_CALENDAR_WORKSPACE_ISSUE_RESYNC_TASK)
+                publish_google_calendar_task(
+                    issue_resync_task,
+                    str(workspace_integration.workspace_id),
+                    policy_generation=issue_generation,
+                )
+            cycle_generation = workspace_integration.metadata.get(GOOGLE_CALENDAR_WORKSPACE_CYCLE_RESYNC_METADATA_KEY)
+            if cycle_generation is not None:
+                cycle_resync_task = current_app.signature(GOOGLE_CALENDAR_WORKSPACE_CYCLE_RESYNC_TASK)
+                publish_google_calendar_task(
+                    cycle_resync_task,
+                    str(workspace_integration.workspace_id),
+                    policy_generation=cycle_generation,
+                )
 
         if len(pending) > len(current_batch) and current_batch:
             continuation = current_app.signature(GOOGLE_CALENDAR_WORKSPACE_ISSUE_RESYNC_RECONCILIATION_TASK)
