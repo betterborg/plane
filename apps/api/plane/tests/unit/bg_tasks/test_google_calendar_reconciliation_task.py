@@ -13,6 +13,8 @@ from freezegun import freeze_time
 
 from plane.bgtasks.google_calendar_task import (
     GOOGLE_CALENDAR_RECONCILIATION_MAX_STAGGER_SECONDS,
+    _clear_expired_oauth_attempt,
+    _expired_oauth_attempt_pages,
     _release_reconciliation_lease,
     _start_or_resume_inventory,
     reconcile_google_calendar_connection,
@@ -60,6 +62,13 @@ class TestScheduleGoogleCalendarReconciliations:
         entry = app.conf.beat_schedule["schedule-google-calendar-reconciliations"]
         assert entry["task"] == "plane.bgtasks.google_calendar_task.schedule_google_calendar_reconciliations"
         assert entry["schedule"].minute == {0}
+        assert (
+            sum(
+                item["task"] == "plane.bgtasks.google_calendar_task.schedule_google_calendar_reconciliations"
+                for item in app.conf.beat_schedule.values()
+            )
+            == 1
+        )
 
     @freeze_time("2026-08-24 12:00:00")
     def test_selects_six_hour_due_connections_and_skips_active_two_hour_leases(self):
@@ -335,6 +344,190 @@ class TestScheduleGoogleCalendarReconciliations:
 
         assert acquire_lock.call_count == 2
         publish.assert_not_called()
+
+    @freeze_time("2026-08-24 12:00:00")
+    def test_expired_attempts_clear_only_attempt_metadata_without_scheduling_work(self):
+        at = timezone.now()
+        workspace_integration = _enabled_calendar_integration()
+        popup_abandonment = GoogleCalendarConnectionFactory(
+            workspace_integration=workspace_integration,
+            attempt_only=True,
+            oauth_attempt_expires_at=at,
+        )
+        partial_consent = GoogleCalendarConnectionFactory(
+            workspace_integration=workspace_integration,
+            active=True,
+            attempt_only=True,
+            oauth_attempt_expires_at=at,
+            reconciliation_completed_at=at,
+            reconciliation_lease_expires_at=at + timedelta(minutes=30),
+            reconciliation_phase="local_scan",
+            reconciliation_cursor='{"after_id":"cursor"}',
+            last_success_at=at - timedelta(minutes=5),
+        )
+        failed_exchange = GoogleCalendarConnectionFactory(
+            workspace_integration=workspace_integration,
+            bound_broken=True,
+            attempt_only=True,
+            oauth_attempt_expires_at=at,
+        )
+        attempts = [popup_abandonment, partial_consent, failed_exchange]
+        attempt_fields = {
+            "oauth_state",
+            "oauth_code_verifier",
+            "oauth_redirect_uri",
+            "oauth_attempt_expires_at",
+        }
+        durable_snapshots = {
+            connection.id: {
+                field.attname: getattr(connection, field.attname)
+                for field in connection._meta.concrete_fields
+                if field.name not in attempt_fields
+            }
+            for connection in attempts
+        }
+        row_count = GoogleCalendarConnection.objects.count()
+
+        with (
+            patch("plane.integrations.google_calendar.lifecycle._acquire_advisory_xact_lock"),
+            patch("plane.bgtasks.google_calendar_task.publish_google_calendar_task") as publish,
+            patch("plane.bgtasks.google_calendar_task.enqueue_google_calendar_task_on_commit") as enqueue,
+            patch("plane.bgtasks.google_calendar_task.GoogleCalendarClient") as client_class,
+        ):
+            assert schedule_google_calendar_reconciliations.run() == 0
+            assert schedule_google_calendar_reconciliations.run() == 0
+
+        assert GoogleCalendarConnection.objects.count() == row_count
+        publish.assert_not_called()
+        enqueue.assert_not_called()
+        client_class.assert_not_called()
+        for connection in attempts:
+            connection.refresh_from_db()
+            assert connection.oauth_state == ""
+            assert connection.oauth_code_verifier == ""
+            assert connection.oauth_redirect_uri == ""
+            assert connection.oauth_attempt_expires_at is None
+            assert {
+                field.attname: getattr(connection, field.attname)
+                for field in connection._meta.concrete_fields
+                if field.name not in attempt_fields
+            } == durable_snapshots[connection.id]
+
+    @freeze_time("2026-08-24 12:00:00")
+    def test_stale_expiry_page_cannot_clear_a_new_attempt_or_lifecycle_generation(self):
+        at = timezone.now()
+        new_attempt = GoogleCalendarConnectionFactory(
+            attempt_only=True,
+            oauth_attempt_expires_at=at - timedelta(minutes=1),
+        )
+        newer_lifecycle = GoogleCalendarConnectionFactory(
+            attempt_only=True,
+            oauth_attempt_expires_at=at - timedelta(minutes=1),
+            lifecycle_generation=4,
+        )
+
+        def advance_before_cleanup(connection_id, attempt_generation, expires_at, lifecycle_generation, selected_at):
+            if connection_id == new_attempt.id:
+                GoogleCalendarConnection.objects.filter(id=connection_id).update(
+                    oauth_state="new-attempt-generation",
+                    oauth_code_verifier="new-code-verifier",
+                    oauth_redirect_uri="https://plane.example/new-callback",
+                    oauth_attempt_expires_at=at + timedelta(minutes=10),
+                )
+            else:
+                GoogleCalendarConnection.objects.filter(id=connection_id).update(lifecycle_generation=5)
+            return _clear_expired_oauth_attempt(
+                connection_id,
+                attempt_generation,
+                expires_at,
+                lifecycle_generation,
+                selected_at,
+            )
+
+        with (
+            patch("plane.integrations.google_calendar.lifecycle._acquire_advisory_xact_lock"),
+            patch(
+                "plane.bgtasks.google_calendar_task._clear_expired_oauth_attempt",
+                side_effect=advance_before_cleanup,
+            ),
+            patch("plane.bgtasks.google_calendar_task.publish_google_calendar_task") as publish,
+            patch("plane.bgtasks.google_calendar_task.GoogleCalendarClient") as client_class,
+        ):
+            assert schedule_google_calendar_reconciliations.run() == 0
+
+        new_attempt.refresh_from_db()
+        newer_lifecycle.refresh_from_db()
+        assert new_attempt.oauth_state == "new-attempt-generation"
+        assert new_attempt.oauth_code_verifier == "new-code-verifier"
+        assert new_attempt.oauth_redirect_uri == "https://plane.example/new-callback"
+        assert new_attempt.oauth_attempt_expires_at == at + timedelta(minutes=10)
+        assert newer_lifecycle.lifecycle_generation == 5
+        assert newer_lifecycle.oauth_state
+        assert newer_lifecycle.oauth_attempt_expires_at == at - timedelta(minutes=1)
+        publish.assert_not_called()
+        client_class.assert_not_called()
+
+    @freeze_time("2026-08-24 12:00:00")
+    def test_expired_attempt_selector_uses_bounded_primary_key_pages(self):
+        at = timezone.now()
+        attempts = [
+            GoogleCalendarConnectionFactory(
+                id=UUID(int=index),
+                attempt_only=True,
+                oauth_attempt_expires_at=at,
+            )
+            for index in range(1, 6)
+        ]
+
+        with patch("plane.bgtasks.google_calendar_task.GOOGLE_CALENDAR_OAUTH_ATTEMPT_EXPIRY_PAGE_SIZE", 2):
+            pages = list(_expired_oauth_attempt_pages(at))
+
+        assert [len(page) for page in pages] == [2, 2, 1]
+        assert [candidate[0] for page in pages for candidate in page] == [attempt.id for attempt in attempts]
+
+    @freeze_time("2026-08-24 12:00:00")
+    def test_hourly_entry_composes_healthy_present_and_attempt_expiry_once(self):
+        at = timezone.now()
+        workspace_integration = _enabled_calendar_integration()
+        healthy = GoogleCalendarConnectionFactory(
+            workspace_integration=workspace_integration,
+            active=True,
+            reconciliation_completed_at=at - timedelta(hours=6),
+        )
+        present = GoogleCalendarConnectionFactory(
+            workspace_integration=workspace_integration,
+            provider_account_id="present-account",
+            refresh_token="present-refresh-token",
+            desired_state=GoogleCalendarConnection.DesiredState.CONNECTED,
+            status=GoogleCalendarConnection.Status.PENDING,
+            lifecycle_generation=7,
+        )
+        WorkspaceMemberFactory(
+            workspace=workspace_integration.workspace,
+            member=present.member,
+        )
+        expired_attempt = GoogleCalendarConnectionFactory(
+            workspace_integration=workspace_integration,
+            attempt_only=True,
+            oauth_attempt_expires_at=at,
+        )
+
+        with (
+            patch("plane.integrations.google_calendar.lifecycle._acquire_advisory_xact_lock"),
+            patch("plane.bgtasks.google_calendar_task.publish_google_calendar_task") as publish,
+            patch("plane.bgtasks.google_calendar_task.GoogleCalendarClient") as client_class,
+        ):
+            assert schedule_google_calendar_reconciliations.run() == 2
+
+        published = [(call.args[0].task, call.args[1:]) for call in publish.call_args_list]
+        assert published == [
+            (GOOGLE_CALENDAR_INVENTORY_TASK, (str(healthy.id),)),
+            (GOOGLE_CALENDAR_LIFECYCLE_TASK, (str(present.id), 7)),
+        ]
+        expired_attempt.refresh_from_db()
+        assert expired_attempt.oauth_state == ""
+        assert expired_attempt.oauth_attempt_expires_at is None
+        client_class.assert_not_called()
 
 
 @pytest.mark.unit
