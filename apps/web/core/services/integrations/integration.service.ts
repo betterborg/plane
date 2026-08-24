@@ -11,6 +11,7 @@ import type {
   IGoogleCalendarConnectionRosterItem,
   IGoogleCalendarDisconnectResponse,
   IGoogleCalendarFilterOptions,
+  IGoogleCalendarProjectSync,
   IGoogleCalendarWorkspacePolicy,
   IGoogleCalendarWorkspaceStatus,
   IImporterService,
@@ -70,6 +71,29 @@ export class IntegrationService extends APIService {
 
   async getGoogleCalendarFilterOptions(workspaceSlug: string): Promise<IGoogleCalendarFilterOptions> {
     return this.get(`/api/workspaces/${workspaceSlug}/integrations/google-calendar/filter-options/`)
+      .then((response) => response?.data)
+      .catch((error) => {
+        throw error?.response?.data;
+      });
+  }
+
+  async getGoogleCalendarProjectSync(workspaceSlug: string, projectId: string): Promise<IGoogleCalendarProjectSync> {
+    return this.get(`/api/workspaces/${workspaceSlug}/projects/${projectId}/integrations/google-calendar/`)
+      .then((response) => response?.data)
+      .catch((error) => {
+        throw error?.response?.data;
+      });
+  }
+
+  async updateGoogleCalendarProjectSync(
+    workspaceSlug: string,
+    projectId: string,
+    projectSync: IGoogleCalendarProjectSync
+  ): Promise<IGoogleCalendarProjectSync> {
+    return this.patch(
+      `/api/workspaces/${workspaceSlug}/projects/${projectId}/integrations/google-calendar/`,
+      projectSync
+    )
       .then((response) => response?.data)
       .catch((error) => {
         throw error?.response?.data;

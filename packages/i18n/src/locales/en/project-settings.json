@@ -330,6 +330,25 @@
         "toggle_title": "Enable cycles",
         "toggle_description": "Plan work in focused timeframes."
       },
+      "google_calendar": {
+        "title": "Google Calendar",
+        "short_title": "Google Calendar",
+        "description": "Control whether this project's work items and cycles are synchronized with Google Calendar.",
+        "toggle_title": "Sync this project",
+        "toggle_description": "Create Calendar events for eligible work items and cycles. Turning this off removes this project's events from connected calendars.",
+        "load_error": "Google Calendar settings could not be loaded. Please try again.",
+        "toast": {
+          "loading": "Updating Google Calendar sync...",
+          "success": {
+            "title": "Google Calendar updated",
+            "message": "Project synchronization has been updated."
+          },
+          "error": {
+            "title": "Update failed",
+            "message": "Google Calendar synchronization could not be updated. Please try again."
+          }
+        }
+      },
       "modules": {
         "title": "Modules",
         "short_title": "Modules",

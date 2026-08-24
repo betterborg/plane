@@ -38,6 +38,10 @@ export interface IBaseUserPermissionStore {
   workspaceInfoBySlug: (workspaceSlug: string) => IWorkspaceMemberMe | undefined;
   getWorkspaceRoleByWorkspaceSlug: (workspaceSlug: string) => TUserPermissions | EUserWorkspaceRoles | undefined;
   getProjectRolesByWorkspaceSlug: (workspaceSlug: string) => IUserProjectsRole;
+  getProjectMembershipRoleByWorkspaceSlugAndProjectId: (
+    workspaceSlug: string,
+    projectId?: string
+  ) => EUserPermissions | undefined;
   getProjectRoleByWorkspaceSlugAndProjectId: (
     workspaceSlug: string,
     projectId?: string
@@ -114,14 +118,27 @@ export class BaseUserPermissionStore implements IBaseUserPermissionStore {
   );
 
   /**
-   * @description Returns the project membership permission
+   * @description Returns the stored project membership role without applying workspace-level permissions
+   * @param { string } workspaceSlug
+   * @param { string } projectId
+   * @returns { EUserPermissions | undefined }
+   */
+  getProjectMembershipRoleByWorkspaceSlugAndProjectId = computedFn(
+    (workspaceSlug: string, projectId?: string): EUserPermissions | undefined => {
+      if (!workspaceSlug || !projectId) return undefined;
+      return this.workspaceProjectsPermissions?.[workspaceSlug]?.[projectId];
+    }
+  );
+
+  /**
+   * @description Returns the effective project permission, including workspace administrator access
    * @param { string } workspaceSlug
    * @param { string } projectId
    * @returns { EUserPermissions | undefined }
    */
   protected getProjectRole = computedFn((workspaceSlug: string, projectId?: string): EUserPermissions | undefined => {
     if (!workspaceSlug || !projectId) return undefined;
-    const projectRole = this.workspaceProjectsPermissions?.[workspaceSlug]?.[projectId];
+    const projectRole = this.getProjectMembershipRoleByWorkspaceSlugAndProjectId(workspaceSlug, projectId);
     if (!projectRole) return undefined;
     const workspaceRole = this.workspaceUserInfo?.[workspaceSlug]?.role;
     if (workspaceRole === EUserWorkspaceRoles.ADMIN) return EUserPermissions.ADMIN;

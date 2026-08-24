@@ -118,6 +118,8 @@ export const GOOGLE_CALENDAR_STATUS = (workspaceSlug: string) =>
   `GOOGLE_CALENDAR_STATUS_${workspaceSlug.toUpperCase()}`;
 export const GOOGLE_CALENDAR_FILTER_OPTIONS = (workspaceSlug: string) =>
   `GOOGLE_CALENDAR_FILTER_OPTIONS_${workspaceSlug.toUpperCase()}`;
+export const GOOGLE_CALENDAR_PROJECT_SYNC = (workspaceSlug: string, projectId: string) =>
+  `GOOGLE_CALENDAR_PROJECT_SYNC_${workspaceSlug.toUpperCase()}_${projectId.toUpperCase()}`;
 export const GOOGLE_CALENDAR_CONNECTION_ROSTER = (workspaceSlug: string) =>
   `GOOGLE_CALENDAR_CONNECTION_ROSTER_${workspaceSlug.toUpperCase()}`;
 
