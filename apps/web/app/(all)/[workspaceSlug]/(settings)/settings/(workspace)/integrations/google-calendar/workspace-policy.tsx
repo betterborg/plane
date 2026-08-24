@@ -33,7 +33,7 @@ type Props = {
 
 type TFilterPolicyDraft = Pick<IGoogleCalendarWorkspacePolicy, "label_ids" | "label_match" | "mode" | "priorities">;
 
-type TPolicyMutation = "completion" | "enabled" | "filter" | null;
+type TPolicyMutation = "completion" | "enabled" | "filter" | "recipients" | null;
 
 const integrationService = new IntegrationService();
 
@@ -166,6 +166,12 @@ export const GoogleCalendarWorkspacePolicy = observer(function GoogleCalendarWor
     await updatePolicy({ ...workspaceStatus.policy, update_on_completion: updateOnCompletion }, "completion");
   };
 
+  const handleRecipientsChange = async (recipients: IGoogleCalendarWorkspacePolicy["recipients"]) => {
+    if (!workspaceStatus || recipients === workspaceStatus.policy.recipients) return;
+
+    await updatePolicy({ ...workspaceStatus.policy, recipients }, "recipients");
+  };
+
   const handleFilterSave = async () => {
     if (!workspaceStatus) return;
 
@@ -284,6 +290,43 @@ export const GoogleCalendarWorkspacePolicy = observer(function GoogleCalendarWor
                 <CustomSelect.Option value={false}>
                   {t(
                     "workspace_settings.settings.integrations.google_calendar.workspace_policy.completion.options.delete"
+                  )}
+                </CustomSelect.Option>
+              </CustomSelect>
+            }
+          />
+          <SettingsBoxedControlItem
+            title={t("workspace_settings.settings.integrations.google_calendar.workspace_policy.recipients.title")}
+            description={t(
+              "workspace_settings.settings.integrations.google_calendar.workspace_policy.recipients.description"
+            )}
+            control={
+              <CustomSelect
+                value={workspaceStatus.policy.recipients}
+                onChange={(recipients: IGoogleCalendarWorkspacePolicy["recipients"]) =>
+                  void handleRecipientsChange(recipients)
+                }
+                label={t(
+                  `workspace_settings.settings.integrations.google_calendar.workspace_policy.recipients.options.${workspaceStatus.policy.recipients}`
+                )}
+                disabled={isMutating}
+                buttonClassName="min-w-44 border border-subtle-1"
+                input
+                placement="bottom-end"
+              >
+                <CustomSelect.Option value="cycle_members">
+                  {t(
+                    "workspace_settings.settings.integrations.google_calendar.workspace_policy.recipients.options.cycle_members"
+                  )}
+                </CustomSelect.Option>
+                <CustomSelect.Option value="project_members">
+                  {t(
+                    "workspace_settings.settings.integrations.google_calendar.workspace_policy.recipients.options.project_members"
+                  )}
+                </CustomSelect.Option>
+                <CustomSelect.Option value="workspace_members">
+                  {t(
+                    "workspace_settings.settings.integrations.google_calendar.workspace_policy.recipients.options.workspace_members"
                   )}
                 </CustomSelect.Option>
               </CustomSelect>
