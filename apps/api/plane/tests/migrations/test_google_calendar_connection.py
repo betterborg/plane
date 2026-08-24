@@ -16,16 +16,10 @@ MIGRATE_FROM = ("db", "0122_alter_draftissue_assignees_alter_issue_assignees_and
 MIGRATE_TO = ("db", "0126_google_calendar_cleanup_intent")
 
 
-def migrate_to(executor, target):
-    executor.loader.build_graph()
-    executor.migrate([target])
-    return executor.loader.project_state([target]).apps
-
-
 @pytest.mark.migration
 class TestGoogleCalendarConnectionMigration:
-    def test_preserves_legacy_integrations_and_adds_connection_schema(self, migration_executor):
-        old_apps = migrate_to(migration_executor, MIGRATE_FROM)
+    def test_preserves_legacy_integrations_and_adds_connection_schema(self, migrate_to):
+        old_apps = migrate_to(MIGRATE_FROM)
         User = old_apps.get_model("db", "User")
         Workspace = old_apps.get_model("db", "Workspace")
         APIToken = old_apps.get_model("db", "APIToken")
@@ -51,7 +45,7 @@ class TestGoogleCalendarConnectionMigration:
             )
             legacy_ids[provider] = workspace_integration.id
 
-        new_apps = migrate_to(migration_executor, MIGRATE_TO)
+        new_apps = migrate_to(MIGRATE_TO)
         Integration = new_apps.get_model("db", "Integration")
         WorkspaceIntegration = new_apps.get_model("db", "WorkspaceIntegration")
         CalendarConnection = new_apps.get_model("db", "GoogleCalendarConnection")
@@ -112,8 +106,8 @@ class TestGoogleCalendarConnectionMigration:
                 member_id=member.id,
             )
 
-    def test_factories_cover_lifecycle_states(self, migration_executor):
-        migrate_to(migration_executor, MIGRATE_TO)
+    def test_factories_cover_lifecycle_states(self, migrate_to):
+        migrate_to(MIGRATE_TO)
 
         assert google_calendar_connection_scenario() is None
 

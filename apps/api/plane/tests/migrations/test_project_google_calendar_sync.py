@@ -9,16 +9,10 @@ MIGRATE_FROM = ("db", "0128_google_calendar_events")
 MIGRATE_TO = ("db", "0129_project_google_calendar_sync")
 
 
-def migrate_to(executor, target):
-    executor.loader.build_graph()
-    executor.migrate([target])
-    return executor.loader.project_state([target]).apps
-
-
 @pytest.mark.migration
 class TestProjectGoogleCalendarSyncMigration:
-    def test_defaults_existing_and_new_projects_to_calendar_sync(self, migration_executor):
-        old_apps = migrate_to(migration_executor, MIGRATE_FROM)
+    def test_defaults_existing_and_new_projects_to_calendar_sync(self, migrate_to):
+        old_apps = migrate_to(MIGRATE_FROM)
         User = old_apps.get_model("db", "User")
         Workspace = old_apps.get_model("db", "Workspace")
         Project = old_apps.get_model("db", "Project")
@@ -27,7 +21,7 @@ class TestProjectGoogleCalendarSyncMigration:
         workspace = Workspace.objects.create(name="Calendar workspace", slug="calendar-workspace", owner=owner)
         existing_project = Project.objects.create(name="Existing project", identifier="EXIST", workspace=workspace)
 
-        new_apps = migrate_to(migration_executor, MIGRATE_TO)
+        new_apps = migrate_to(MIGRATE_TO)
         Project = new_apps.get_model("db", "Project")
 
         migrated_project = Project.objects.get(pk=existing_project.pk)

@@ -35,6 +35,18 @@ def migration_executor(request, transactional_db, django_db_blocker):
 
 
 @pytest.fixture
+def migrate_to(migration_executor):
+    """Migrate the test database to a target and return its historical app registry."""
+
+    def migrate(target):
+        migration_executor.loader.build_graph()
+        migration_executor.migrate([target])
+        return migration_executor.loader.project_state([target]).apps
+
+    return migrate
+
+
+@pytest.fixture
 def api_client():
     """Return an unauthenticated API client"""
     return APIClient()
