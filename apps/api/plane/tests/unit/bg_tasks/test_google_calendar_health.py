@@ -15,6 +15,7 @@ from django.utils import timezone
 from plane.bgtasks.google_calendar_task import (
     _deliver_google_calendar_disconnected_email,
     _mark_authorization_failure,
+    reconcile_google_calendar_connection,
     schedule_google_calendar_reconciliations,
     send_google_calendar_disconnected_email,
 )
@@ -99,6 +100,57 @@ class TestGoogleCalendarAuthorizationClassification:
         post.assert_called_once()
         assert request.call_count == 2
 
+    def test_invalid_refresh_grant_stops_calendar_creation_recovery(self):
+        invalid_grant = Mock(status_code=400, headers={})
+        invalid_grant.json.return_value = {"error": "invalid_grant"}
+        client = _client(
+            access_token="expired-access-token",
+            refresh_token="invalid-refresh-token",
+            token_expires_at=timezone.now() - timedelta(minutes=1),
+        )
+
+        with (
+            patch("plane.integrations.google_calendar.client.requests.post", return_value=invalid_grant) as post,
+            patch("plane.integrations.google_calendar.client.requests.request") as request,
+            patch("plane.integrations.google_calendar.client.time.sleep") as sleep,
+            pytest.raises(GoogleCalendarInvalidGrant) as error,
+        ):
+            client.create_calendar("calendar-operation")
+
+        assert error.value.classification == "refresh_token_invalid"
+        post.assert_called_once()
+        request.assert_not_called()
+        sleep.assert_not_called()
+
+    def test_persistent_authorization_stops_calendar_creation_recovery(self):
+        forbidden = Mock(status_code=403, headers={})
+        forbidden.json.return_value = {
+            "error": {
+                "errors": [{"reason": "insufficientPermissions"}],
+            }
+        }
+        calendar_list = Mock(status_code=200, headers={})
+        calendar_list.json.return_value = {"items": []}
+        client = _client(
+            access_token="access-token",
+            token_expires_at=timezone.now() + timedelta(hours=1),
+            max_retries=1,
+        )
+
+        with (
+            patch(
+                "plane.integrations.google_calendar.client.requests.request",
+                side_effect=[forbidden, calendar_list, forbidden, calendar_list],
+            ) as request,
+            patch("plane.integrations.google_calendar.client.time.sleep") as sleep,
+            pytest.raises(GoogleCalendarAuthorizationError) as error,
+        ):
+            client.create_calendar("calendar-operation")
+
+        assert error.value.classification == "authorization_failed"
+        request.assert_called_once()
+        sleep.assert_not_called()
+
     def test_transient_provider_failure_keeps_retry_classification(self):
         unavailable = Mock(status_code=503, headers={})
         unavailable.raise_for_status.side_effect = requests.HTTPError("unavailable")
@@ -159,6 +211,33 @@ class TestGoogleCalendarBrokenNotice:
                 "action_url": "/acme/settings/integrations/google-calendar",
             }
         }
+        send_email.assert_called_once_with(str(connection.id), connection.broken_notified_at.isoformat())
+
+    def test_calendar_creation_authorization_failure_produces_broken_notices(self):
+        connection = GoogleCalendarConnectionFactory(
+            provider_account_id="google-account",
+            provider_email="member@example.com",
+            refresh_token="refresh-token",
+            desired_state=GoogleCalendarConnection.DesiredState.CONNECTED,
+            status=GoogleCalendarConnection.Status.PENDING,
+            lifecycle_generation=3,
+        )
+        client = Mock(access_token=None)
+        client.find_calendar.return_value = None
+        client.create_calendar.side_effect = GoogleCalendarAuthorizationError("authorization rejected")
+
+        with (
+            patch("plane.integrations.google_calendar.lifecycle._acquire_advisory_xact_lock"),
+            patch("plane.bgtasks.google_calendar_task.GoogleCalendarClient", return_value=client),
+            patch.object(send_google_calendar_disconnected_email, "delay") as send_email,
+        ):
+            result = reconcile_google_calendar_connection.run(str(connection.id), 3)
+
+        connection.refresh_from_db()
+        assert result == "error"
+        assert connection.status == GoogleCalendarConnection.Status.ERROR
+        assert connection.last_error == "authorization_failed"
+        assert Notification.objects.filter(receiver=connection.member).count() == 1
         send_email.assert_called_once_with(str(connection.id), connection.broken_notified_at.isoformat())
 
     def test_failed_email_remains_due_and_is_republished(self):

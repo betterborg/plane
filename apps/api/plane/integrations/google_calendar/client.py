@@ -351,6 +351,8 @@ class GoogleCalendarClient:
                     max_retries=0,
                     json=payload,
                 )
+            except (GoogleCalendarInvalidGrant, GoogleCalendarAuthorizationError):
+                raise
             except GoogleCalendarProviderError as exc:
                 if operation_id is not None:
                     # Recovery is another provider attempt, so it must observe
