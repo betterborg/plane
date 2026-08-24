@@ -12,6 +12,7 @@ from rest_framework import status
 from plane.bgtasks.google_calendar_task import synchronize_google_calendar_cycle
 from plane.db.models import CycleIssue, GoogleCalendarEvent
 from plane.db.signals import suppress_google_calendar_issue_signal_dispatch
+from plane.integrations.google_calendar.dispatch import GOOGLE_CALENDAR_CYCLE_SYNC_TASK
 from plane.tests.factories import (
     CycleFactory,
     CycleIssueFactory,
@@ -44,6 +45,18 @@ def _run_callbacks(callbacks):
     assert all(robust is True for _, robust in callbacks)
     for callback, _ in callbacks:
         callback()
+
+
+def _targeted_task(side_effect):
+    task = Mock(options={})
+
+    def set_options(**options):
+        task.options.update(options)
+        return task
+
+    task.set.side_effect = set_options
+    task.delay.side_effect = side_effect
+    return task
 
 
 @pytest.mark.contract
@@ -204,8 +217,18 @@ class TestGoogleCalendarCycleMembershipDispatch:
         provider_client.list_events.return_value = []
         callbacks = []
 
+        def converge_targeted_cycle(cycle_id, connection_id):
+            assert connection_id == str(connection.id)
+            return synchronize_google_calendar_cycle.run(cycle_id, connection_id)
+
+        targeted_cycle_task = _targeted_task(converge_targeted_cycle)
+
         with (
             patch("plane.bgtasks.google_calendar_task.GoogleCalendarClient", return_value=provider_client),
+            patch(
+                "plane.bgtasks.google_calendar_task.current_app.signature",
+                return_value=targeted_cycle_task,
+            ) as signature,
             patch(
                 "plane.integrations.google_calendar.dispatch.transaction.on_commit",
                 side_effect=_capture_on_commit(callbacks),
@@ -213,8 +236,7 @@ class TestGoogleCalendarCycleMembershipDispatch:
             patch.object(
                 synchronize_google_calendar_cycle,
                 "delay",
-                side_effect=synchronize_google_calendar_cycle.run,
-            ),
+            ) as fallback_cycle_dispatch,
             patch("plane.app.views.cycle.issue.issue_activity.delay"),
             patch("plane.api.views.cycle.issue_activity.delay"),
         ):
@@ -231,3 +253,7 @@ class TestGoogleCalendarCycleMembershipDispatch:
 
         assert not GoogleCalendarEvent.objects.filter(entity_id=cycle.id).exists()
         provider_client.delete_event.assert_called_once()
+        signature.assert_called_once_with(GOOGLE_CALENDAR_CYCLE_SYNC_TASK)
+        targeted_cycle_task.set.assert_called_once_with(countdown=0)
+        targeted_cycle_task.delay.assert_called_once_with(str(cycle.id), str(connection.id))
+        fallback_cycle_dispatch.assert_not_called()

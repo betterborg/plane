@@ -270,6 +270,57 @@ class TestGoogleCalendarReconciliationTask:
         client.list_event_page.assert_not_called()
         publish.assert_not_called()
 
+    def test_prior_lifecycle_lease_cannot_block_forced_reconnect_scan(self):
+        stale_run_id = str(uuid4())
+        connection = GoogleCalendarConnectionFactory(
+            active=True,
+            lifecycle_generation=2,
+            sync_token="current-sync-token",
+            reconciliation_phase="provider_inventory",
+            reconciliation_cursor=json.dumps(
+                {
+                    "run_id": stale_run_id,
+                    "lease_token": str(uuid4()),
+                    "calendar_generation": 1,
+                    "lifecycle_generation": 1,
+                    "after_id": "",
+                    "force_local_scan": False,
+                    "full_inventory": False,
+                    "saw_delta": False,
+                }
+            ),
+            reconciliation_lease_expires_at=timezone.now() + timedelta(minutes=5),
+        )
+        correlation = GoogleCalendarEventFactory(connection=connection)
+        client = _provider_client(GoogleCalendarEventPage((), None, "next-token"))
+
+        with (
+            patch("plane.bgtasks.google_calendar_task.GoogleCalendarClient", return_value=client),
+            patch("plane.bgtasks.google_calendar_task.publish_google_calendar_task") as publish,
+        ):
+            assert (
+                reconcile_google_calendar_inventory.run(
+                    str(connection.id),
+                    force_local_scan=True,
+                )
+                == "continued"
+            )
+
+        connection.refresh_from_db()
+        current_state = json.loads(connection.reconciliation_cursor)
+        assert current_state["run_id"] != stale_run_id
+        assert current_state["lifecycle_generation"] == connection.lifecycle_generation
+        assert current_state["force_local_scan"] is True
+        assert connection.reconciliation_phase == "local_scan"
+        client.list_event_page.assert_called_once_with(
+            connection.calendar_id,
+            page_token=None,
+            sync_token="current-sync-token",
+        )
+        assert publish.call_args.args[0].task == GOOGLE_CALENDAR_INVENTORY_TASK
+        assert reconcile_google_calendar_inventory.run(str(connection.id), stale_run_id) == "stale"
+        assert GoogleCalendarEvent.objects.filter(id=correlation.id).exists()
+
     def test_expired_lease_holder_cannot_advance_or_release_takeover_lease(self):
         connection = GoogleCalendarConnectionFactory(active=True, sync_token="current-sync-token")
         page = GoogleCalendarEventPage((), None, "stale-worker-sync-token")

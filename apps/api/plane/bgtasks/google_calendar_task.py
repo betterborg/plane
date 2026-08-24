@@ -1182,18 +1182,18 @@ def _start_or_resume_inventory(connection_id, run_id, force_local_scan):
         _claim_reconciliation_lease(connection, state)
         return connection
 
+    state_owns_current_generation = state is not None and (
+        state.get("calendar_generation") == connection.calendar_generation
+        and state.get("lifecycle_generation") == connection.lifecycle_generation
+    )
     if (
         connection.reconciliation_phase
         and connection.reconciliation_lease_expires_at
         and connection.reconciliation_lease_expires_at > timezone.now()
+        and (state is None or state_owns_current_generation)
     ):
         return "leased"
-    if (
-        connection.reconciliation_phase
-        and state is not None
-        and state.get("calendar_generation") == connection.calendar_generation
-        and state.get("lifecycle_generation") == connection.lifecycle_generation
-    ):
+    if connection.reconciliation_phase and state_owns_current_generation:
         _claim_reconciliation_lease(connection, state)
         return connection
 
