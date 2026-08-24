@@ -85,3 +85,23 @@ class TestGoogleCalendarEvent:
         assert GoogleCalendarEvent.objects.filter(pk__in=(first_event.pk, second_event.pk)).count() == 2
         assert first_event.payload_hash == "e" * 64
         assert first_event.last_synced_at == last_synced_at
+
+    def test_reconciliation_observation_fields_persist(self):
+        calendar_connection = GoogleCalendarConnectionFactory(calendar_generation=7)
+        event = GoogleCalendarEvent.objects.create(
+            connection=calendar_connection,
+            entity_type=GoogleCalendarEvent.EntityType.WORK_ITEM,
+            entity_id=uuid4(),
+            google_event_id="observed-provider-event",
+            payload_hash="f" * 64,
+            calendar_generation=calendar_connection.calendar_generation,
+            provider_etag='"provider-etag"',
+            provider_payload_hash="1" * 64,
+            provider_status="confirmed",
+        )
+
+        event.refresh_from_db()
+        assert event.calendar_generation == 7
+        assert event.provider_etag == '"provider-etag"'
+        assert event.provider_payload_hash == "1" * 64
+        assert event.provider_status == "confirmed"

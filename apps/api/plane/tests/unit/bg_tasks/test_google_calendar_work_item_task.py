@@ -80,6 +80,7 @@ class TestGoogleCalendarWorkItemTask:
         self.connection = GoogleCalendarConnectionFactory(
             workspace_integration=self.workspace_integration,
             active=True,
+            calendar_generation=5,
         )
         IssueAssigneeFactory(issue=self.issue, assignee=self.connection.member, project=self.issue.project)
 
@@ -107,6 +108,10 @@ class TestGoogleCalendarWorkItemTask:
         assert "ineligible" in first_result
         assert second_result.count("unchanged") == 2
         assert GoogleCalendarEvent.objects.filter(entity_id=self.issue.id).count() == 2
+        assert (
+            GoogleCalendarEvent.objects.get(connection=self.connection, entity_id=self.issue.id).calendar_generation
+            == 5
+        )
         assert client.insert_event.call_count == 2
 
     def test_insert_conflict_recovers_the_deterministic_event_without_a_duplicate(self):
