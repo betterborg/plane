@@ -22,7 +22,7 @@ from plane.bgtasks.google_calendar_task import (
     schedule_google_calendar_reconciliations,
     synchronize_google_calendar_issue,
 )
-from plane.db.models import GoogleCalendarConnection, GoogleCalendarEvent
+from plane.db.models import GoogleCalendarConnection, GoogleCalendarEvent, WorkspaceIntegration
 from plane.integrations.google_calendar.client import GoogleCalendarEventPage, GoogleCalendarSyncTokenExpired
 from plane.integrations.google_calendar.dispatch import (
     GOOGLE_CALENDAR_INVENTORY_TASK,
@@ -486,7 +486,122 @@ class TestScheduleGoogleCalendarReconciliations:
         assert [candidate[0] for page in pages for candidate in page] == [attempt.id for attempt in attempts]
 
     @freeze_time("2026-08-24 12:00:00")
-    def test_hourly_entry_composes_healthy_present_and_attempt_expiry_once(self):
+    def test_recovers_exact_cleanup_generations_for_soft_deleted_descendants_and_retries_publication(self):
+        absent_integration = _enabled_calendar_integration()
+        absent = GoogleCalendarConnectionFactory(
+            id=UUID(int=1),
+            workspace_integration=absent_integration,
+            pending_cleanup=True,
+            calendar_id="absent-calendar",
+            lifecycle_generation=7,
+            retain_grant_after_cleanup=True,
+        )
+        disconnect_integration = _enabled_calendar_integration()
+        disconnect = GoogleCalendarConnectionFactory(
+            id=UUID(int=2),
+            workspace_integration=disconnect_integration,
+            pending_cleanup=True,
+            calendar_id="disconnect-calendar",
+            lifecycle_generation=11,
+            retain_grant_after_cleanup=False,
+        )
+        deleted_at = timezone.now()
+        GoogleCalendarConnection.all_objects.filter(id__in=[absent.id, disconnect.id]).update(deleted_at=deleted_at)
+        for workspace_integration in (absent_integration, disconnect_integration):
+            WorkspaceIntegration.all_objects.filter(id=workspace_integration.id).update(deleted_at=deleted_at)
+
+        def fail_first_publication(task, connection_id, generation):
+            if connection_id == str(absent.id):
+                raise RuntimeError("broker unavailable")
+
+        with (
+            patch("plane.integrations.google_calendar.lifecycle._acquire_advisory_xact_lock"),
+            patch(
+                "plane.bgtasks.google_calendar_task.publish_google_calendar_task",
+                side_effect=fail_first_publication,
+            ) as first_publish,
+        ):
+            assert schedule_google_calendar_reconciliations.run() == 1
+
+        assert [(call.args[1], call.args[2]) for call in first_publish.call_args_list] == [
+            (str(absent.id), 7),
+            (str(disconnect.id), 11),
+        ]
+
+        with (
+            patch("plane.integrations.google_calendar.lifecycle._acquire_advisory_xact_lock"),
+            patch("plane.bgtasks.google_calendar_task.publish_google_calendar_task") as retry_publish,
+        ):
+            assert schedule_google_calendar_reconciliations.run() == 2
+
+        assert [(call.args[1], call.args[2]) for call in retry_publish.call_args_list] == [
+            (str(absent.id), 7),
+            (str(disconnect.id), 11),
+        ]
+        assert all(call.args[0].task == GOOGLE_CALENDAR_LIFECYCLE_TASK for call in retry_publish.call_args_list)
+
+        absent_client = Mock(access_token=None)
+        with (
+            patch("plane.integrations.google_calendar.lifecycle._acquire_advisory_xact_lock"),
+            patch("plane.bgtasks.google_calendar_task.GoogleCalendarClient", return_value=absent_client),
+        ):
+            assert reconcile_google_calendar_connection.run(str(absent.id), 7) == "disabled"
+
+        disconnect_client = Mock(access_token=None)
+        with (
+            patch("plane.integrations.google_calendar.lifecycle._acquire_advisory_xact_lock"),
+            patch("plane.bgtasks.google_calendar_task.GoogleCalendarClient", return_value=disconnect_client),
+        ):
+            assert reconcile_google_calendar_connection.run(str(disconnect.id), 11) == "disconnected"
+
+        recovered_absent = GoogleCalendarConnection.all_objects.get(id=absent.id)
+        recovered_disconnect = GoogleCalendarConnection.all_objects.get(id=disconnect.id)
+        assert recovered_absent.status == GoogleCalendarConnection.Status.DISCONNECTED
+        assert recovered_absent.refresh_token
+        assert recovered_disconnect.status == GoogleCalendarConnection.Status.DISCONNECTED
+        assert recovered_disconnect.refresh_token == ""
+        absent_client.delete_calendar.assert_called_once_with("absent-calendar")
+        absent_client.revoke_grant.assert_not_called()
+        disconnect_client.delete_calendar.assert_called_once_with("disconnect-calendar")
+        disconnect_client.revoke_grant.assert_called_once_with()
+
+    @freeze_time("2026-08-24 12:00:00")
+    def test_cleanup_recovery_excludes_terminal_attempt_and_soft_deleted_present_state(self):
+        terminal_tombstone = GoogleCalendarConnectionFactory(tombstone=True)
+        tokenless_attempt = GoogleCalendarConnectionFactory(attempt_only=True)
+        absent_without_calendar = GoogleCalendarConnectionFactory(
+            pending_cleanup=True,
+            calendar_id="",
+            retain_grant_after_cleanup=True,
+        )
+        soft_deleted_present = GoogleCalendarConnectionFactory(
+            workspace_integration=_enabled_calendar_integration(),
+            provider_account_id="present-account",
+            refresh_token="present-refresh-token",
+            desired_state=GoogleCalendarConnection.DesiredState.CONNECTED,
+            status=GoogleCalendarConnection.Status.PENDING,
+            lifecycle_generation=5,
+        )
+        WorkspaceMemberFactory(
+            workspace=soft_deleted_present.workspace_integration.workspace,
+            member=soft_deleted_present.member,
+        )
+        GoogleCalendarConnection.all_objects.filter(id=soft_deleted_present.id).update(deleted_at=timezone.now())
+
+        with (
+            patch("plane.integrations.google_calendar.lifecycle._acquire_advisory_xact_lock"),
+            patch("plane.bgtasks.google_calendar_task.publish_google_calendar_task") as publish,
+        ):
+            assert schedule_google_calendar_reconciliations.run() == 0
+
+        publish.assert_not_called()
+        for connection in (terminal_tombstone, tokenless_attempt, absent_without_calendar, soft_deleted_present):
+            persisted = GoogleCalendarConnection.all_objects.get(id=connection.id)
+            assert persisted.lifecycle_generation == connection.lifecycle_generation
+        assert tokenless_attempt.oauth_state
+
+    @freeze_time("2026-08-24 12:00:00")
+    def test_hourly_entry_composes_healthy_present_attempt_expiry_and_cleanup_once(self):
         at = timezone.now()
         workspace_integration = _enabled_calendar_integration()
         healthy = GoogleCalendarConnectionFactory(
@@ -511,18 +626,25 @@ class TestScheduleGoogleCalendarReconciliations:
             attempt_only=True,
             oauth_attempt_expires_at=at,
         )
+        cleanup = GoogleCalendarConnectionFactory(
+            workspace_integration=workspace_integration,
+            pending_cleanup=True,
+            lifecycle_generation=9,
+            retain_grant_after_cleanup=False,
+        )
 
         with (
             patch("plane.integrations.google_calendar.lifecycle._acquire_advisory_xact_lock"),
             patch("plane.bgtasks.google_calendar_task.publish_google_calendar_task") as publish,
             patch("plane.bgtasks.google_calendar_task.GoogleCalendarClient") as client_class,
         ):
-            assert schedule_google_calendar_reconciliations.run() == 2
+            assert schedule_google_calendar_reconciliations.run() == 3
 
         published = [(call.args[0].task, call.args[1:]) for call in publish.call_args_list]
         assert published == [
             (GOOGLE_CALENDAR_INVENTORY_TASK, (str(healthy.id),)),
             (GOOGLE_CALENDAR_LIFECYCLE_TASK, (str(present.id), 7)),
+            (GOOGLE_CALENDAR_LIFECYCLE_TASK, (str(cleanup.id), 9)),
         ]
         expired_attempt.refresh_from_db()
         assert expired_attempt.oauth_state == ""
