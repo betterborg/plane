@@ -83,7 +83,7 @@ class SoftDeleteModel(models.Model):
                     using=using,
                 )
 
-            transaction.on_commit(_publish_soft_delete_related_objects, robust=True)
+            transaction.on_commit(_publish_soft_delete_related_objects, using=using, robust=True)
 
         else:
             # Perform hard delete if soft deletion is not enabled
