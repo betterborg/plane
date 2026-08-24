@@ -15,6 +15,8 @@ from plane.bgtasks.google_calendar_task import (
 )
 from plane.db.models import Cycle, GoogleCalendarEvent, IssueAssignee
 from plane.db.signals import suppress_google_calendar_issue_signal_dispatch
+from plane.integrations.google_calendar.dispatch import GOOGLE_CALENDAR_CYCLE_SYNC_TASK
+from plane.tests.contract.app.google_calendar_helpers import targeted_task
 from plane.tests.factories import (
     CycleFactory,
     CycleIssueFactory,
@@ -61,7 +63,8 @@ class TestGoogleCalendarCycleDispatch:
         def capture_on_commit(callback, robust=False):
             callbacks.append((callback, robust))
 
-        def synchronize_persisted_cycle(cycle_id):
+        def synchronize_persisted_cycle(cycle_id, connection_id):
+            assert connection_id == str(connection.id)
             saved_cycle = Cycle.all_objects.get(id=cycle_id)
             observed_states.append(
                 {
@@ -73,7 +76,7 @@ class TestGoogleCalendarCycleDispatch:
                     "deleted_at": saved_cycle.deleted_at,
                 }
             )
-            return synchronize_google_calendar_cycle.run(cycle_id)
+            return synchronize_google_calendar_cycle.run(cycle_id, connection_id)
 
         def save_and_converge(update_fields):
             cycle.save(update_fields=[*update_fields, "updated_at"])
@@ -89,8 +92,14 @@ class TestGoogleCalendarCycleDispatch:
                 <= 1
             )
 
+        targeted_cycle_task = targeted_task(synchronize_persisted_cycle)
+
         with (
             patch("plane.bgtasks.google_calendar_task.GoogleCalendarClient", return_value=client),
+            patch(
+                "plane.bgtasks.google_calendar_task.current_app.signature",
+                return_value=targeted_cycle_task,
+            ) as signature,
             patch(
                 "plane.integrations.google_calendar.dispatch.transaction.on_commit",
                 side_effect=capture_on_commit,
@@ -98,8 +107,7 @@ class TestGoogleCalendarCycleDispatch:
             patch.object(
                 synchronize_google_calendar_cycle,
                 "delay",
-                side_effect=synchronize_persisted_cycle,
-            ),
+            ) as fallback_cycle_dispatch,
             patch("plane.db.mixins.soft_delete_related_objects.delay"),
         ):
             assert synchronize_google_calendar_cycle.run(str(cycle.id)) == ["created"]
@@ -145,6 +153,15 @@ class TestGoogleCalendarCycleDispatch:
         assert client.insert_event.call_count == 3
         assert client.update_event.call_count == 2
         assert client.delete_event.call_count == 2
+        assert [invocation.args for invocation in signature.call_args_list] == [(GOOGLE_CALENDAR_CYCLE_SYNC_TASK,)] * 7
+        assert [invocation.kwargs for invocation in targeted_cycle_task.set.call_args_list] == [
+            {"countdown": 0},
+            {"countdown": 0},
+        ] * 7
+        assert [invocation.args for invocation in targeted_cycle_task.delay.call_args_list] == [
+            (str(cycle.id), str(connection.id))
+        ] * 7
+        fallback_cycle_dispatch.assert_not_called()
 
     def test_assignee_replacement_dispatches_current_cycle_after_final_relations(self, workspace, create_user):
         project = ProjectFactory(workspace=workspace)

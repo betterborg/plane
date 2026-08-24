@@ -32,7 +32,7 @@ from plane.db.models import (
     IssueReaction,
     CycleIssue,
 )
-from plane.db.signals import dispatch_google_calendar_issue_sync
+from plane.db.signals import dispatch_google_calendar_issue_syncs
 from plane.utils.grouper import (
     issue_group_values,
     issue_on_results,
@@ -342,7 +342,6 @@ class BulkArchiveIssuesEndpoint(BaseAPIView):
         affected_issue_ids = [issue.id for issue in bulk_archive_issues]
         Issue.objects.bulk_update(bulk_archive_issues, ["archived_at"])
 
-        for issue_id in affected_issue_ids:
-            dispatch_google_calendar_issue_sync(issue_id)
+        dispatch_google_calendar_issue_syncs(affected_issue_ids)
 
         return Response({"archived_at": str(timezone.now().date())}, status=status.HTTP_200_OK)

@@ -38,9 +38,10 @@ class TestGoogleCalendarStateDispatch:
         def capture_on_commit(callback, robust=False):
             callbacks.append((callback, robust))
 
-        def inspect_saved_state(issue_id):
-            saved_issue = Issue.all_objects.select_related("state").get(id=issue_id)
-            observed.append((saved_issue.id, saved_issue.state.name, saved_issue.state.group))
+        def inspect_saved_states(issue_ids):
+            for issue_id in issue_ids:
+                saved_issue = Issue.all_objects.select_related("state").get(id=issue_id)
+                observed.append((saved_issue.id, saved_issue.state.name, saved_issue.state.group))
 
         with (
             patch(
@@ -52,7 +53,7 @@ class TestGoogleCalendarStateDispatch:
                 "delay",
                 side_effect=lambda *args, **kwargs: resync_google_calendar_state_issues.run(*args, **kwargs),
             ),
-            patch("plane.db.signals.dispatch_google_calendar_issue_sync", side_effect=inspect_saved_state),
+            patch("plane.db.signals.dispatch_google_calendar_issue_syncs", side_effect=inspect_saved_states),
         ):
             response = client.patch(
                 url,

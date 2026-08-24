@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # See the LICENSE file for details.
 
+import json
+from datetime import timedelta
 from uuid import UUID, uuid4
 
 from celery import current_app, shared_task
@@ -21,15 +23,19 @@ from plane.db.models import (
 )
 from plane.db.models.state import StateGroup
 from plane.integrations.google_calendar.client import (
+    GoogleCalendarCalendarAbsent,
     GoogleCalendarClient,
     GoogleCalendarClientConflict,
     GoogleCalendarClientError,
     GoogleCalendarCredentialMismatch,
+    GoogleCalendarEventAbsent,
+    GoogleCalendarSyncTokenExpired,
 )
 from plane.integrations.google_calendar.dispatch import (
     GOOGLE_CALENDAR_CYCLE_BACKFILL_TASK,
     GOOGLE_CALENDAR_CYCLE_SYNC_TASK,
     GOOGLE_CALENDAR_ISSUE_SYNC_TASK,
+    GOOGLE_CALENDAR_INVENTORY_TASK,
     GOOGLE_CALENDAR_LABEL_ISSUE_RESYNC_TASK,
     GOOGLE_CALENDAR_LIFECYCLE_TASK,
     GOOGLE_CALENDAR_OPEN_BACKFILL_TASK,
@@ -57,6 +63,7 @@ from plane.integrations.google_calendar.events import (
     build_google_calendar_work_item_event,
     google_calendar_event_id,
     google_calendar_payload_hash,
+    google_calendar_provider_payload_hash,
 )
 from plane.integrations.google_calendar.lifecycle import (
     complete_google_calendar_disconnect,
@@ -67,6 +74,13 @@ from plane.integrations.google_calendar.lifecycle import (
     record_google_calendar_cleanup_error,
 )
 from plane.integrations.google_calendar.oauth import GoogleCalendarOAuthConfigurationError
+
+
+GOOGLE_CALENDAR_RECONCILIATION_LEASE = timedelta(minutes=5)
+GOOGLE_CALENDAR_RECONCILIATION_PROVIDER_PAGE_LIMIT = 5
+GOOGLE_CALENDAR_RECONCILIATION_LOCAL_PAGE_SIZE = 1000
+GOOGLE_CALENDAR_RECONCILIATION_PROVIDER_PHASE = "provider_inventory"
+GOOGLE_CALENDAR_RECONCILIATION_LOCAL_PHASE = "local_scan"
 
 
 def _owns_generation(connection, generation, *, desired_state, status):
@@ -128,10 +142,19 @@ def _cycle_queryset():
     return Cycle.all_objects.select_related("workspace", "project")
 
 
-def _client_event_id_from_recovery(client, connection, entity_id, deterministic_event_id):
-    existing_event = client.get_event(connection.calendar_id, deterministic_event_id)
-    if existing_event is not None:
-        return deterministic_event_id
+def _client_event_id_from_recovery(
+    client,
+    connection,
+    entity_type,
+    entity_id,
+    provider_event_id,
+    *,
+    provider_id_owned,
+):
+    expected_marker = (entity_type, UUID(str(entity_id)))
+    existing_event = client.get_event(connection.calendar_id, provider_event_id)
+    if existing_event is not None and (provider_id_owned or _provider_marker(existing_event) == expected_marker):
+        return provider_event_id
 
     marker = f"plane_entity_id={entity_id}"
     recovered_events = client.list_events(
@@ -139,6 +162,8 @@ def _client_event_id_from_recovery(client, connection, entity_id, deterministic_
         private_extended_property=marker,
     )
     for event in recovered_events:
+        if _provider_marker(event) != expected_marker:
+            continue
         recovered_id = event.get("id")
         if isinstance(recovered_id, str) and recovered_id:
             return recovered_id
@@ -146,7 +171,7 @@ def _client_event_id_from_recovery(client, connection, entity_id, deterministic_
 
 
 def _delete_provider_event(connection, correlation):
-    if connection.calendar_id:
+    if connection.calendar_id and correlation.calendar_generation == connection.calendar_generation:
         client = _client_for(connection)
         try:
             client.delete_event(connection.calendar_id, correlation.google_event_id)
@@ -163,7 +188,13 @@ def _delete_provider_event(connection, correlation):
 
 def _converge_provider_event(connection, entity_type, entity_id, payload, correlation):
     payload_hash = google_calendar_payload_hash(payload)
-    if correlation is not None and correlation.payload_hash == payload_hash:
+    if (
+        correlation is not None
+        and correlation.calendar_generation == connection.calendar_generation
+        and correlation.payload_hash == payload_hash
+        and correlation.provider_payload_hash == payload_hash
+        and correlation.provider_status == "confirmed"
+    ):
         return "unchanged"
 
     client = _client_for(connection)
@@ -177,12 +208,44 @@ def _converge_provider_event(connection, entity_type, entity_id, payload, correl
             payload_hash,
             correlation,
         )
+    except GoogleCalendarEventAbsent:
+        return _request_event_calendar_replacement(connection)
     except GoogleCalendarCredentialMismatch:
         _mark_credential_mismatch(connection)
         return "credential_mismatch"
     except GoogleCalendarClientError as exc:
         _persist_refreshed_access_token(connection, client)
         return _GoogleCalendarProviderRetry(exc)
+
+
+def _request_event_calendar_replacement(connection):
+    """Move an active connection back through lifecycle validation after collection absence."""
+
+    if (
+        connection.desired_state != GoogleCalendarConnection.DesiredState.CONNECTED
+        or connection.status != GoogleCalendarConnection.Status.ACTIVE
+    ):
+        return "stale"
+    connection.status = GoogleCalendarConnection.Status.PENDING
+    connection.reconciliation_phase = ""
+    connection.reconciliation_cursor = ""
+    connection.reconciliation_lease_expires_at = None
+    connection.save(
+        update_fields=[
+            "status",
+            "reconciliation_phase",
+            "reconciliation_cursor",
+            "reconciliation_lease_expires_at",
+            "updated_at",
+        ]
+    )
+    lifecycle_task = current_app.signature(GOOGLE_CALENDAR_LIFECYCLE_TASK)
+    enqueue_google_calendar_task_on_commit(
+        lifecycle_task,
+        str(connection.id),
+        connection.lifecycle_generation,
+    )
+    return "replacement_pending"
 
 
 def _converge_provider_event_with_client(
@@ -195,55 +258,190 @@ def _converge_provider_event_with_client(
     correlation,
 ):
     deterministic_event_id = google_calendar_event_id(connection.id, entity_type, entity_id)
-    if correlation is None:
+    current_generation_correlation = (
+        correlation is not None and correlation.calendar_generation == connection.calendar_generation
+    )
+    if not current_generation_correlation:
         provider_event_id = deterministic_event_id
         try:
-            client.insert_event(connection.calendar_id, provider_event_id, payload)
+            provider_event = client.insert_event(connection.calendar_id, provider_event_id, payload)
         except GoogleCalendarClientConflict:
             provider_event_id = _client_event_id_from_recovery(
                 client,
                 connection,
+                entity_type,
                 entity_id,
                 deterministic_event_id,
+                provider_id_owned=False,
             )
             if provider_event_id is None:
-                client.insert_event(connection.calendar_id, deterministic_event_id, payload)
+                provider_event = client.insert_event(connection.calendar_id, deterministic_event_id, payload)
                 provider_event_id = deterministic_event_id
             else:
-                client.update_event(connection.calendar_id, provider_event_id, payload)
-        GoogleCalendarEvent.objects.create(
-            connection=connection,
-            entity_type=entity_type,
-            entity_id=entity_id,
-            google_event_id=provider_event_id,
-            payload_hash=payload_hash,
-            calendar_generation=connection.calendar_generation,
-            last_synced_at=timezone.now(),
-        )
+                provider_event = _update_or_recreate_provider_event(
+                    client,
+                    connection,
+                    deterministic_event_id,
+                    provider_event_id,
+                    payload,
+                    entity_type,
+                    entity_id,
+                )
+                provider_event_id = _provider_event_id(provider_event, provider_event_id)
+        observation = _provider_observation(provider_event, payload_hash)
+        if correlation is None:
+            GoogleCalendarEvent.objects.create(
+                connection=connection,
+                entity_type=entity_type,
+                entity_id=entity_id,
+                google_event_id=provider_event_id,
+                payload_hash=payload_hash,
+                calendar_generation=connection.calendar_generation,
+                last_synced_at=timezone.now(),
+                **observation,
+            )
+        else:
+            correlation.google_event_id = provider_event_id
+            correlation.payload_hash = payload_hash
+            correlation.calendar_generation = connection.calendar_generation
+            correlation.last_synced_at = timezone.now()
+            for field, value in observation.items():
+                setattr(correlation, field, value)
+            correlation.save(
+                update_fields=[
+                    "google_event_id",
+                    "payload_hash",
+                    "calendar_generation",
+                    "provider_etag",
+                    "provider_payload_hash",
+                    "provider_status",
+                    "last_synced_at",
+                    "updated_at",
+                ]
+            )
         _persist_refreshed_access_token(connection, client)
         return "created"
 
     provider_event_id = _client_event_id_from_recovery(
         client,
         connection,
+        entity_type,
         entity_id,
         correlation.google_event_id,
+        provider_id_owned=True,
     )
     if provider_event_id is None:
         try:
-            client.insert_event(connection.calendar_id, deterministic_event_id, payload)
+            provider_event = client.insert_event(connection.calendar_id, deterministic_event_id, payload)
             provider_event_id = deterministic_event_id
         except GoogleCalendarClientConflict:
-            provider_event_id = deterministic_event_id
-            client.update_event(connection.calendar_id, provider_event_id, payload)
+            provider_event_id = _client_event_id_from_recovery(
+                client,
+                connection,
+                entity_type,
+                entity_id,
+                deterministic_event_id,
+                provider_id_owned=False,
+            )
+            if provider_event_id is None:
+                provider_event = client.insert_event(connection.calendar_id, deterministic_event_id, payload)
+                provider_event_id = deterministic_event_id
+            else:
+                provider_event = _update_or_recreate_provider_event(
+                    client,
+                    connection,
+                    deterministic_event_id,
+                    provider_event_id,
+                    payload,
+                    entity_type,
+                    entity_id,
+                )
     else:
-        client.update_event(connection.calendar_id, provider_event_id, payload)
+        provider_event = _update_or_recreate_provider_event(
+            client,
+            connection,
+            deterministic_event_id,
+            provider_event_id,
+            payload,
+            entity_type,
+            entity_id,
+        )
+        provider_event_id = _provider_event_id(provider_event, provider_event_id)
+    observation = _provider_observation(provider_event, payload_hash)
     correlation.google_event_id = provider_event_id
     correlation.payload_hash = payload_hash
     correlation.last_synced_at = timezone.now()
-    correlation.save(update_fields=["google_event_id", "payload_hash", "last_synced_at", "updated_at"])
+    for field, value in observation.items():
+        setattr(correlation, field, value)
+    correlation.save(
+        update_fields=[
+            "google_event_id",
+            "payload_hash",
+            "provider_etag",
+            "provider_payload_hash",
+            "provider_status",
+            "last_synced_at",
+            "updated_at",
+        ]
+    )
     _persist_refreshed_access_token(connection, client)
     return "updated"
+
+
+def _provider_event_id(provider_event, fallback):
+    if isinstance(provider_event, dict):
+        event_id = provider_event.get("id")
+        if isinstance(event_id, str) and event_id:
+            return event_id
+    return fallback
+
+
+def _provider_observation(provider_event, payload_hash):
+    etag = provider_event.get("etag", "") if isinstance(provider_event, dict) else ""
+    status = provider_event.get("status", "confirmed") if isinstance(provider_event, dict) else "confirmed"
+    observed_payload_hash = payload_hash
+    if isinstance(provider_event, dict) and any(
+        key in provider_event
+        for key in ("summary", "description", "start", "end", "reminders", "extendedProperties", "colorId")
+    ):
+        observed_payload_hash = google_calendar_provider_payload_hash(provider_event)
+    return {
+        "provider_etag": etag if isinstance(etag, str) else "",
+        "provider_payload_hash": observed_payload_hash,
+        "provider_status": status if isinstance(status, str) else "confirmed",
+    }
+
+
+def _update_or_recreate_provider_event(
+    client,
+    connection,
+    deterministic_event_id,
+    provider_event_id,
+    payload,
+    entity_type,
+    entity_id,
+):
+    calendar_id = connection.calendar_id
+    try:
+        return client.update_event(calendar_id, provider_event_id, payload)
+    except (GoogleCalendarClientConflict, GoogleCalendarEventAbsent):
+        existing = client.get_event(calendar_id, provider_event_id)
+        if existing is not None:
+            return client.update_event(calendar_id, provider_event_id, payload)
+        try:
+            return client.insert_event(calendar_id, deterministic_event_id, payload)
+        except GoogleCalendarClientConflict:
+            recovered_event_id = _client_event_id_from_recovery(
+                client,
+                connection,
+                entity_type,
+                entity_id,
+                deterministic_event_id,
+                provider_id_owned=False,
+            )
+            if recovered_event_id is None:
+                return client.insert_event(calendar_id, deterministic_event_id, payload)
+            return client.update_event(calendar_id, recovered_event_id, payload)
 
 
 @transaction.atomic
@@ -320,12 +518,7 @@ def _connection_ids_for_issue(issue, connection_id=None):
     return sorted(set(eligible_connection_ids) | set(correlated_connection_ids), key=str)
 
 
-@shared_task(
-    autoretry_for=(GoogleCalendarClientError, GoogleCalendarOAuthConfigurationError),
-    retry_backoff=True,
-    retry_kwargs={"max_retries": 5},
-    rate_limit="120/m",
-)
+@shared_task
 def synchronize_google_calendar_issue(issue_id, connection_id=None):
     """Converge one work item for all relevant assignee connections."""
 
@@ -438,12 +631,65 @@ def _connection_ids_for_cycle(cycle, connection_id=None):
     return sorted(set(recipient_connection_ids) | set(correlated_connection_ids), key=str)
 
 
-@shared_task(
-    autoretry_for=(GoogleCalendarClientError, GoogleCalendarOAuthConfigurationError),
-    retry_backoff=True,
-    retry_kwargs={"max_retries": 5},
-    rate_limit="120/m",
-)
+def _connection_ids_for_issue_id(issue_id):
+    try:
+        issue = _issue_queryset().get(id=issue_id)
+    except Issue.DoesNotExist:
+        return list(
+            GoogleCalendarEvent.objects.filter(
+                entity_type=GoogleCalendarEvent.EntityType.WORK_ITEM,
+                entity_id=issue_id,
+            ).values_list("connection_id", flat=True)
+        )
+    return _connection_ids_for_issue(issue)
+
+
+def _connection_ids_for_cycle_id(cycle_id):
+    try:
+        cycle = _cycle_queryset().get(id=cycle_id)
+    except Cycle.DoesNotExist:
+        return list(
+            GoogleCalendarEvent.objects.filter(
+                entity_type=GoogleCalendarEvent.EntityType.CYCLE,
+                entity_id=cycle_id,
+            ).values_list("connection_id", flat=True)
+        )
+    return _connection_ids_for_cycle(cycle)
+
+
+def _paced_google_calendar_sync_tasks(entity_ids, task_name, connection_ids_for_entity):
+    """Build targeted tasks whose countdown advances independently for each connection."""
+
+    next_countdown_by_connection = {}
+    for entity_id in dict.fromkeys(entity_ids):
+        for connection_id in connection_ids_for_entity(entity_id):
+            countdown = next_countdown_by_connection.get(connection_id, 0)
+            task = current_app.signature(task_name).set(countdown=countdown)
+            yield task, str(entity_id), str(connection_id)
+            next_countdown_by_connection[connection_id] = countdown + 1
+
+
+def paced_google_calendar_issue_sync_tasks(issue_ids):
+    """Build a bounded issue fan-out with one independent sequence per connection."""
+
+    return _paced_google_calendar_sync_tasks(
+        issue_ids,
+        GOOGLE_CALENDAR_ISSUE_SYNC_TASK,
+        _connection_ids_for_issue_id,
+    )
+
+
+def paced_google_calendar_cycle_sync_tasks(cycle_ids):
+    """Build a bounded cycle fan-out with one independent sequence per connection."""
+
+    return _paced_google_calendar_sync_tasks(
+        cycle_ids,
+        GOOGLE_CALENDAR_CYCLE_SYNC_TASK,
+        _connection_ids_for_cycle_id,
+    )
+
+
+@shared_task
 def synchronize_google_calendar_cycle(cycle_id, connection_id=None):
     """Converge one cycle block for every current or previously correlated recipient."""
 
@@ -512,16 +758,14 @@ def backfill_google_calendar_open_issues(connection_id, after_id=None, batch_siz
     except GoogleCalendarConnection.DoesNotExist:
         return "missing"
 
-    queryset = (
-        _issue_queryset()
-        .filter(
-            workspace_id=connection.workspace_integration.workspace_id,
-            target_date__isnull=False,
-            issue_assignee__assignee_id=connection.member_id,
-        )
-        .distinct()
-        .order_by("id")
+    queryset = _issue_queryset().filter(
+        workspace_id=connection.workspace_integration.workspace_id,
+        target_date__isnull=False,
     )
+    policy = connection.workspace_integration.config or {}
+    if policy.get("mode", "assignment") != "filter":
+        queryset = queryset.filter(issue_assignee__assignee_id=connection.member_id)
+    queryset = queryset.distinct().order_by("id")
     if after_id is not None:
         queryset = queryset.filter(id__gt=after_id)
     issues = list(queryset[: int(batch_size) + 1])
@@ -559,13 +803,12 @@ def resync_google_calendar_state_issues(state_id, after_id=None, batch_size=100)
 
     # Import locally because the signal module owns this shared dispatch boundary
     # and imports the task definitions while Django initializes receivers.
-    from plane.db.signals import dispatch_google_calendar_issue_sync
+    from plane.db.signals import dispatch_google_calendar_issue_syncs
 
-    for issue_id in current_batch:
-        dispatch_google_calendar_issue_sync(issue_id)
+    dispatch_google_calendar_issue_syncs(current_batch)
 
     if len(issue_ids) > len(current_batch) and current_batch:
-        continuation = current_app.signature(GOOGLE_CALENDAR_STATE_ISSUE_RESYNC_TASK)
+        continuation = current_app.signature(GOOGLE_CALENDAR_STATE_ISSUE_RESYNC_TASK).set(countdown=len(current_batch))
         publish_google_calendar_task(
             continuation,
             str(state_id),
@@ -587,13 +830,12 @@ def resync_google_calendar_label(label_id, after_id=None, batch_size=100):
 
     # Import locally because the signal module owns this shared dispatch boundary
     # and imports the task definitions while Django initializes receivers.
-    from plane.db.signals import dispatch_google_calendar_issue_sync
+    from plane.db.signals import dispatch_google_calendar_issue_syncs
 
-    for issue_id in current_batch:
-        dispatch_google_calendar_issue_sync(issue_id)
+    dispatch_google_calendar_issue_syncs(current_batch)
 
     if len(issue_ids) > len(current_batch) and current_batch:
-        continuation = current_app.signature(GOOGLE_CALENDAR_LABEL_ISSUE_RESYNC_TASK)
+        continuation = current_app.signature(GOOGLE_CALENDAR_LABEL_ISSUE_RESYNC_TASK).set(countdown=len(current_batch))
         publish_google_calendar_task(
             continuation,
             str(label_id),
@@ -618,9 +860,8 @@ def resync_google_calendar_project_issues(project_id, after_id=None, batch_size=
     issue_ids = list(issue_ids.values_list("id", flat=True)[: int(batch_size) + 1])
     current_batch = issue_ids[: int(batch_size)]
 
-    for index, issue_id in enumerate(current_batch):
-        sync_task = current_app.signature(GOOGLE_CALENDAR_ISSUE_SYNC_TASK).set(countdown=index)
-        publish_google_calendar_task(sync_task, str(issue_id))
+    for sync_task, issue_id, connection_id in paced_google_calendar_issue_sync_tasks(current_batch):
+        publish_google_calendar_task(sync_task, issue_id, connection_id)
 
     if len(issue_ids) > len(current_batch) and current_batch:
         continuation = current_app.signature(GOOGLE_CALENDAR_PROJECT_ISSUE_RESYNC_TASK).set(
@@ -655,9 +896,8 @@ def resync_google_calendar_project_cycles(project_id, after_id=None, batch_size=
     cycle_ids = list(cycle_ids.values_list("id", flat=True)[: int(batch_size) + 1])
     current_batch = cycle_ids[: int(batch_size)]
 
-    for index, cycle_id in enumerate(current_batch):
-        sync_task = current_app.signature(GOOGLE_CALENDAR_CYCLE_SYNC_TASK).set(countdown=index)
-        publish_google_calendar_task(sync_task, str(cycle_id))
+    for sync_task, cycle_id, connection_id in paced_google_calendar_cycle_sync_tasks(current_batch):
+        publish_google_calendar_task(sync_task, cycle_id, connection_id)
 
     if len(cycle_ids) > len(current_batch) and current_batch:
         continuation = current_app.signature(GOOGLE_CALENDAR_PROJECT_CYCLE_RESYNC_TASK).set(
@@ -776,9 +1016,8 @@ def resync_google_calendar_workspace_issues(
     current_batch = issue_ids[: int(batch_size)]
 
     try:
-        for index, issue_id in enumerate(current_batch):
-            sync_task = current_app.signature(GOOGLE_CALENDAR_ISSUE_SYNC_TASK).set(countdown=index)
-            publish_google_calendar_task(sync_task, str(issue_id))
+        for sync_task, issue_id, connection_id in paced_google_calendar_issue_sync_tasks(current_batch):
+            publish_google_calendar_task(sync_task, issue_id, connection_id)
 
         if len(issue_ids) > len(current_batch) and current_batch:
             next_batch = current_app.signature(GOOGLE_CALENDAR_WORKSPACE_ISSUE_RESYNC_TASK).set(
@@ -829,9 +1068,8 @@ def resync_google_calendar_workspace_cycles(
     current_batch = cycle_ids[: int(batch_size)]
 
     try:
-        for index, cycle_id in enumerate(current_batch):
-            sync_task = current_app.signature(GOOGLE_CALENDAR_CYCLE_SYNC_TASK).set(countdown=index)
-            publish_google_calendar_task(sync_task, str(cycle_id))
+        for sync_task, cycle_id, connection_id in paced_google_calendar_cycle_sync_tasks(current_batch):
+            publish_google_calendar_task(sync_task, cycle_id, connection_id)
 
         if len(cycle_ids) > len(current_batch) and current_batch:
             next_batch = current_app.signature(GOOGLE_CALENDAR_WORKSPACE_CYCLE_RESYNC_TASK).set(
@@ -921,6 +1159,560 @@ def reconcile_google_calendar_workspace_issue_resyncs(task, after_id=None, batch
     return len(current_batch)
 
 
+def _reconciliation_state(connection):
+    try:
+        state = json.loads(connection.reconciliation_cursor or "{}")
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(state, dict) or not isinstance(state.get("run_id"), str):
+        return None
+    return state
+
+
+def _save_reconciliation_state(connection, state, *, phase=None, page_token=None):
+    connection.reconciliation_cursor = json.dumps(state, separators=(",", ":"), sort_keys=True)
+    connection.reconciliation_lease_expires_at = timezone.now() + GOOGLE_CALENDAR_RECONCILIATION_LEASE
+    update_fields = ["reconciliation_cursor", "reconciliation_lease_expires_at", "updated_at"]
+    if phase is not None:
+        connection.reconciliation_phase = phase
+        update_fields.append("reconciliation_phase")
+    if page_token is not None:
+        connection.page_token = page_token
+        update_fields.append("page_token")
+    connection.save(update_fields=update_fields)
+
+
+def _owns_reconciliation_lease(connection, state, run_id, lease_token, *, phase=None):
+    return (
+        state is not None
+        and state["run_id"] == str(run_id)
+        and bool(lease_token)
+        and state.get("lease_token") == str(lease_token)
+        and connection.reconciliation_lease_expires_at is not None
+        and connection.reconciliation_lease_expires_at > timezone.now()
+        and (phase is None or connection.reconciliation_phase == phase)
+        and state.get("calendar_generation") == connection.calendar_generation
+        and state.get("lifecycle_generation") == connection.lifecycle_generation
+    )
+
+
+def _claim_reconciliation_lease(connection, state):
+    state["lease_token"] = str(uuid4())
+    _save_reconciliation_state(connection, state)
+
+
+@transaction.atomic
+def _start_or_resume_inventory(connection_id, run_id, force_local_scan):
+    try:
+        connection = (
+            GoogleCalendarConnection.objects.select_for_update()
+            .select_related("workspace_integration")
+            .get(id=connection_id)
+        )
+    except GoogleCalendarConnection.DoesNotExist:
+        return "missing"
+    if (
+        connection.desired_state != GoogleCalendarConnection.DesiredState.CONNECTED
+        or connection.status not in {GoogleCalendarConnection.Status.ACTIVE, GoogleCalendarConnection.Status.PENDING}
+        or not connection.calendar_id
+    ):
+        return "inactive"
+
+    state = _reconciliation_state(connection)
+    if run_id is not None:
+        if state is None or state["run_id"] != str(run_id):
+            return "stale"
+        if (
+            state.get("calendar_generation") != connection.calendar_generation
+            or state.get("lifecycle_generation") != connection.lifecycle_generation
+        ):
+            return "stale"
+        if connection.reconciliation_lease_expires_at and connection.reconciliation_lease_expires_at > timezone.now():
+            return "leased"
+        _claim_reconciliation_lease(connection, state)
+        return connection
+
+    state_owns_current_generation = state is not None and (
+        state.get("calendar_generation") == connection.calendar_generation
+        and state.get("lifecycle_generation") == connection.lifecycle_generation
+    )
+    if (
+        connection.reconciliation_phase
+        and connection.reconciliation_lease_expires_at
+        and connection.reconciliation_lease_expires_at > timezone.now()
+        and (state is None or state_owns_current_generation)
+    ):
+        return "leased"
+    if connection.reconciliation_phase and state_owns_current_generation:
+        _claim_reconciliation_lease(connection, state)
+        return connection
+
+    full_inventory = not bool(connection.sync_token)
+    state = {
+        "run_id": str(uuid4()),
+        "lease_token": str(uuid4()),
+        "calendar_generation": connection.calendar_generation,
+        "lifecycle_generation": connection.lifecycle_generation,
+        "after_id": "",
+        "force_local_scan": bool(force_local_scan),
+        "full_inventory": full_inventory,
+        "saw_delta": False,
+    }
+    connection.reconciliation_completed_at = None
+    connection.reconciliation_phase = GOOGLE_CALENDAR_RECONCILIATION_PROVIDER_PHASE
+    connection.page_token = ""
+    connection.reconciliation_cursor = json.dumps(state, separators=(",", ":"), sort_keys=True)
+    connection.reconciliation_lease_expires_at = timezone.now() + GOOGLE_CALENDAR_RECONCILIATION_LEASE
+    connection.save(
+        update_fields=[
+            "reconciliation_completed_at",
+            "reconciliation_phase",
+            "page_token",
+            "reconciliation_cursor",
+            "reconciliation_lease_expires_at",
+            "updated_at",
+        ]
+    )
+    if full_inventory:
+        GoogleCalendarEvent.objects.filter(
+            connection=connection,
+            calendar_generation=connection.calendar_generation,
+        ).update(provider_etag="", provider_payload_hash="", provider_status="")
+    return connection
+
+
+def _provider_marker(event):
+    extended_properties = event.get("extendedProperties")
+    if not isinstance(extended_properties, dict):
+        return None
+    private = extended_properties.get("private")
+    if not isinstance(private, dict):
+        return None
+    entity_type = private.get("plane_entity_type")
+    entity_id = private.get("plane_entity_id")
+    if entity_type not in GoogleCalendarEvent.EntityType.values or not isinstance(entity_id, str):
+        return None
+    try:
+        return entity_type, UUID(entity_id)
+    except ValueError:
+        return None
+
+
+def _inventory_marker_candidates(state):
+    candidates = state.get("provider_marker_candidates", {})
+    if not isinstance(candidates, dict):
+        return {}
+    return {
+        correlation_id: candidate
+        for correlation_id, candidate in candidates.items()
+        if isinstance(correlation_id, str) and isinstance(candidate, dict)
+    }
+
+
+def _apply_inventory_marker_candidates(connection, candidates):
+    candidate_ids = set(candidates)
+    if not candidate_ids:
+        return
+    correlations = GoogleCalendarEvent.objects.filter(
+        id__in=candidate_ids,
+        connection=connection,
+        calendar_generation=connection.calendar_generation,
+        provider_payload_hash="",
+    ).exclude(provider_status="cancelled")
+    changed = []
+    for correlation in correlations:
+        candidate = candidates[str(correlation.id)]
+        event_id = candidate.get("event_id")
+        if not isinstance(event_id, str) or not event_id:
+            continue
+        correlation.google_event_id = event_id
+        correlation.provider_etag = candidate.get("etag", "")
+        correlation.provider_payload_hash = candidate.get("provider_hash", "")
+        correlation.provider_status = candidate.get("status", "")
+        changed.append(correlation)
+    if changed:
+        GoogleCalendarEvent.objects.bulk_update(
+            changed,
+            ["google_event_id", "provider_etag", "provider_payload_hash", "provider_status"],
+        )
+
+
+@transaction.atomic
+def _record_inventory_page(connection_id, run_id, lease_token, page):
+    connection = GoogleCalendarConnection.objects.select_for_update().get(id=connection_id)
+    state = _reconciliation_state(connection)
+    if not _owns_reconciliation_lease(
+        connection,
+        state,
+        run_id,
+        lease_token,
+        phase=GOOGLE_CALENDAR_RECONCILIATION_PROVIDER_PHASE,
+    ):
+        return "stale"
+
+    event_ids = [event.get("id") for event in page.events if isinstance(event.get("id"), str)]
+    correlations = list(
+        GoogleCalendarEvent.objects.filter(
+            connection=connection,
+            calendar_generation=connection.calendar_generation,
+            google_event_id__in=event_ids,
+        )
+    )
+    by_provider_id = {correlation.google_event_id: correlation for correlation in correlations}
+    # Provider-ID ownership is stronger than a copied private marker across the
+    # entire full-inventory run, including worker continuations. Marker recovery
+    # is deferred until the last page so provider page ordering cannot replace an
+    # ID-owned ledger row. Full inventory clears provider observations before its
+    # first page, making a payload hash or cancelled status a durable direct-ID
+    # observation across later pages.
+    page_owned_correlation_ids = {str(correlation.id) for correlation in correlations}
+    marker_candidates = _inventory_marker_candidates(state)
+    for correlation_id in page_owned_correlation_ids:
+        marker_candidates.pop(correlation_id, None)
+    marker_keys = [_provider_marker(event) for event in page.events]
+    valid_marker_keys = [marker for marker in marker_keys if marker is not None]
+    by_marker = {
+        (correlation.entity_type, correlation.entity_id): correlation
+        for correlation in GoogleCalendarEvent.objects.filter(
+            connection=connection,
+            calendar_generation=connection.calendar_generation,
+        ).filter(
+            Q(
+                entity_type=GoogleCalendarEvent.EntityType.WORK_ITEM,
+                entity_id__in=[
+                    key[1] for key in valid_marker_keys if key[0] == GoogleCalendarEvent.EntityType.WORK_ITEM
+                ],
+            )
+            | Q(
+                entity_type=GoogleCalendarEvent.EntityType.CYCLE,
+                entity_id__in=[key[1] for key in valid_marker_keys if key[0] == GoogleCalendarEvent.EntityType.CYCLE],
+            )
+        )
+    }
+
+    changed = []
+    for event, marker in zip(page.events, marker_keys, strict=True):
+        event_id = event.get("id")
+        correlation = by_provider_id.get(event_id)
+        if correlation is None and marker is not None and state.get("full_inventory"):
+            marker_correlation = by_marker.get(marker)
+            marker_correlation_id = str(marker_correlation.id) if marker_correlation is not None else None
+            if (
+                marker_correlation_id is not None
+                and marker_correlation_id not in page_owned_correlation_ids
+                and not marker_correlation.provider_payload_hash
+                and marker_correlation.provider_status != "cancelled"
+            ):
+                etag = event.get("etag", "")
+                status = event.get("status", "")
+                marker_candidates[marker_correlation_id] = {
+                    "event_id": event_id,
+                    "etag": etag if isinstance(etag, str) else "",
+                    "provider_hash": google_calendar_provider_payload_hash(event),
+                    "status": status if isinstance(status, str) else "",
+                }
+        if correlation is None:
+            continue
+        etag = event.get("etag", "")
+        status = event.get("status", "")
+        provider_hash = google_calendar_provider_payload_hash(event)
+        if not isinstance(etag, str):
+            etag = ""
+        if not isinstance(status, str):
+            status = ""
+        if (
+            correlation.google_event_id == event_id
+            and correlation.provider_etag == etag
+            and correlation.provider_payload_hash == provider_hash
+            and correlation.provider_status == status
+        ):
+            continue
+        if isinstance(event_id, str) and event_id:
+            correlation.google_event_id = event_id
+        correlation.provider_etag = etag
+        correlation.provider_payload_hash = provider_hash
+        correlation.provider_status = status
+        changed.append(correlation)
+    if changed:
+        GoogleCalendarEvent.objects.bulk_update(
+            changed,
+            ["google_event_id", "provider_etag", "provider_payload_hash", "provider_status"],
+        )
+
+    state["provider_marker_candidates"] = marker_candidates
+    state["saw_delta"] = state.get("saw_delta", False) or bool(page.events)
+    if page.next_page_token:
+        _save_reconciliation_state(connection, state, page_token=page.next_page_token)
+        return "more"
+
+    if state.get("full_inventory"):
+        _apply_inventory_marker_candidates(connection, marker_candidates)
+    state.pop("provider_marker_candidates", None)
+    connection.sync_token = page.next_sync_token or connection.sync_token
+    connection.page_token = ""
+    connection.save(update_fields=["sync_token", "page_token", "updated_at"])
+    needs_local_scan = bool(state.get("force_local_scan") or state.get("full_inventory") or state.get("saw_delta"))
+    if needs_local_scan:
+        _save_reconciliation_state(
+            connection,
+            state,
+            phase=GOOGLE_CALENDAR_RECONCILIATION_LOCAL_PHASE,
+            page_token="",
+        )
+        return "local"
+    return _complete_reconciliation_run(connection, state)
+
+
+@transaction.atomic
+def _expire_inventory_sync_token(connection_id, run_id, lease_token):
+    connection = GoogleCalendarConnection.objects.select_for_update().get(id=connection_id)
+    state = _reconciliation_state(connection)
+    if not _owns_reconciliation_lease(
+        connection,
+        state,
+        run_id,
+        lease_token,
+        phase=GOOGLE_CALENDAR_RECONCILIATION_PROVIDER_PHASE,
+    ):
+        return False
+    connection.sync_token = ""
+    connection.page_token = ""
+    state["full_inventory"] = True
+    state.pop("provider_marker_candidates", None)
+    GoogleCalendarEvent.objects.filter(
+        connection=connection,
+        calendar_generation=connection.calendar_generation,
+    ).update(provider_etag="", provider_payload_hash="", provider_status="")
+    connection.save(update_fields=["sync_token", "page_token", "updated_at"])
+    _save_reconciliation_state(connection, state, page_token="")
+    return True
+
+
+def _publish_reconciliation_continuation(connection_id, run_id, countdown=None):
+    continuation = current_app.signature(GOOGLE_CALENDAR_INVENTORY_TASK)
+    if countdown is not None:
+        continuation = continuation.set(countdown=countdown)
+    publish_google_calendar_task(continuation, str(connection_id), str(run_id))
+
+
+@transaction.atomic
+def _release_reconciliation_lease(connection_id, run_id, lease_token):
+    connection = GoogleCalendarConnection.objects.select_for_update().get(id=connection_id)
+    state = _reconciliation_state(connection)
+    if not _owns_reconciliation_lease(connection, state, run_id, lease_token):
+        return False
+    state["lease_token"] = ""
+    connection.reconciliation_cursor = json.dumps(state, separators=(",", ":"), sort_keys=True)
+    connection.reconciliation_lease_expires_at = None
+    connection.save(update_fields=["reconciliation_cursor", "reconciliation_lease_expires_at", "updated_at"])
+    return True
+
+
+@transaction.atomic
+def _request_calendar_replacement(connection_id, run_id, lease_token):
+    connection = GoogleCalendarConnection.objects.select_for_update().get(id=connection_id)
+    state = _reconciliation_state(connection)
+    if not _owns_reconciliation_lease(
+        connection,
+        state,
+        run_id,
+        lease_token,
+        phase=GOOGLE_CALENDAR_RECONCILIATION_PROVIDER_PHASE,
+    ):
+        return "stale"
+    connection.status = GoogleCalendarConnection.Status.PENDING
+    connection.reconciliation_phase = ""
+    connection.reconciliation_cursor = ""
+    connection.reconciliation_lease_expires_at = None
+    connection.save(
+        update_fields=[
+            "status",
+            "reconciliation_phase",
+            "reconciliation_cursor",
+            "reconciliation_lease_expires_at",
+            "updated_at",
+        ]
+    )
+    lifecycle_task = current_app.signature(GOOGLE_CALENDAR_LIFECYCLE_TASK)
+    enqueue_google_calendar_task_on_commit(
+        lifecycle_task,
+        str(connection.id),
+        connection.lifecycle_generation,
+    )
+    return "replacement_pending"
+
+
+@transaction.atomic
+def _record_reconciliation_credential_mismatch(connection_id, run_id, lease_token):
+    connection = GoogleCalendarConnection.objects.select_for_update().get(id=connection_id)
+    state = _reconciliation_state(connection)
+    if not _owns_reconciliation_lease(
+        connection,
+        state,
+        run_id,
+        lease_token,
+        phase=GOOGLE_CALENDAR_RECONCILIATION_PROVIDER_PHASE,
+    ):
+        return False
+    _mark_credential_mismatch(connection)
+    return True
+
+
+def _publish_correlation_sync(correlation, countdown):
+    if correlation.entity_type == GoogleCalendarEvent.EntityType.WORK_ITEM:
+        task_name = GOOGLE_CALENDAR_ISSUE_SYNC_TASK
+    else:
+        task_name = GOOGLE_CALENDAR_CYCLE_SYNC_TASK
+    sync_task = current_app.signature(task_name).set(countdown=countdown)
+    publish_google_calendar_task(sync_task, str(correlation.entity_id), str(correlation.connection_id))
+
+
+@transaction.atomic
+def _advance_local_scan(connection_id, run_id, lease_token):
+    connection = GoogleCalendarConnection.objects.select_for_update().get(id=connection_id)
+    state = _reconciliation_state(connection)
+    if not _owns_reconciliation_lease(
+        connection,
+        state,
+        run_id,
+        lease_token,
+        phase=GOOGLE_CALENDAR_RECONCILIATION_LOCAL_PHASE,
+    ):
+        return "stale", []
+    queryset = GoogleCalendarEvent.objects.filter(
+        connection=connection,
+        calendar_generation=connection.calendar_generation,
+    ).order_by("id")
+    after_id = state.get("after_id")
+    if after_id:
+        queryset = queryset.filter(id__gt=after_id)
+    correlations = list(queryset[: GOOGLE_CALENDAR_RECONCILIATION_LOCAL_PAGE_SIZE + 1])
+    current_page = correlations[:GOOGLE_CALENDAR_RECONCILIATION_LOCAL_PAGE_SIZE]
+    has_more = len(correlations) > len(current_page)
+    if has_more:
+        return "more", current_page
+    connection.reconciliation_lease_expires_at = timezone.now() + GOOGLE_CALENDAR_RECONCILIATION_LEASE
+    connection.save(update_fields=["reconciliation_lease_expires_at", "updated_at"])
+    return "complete", current_page
+
+
+@transaction.atomic
+def _persist_local_scan_cursor(connection_id, run_id, lease_token, after_id):
+    connection = GoogleCalendarConnection.objects.select_for_update().get(id=connection_id)
+    state = _reconciliation_state(connection)
+    if not _owns_reconciliation_lease(
+        connection,
+        state,
+        run_id,
+        lease_token,
+        phase=GOOGLE_CALENDAR_RECONCILIATION_LOCAL_PHASE,
+    ):
+        return False
+    state["after_id"] = str(after_id)
+    _save_reconciliation_state(connection, state)
+    return True
+
+
+def _complete_reconciliation_run(connection, state):
+    connection.reconciliation_phase = ""
+    connection.reconciliation_cursor = ""
+    connection.reconciliation_lease_expires_at = None
+    connection.reconciliation_completed_at = timezone.now()
+    connection.save(
+        update_fields=[
+            "reconciliation_phase",
+            "reconciliation_cursor",
+            "reconciliation_lease_expires_at",
+            "reconciliation_completed_at",
+            "updated_at",
+        ]
+    )
+    return "complete"
+
+
+@transaction.atomic
+def _finish_reconciliation(connection_id, run_id, lease_token):
+    connection = GoogleCalendarConnection.objects.select_for_update().get(id=connection_id)
+    state = _reconciliation_state(connection)
+    if not _owns_reconciliation_lease(
+        connection,
+        state,
+        run_id,
+        lease_token,
+        phase=GOOGLE_CALENDAR_RECONCILIATION_LOCAL_PHASE,
+    ):
+        return "stale"
+    return _complete_reconciliation_run(connection, state)
+
+
+@shared_task
+def reconcile_google_calendar_inventory(connection_id, run_id=None, force_local_scan=False):
+    """Reconcile one connection within five provider pages or one 1,000-row local page."""
+
+    connection = _start_or_resume_inventory(connection_id, run_id, force_local_scan)
+    if isinstance(connection, str):
+        return connection
+    state = _reconciliation_state(connection)
+    run_id = state["run_id"]
+    lease_token = state["lease_token"]
+
+    if connection.reconciliation_phase == GOOGLE_CALENDAR_RECONCILIATION_PROVIDER_PHASE:
+        client = _client_for(connection)
+        for _ in range(GOOGLE_CALENDAR_RECONCILIATION_PROVIDER_PAGE_LIMIT):
+            connection.refresh_from_db()
+            state = _reconciliation_state(connection)
+            if not _owns_reconciliation_lease(connection, state, run_id, lease_token):
+                return "stale"
+            try:
+                page = client.list_event_page(
+                    connection.calendar_id,
+                    page_token=connection.page_token or None,
+                    sync_token=connection.sync_token or None,
+                )
+            except GoogleCalendarSyncTokenExpired:
+                if not _expire_inventory_sync_token(connection.id, run_id, lease_token):
+                    return "stale"
+                connection.refresh_from_db()
+                continue
+            except GoogleCalendarCalendarAbsent:
+                return _request_calendar_replacement(connection.id, run_id, lease_token)
+            except GoogleCalendarCredentialMismatch:
+                if not _record_reconciliation_credential_mismatch(connection.id, run_id, lease_token):
+                    return "stale"
+                return "credential_mismatch"
+            result = _record_inventory_page(connection.id, run_id, lease_token, page)
+            if result == "stale":
+                return result
+            if result == "more":
+                continue
+            _persist_refreshed_access_token(connection, client)
+            if result == "complete":
+                return result
+            if not _release_reconciliation_lease(connection.id, run_id, lease_token):
+                return "stale"
+            _publish_reconciliation_continuation(connection.id, run_id)
+            return "continued"
+        _persist_refreshed_access_token(connection, client)
+        if not _release_reconciliation_lease(connection.id, run_id, lease_token):
+            return "stale"
+        _publish_reconciliation_continuation(connection.id, run_id)
+        return "continued"
+
+    result, correlations = _advance_local_scan(connection.id, run_id, lease_token)
+    if result == "stale":
+        return result
+    for index, correlation in enumerate(correlations):
+        _publish_correlation_sync(correlation, index)
+    if result == "more":
+        if not _persist_local_scan_cursor(connection.id, run_id, lease_token, correlations[-1].id):
+            return "stale"
+        if not _release_reconciliation_lease(connection.id, run_id, lease_token):
+            return "stale"
+        _publish_reconciliation_continuation(connection.id, run_id, countdown=len(correlations))
+        return "continued"
+    return _finish_reconciliation(connection.id, run_id, lease_token)
+
+
 def _record_present_error(connection, generation, error):
     if not _owns_generation(
         connection,
@@ -983,7 +1775,7 @@ def _prepare_reconciliation(connection_id, generation):
 
 
 @transaction.atomic
-def _converge_present(connection, generation):
+def _converge_present_transaction(connection, generation):
     connection = lock_google_calendar_connection(connection.id)
     if not _owns_generation(
         connection,
@@ -993,11 +1785,12 @@ def _converge_present(connection, generation):
     ):
         return "stale"
     client = _client_for(connection)
+    retained_inventory = bool(connection.calendar_id and connection.calendar_operation_id is None)
     try:
         client.validate_credentials()
         if not has_usable_google_calendar_grant(connection):
             return _record_present_error(connection, generation, "Google Calendar grant is not usable")
-        if not connection.calendar_id:
+        if connection.calendar_operation_id is not None:
             if not _owns_generation(
                 connection,
                 generation,
@@ -1005,8 +1798,6 @@ def _converge_present(connection, generation):
                 status=GoogleCalendarConnection.Status.PENDING,
             ):
                 return "stale"
-            if connection.calendar_operation_id is None:
-                return _record_present_error(connection, generation, "Google Calendar creation identity is missing")
             calendar_id = client.find_calendar(connection.calendar_operation_id)
             if calendar_id is None:
                 if not _owns_generation(
@@ -1019,6 +1810,12 @@ def _converge_present(connection, generation):
                 calendar_id = client.create_calendar(connection.calendar_operation_id)
             connection.calendar_id = calendar_id
             connection.calendar_generation += 1
+            connection.sync_token = ""
+            connection.page_token = ""
+            connection.reconciliation_phase = ""
+            connection.reconciliation_cursor = ""
+            connection.reconciliation_lease_expires_at = None
+            connection.reconciliation_completed_at = None
             _persist_refreshed_access_token(connection, client)
             if not _owns_generation(
                 connection,
@@ -1027,9 +1824,33 @@ def _converge_present(connection, generation):
                 status=GoogleCalendarConnection.Status.PENDING,
             ):
                 return "stale"
-            connection.save(update_fields=["calendar_id", "calendar_generation", "updated_at"])
+            connection.save(
+                update_fields=[
+                    "calendar_id",
+                    "calendar_generation",
+                    "sync_token",
+                    "page_token",
+                    "reconciliation_phase",
+                    "reconciliation_cursor",
+                    "reconciliation_lease_expires_at",
+                    "reconciliation_completed_at",
+                    "updated_at",
+                ]
+            )
+            GoogleCalendarEvent.objects.filter(connection=connection).update(
+                provider_etag="",
+                provider_payload_hash="",
+                provider_status="",
+            )
+        elif connection.calendar_id:
+            try:
+                client.get_calendar(connection.calendar_id)
+            except GoogleCalendarCalendarAbsent:
+                connection.calendar_operation_id = uuid4()
+                connection.save(update_fields=["calendar_operation_id", "updated_at"])
+                return "replacement_prepared"
         else:
-            client.get_calendar(connection.calendar_id)
+            return _record_present_error(connection, generation, "Google Calendar creation identity is missing")
     except GoogleCalendarCredentialMismatch:
         return _record_present_error(
             connection,
@@ -1052,7 +1873,20 @@ def _converge_present(connection, generation):
     mark_google_calendar_connection_active(connection.id, generation)
     enqueue_google_calendar_task_on_commit(backfill_google_calendar_open_issues, str(connection.id))
     enqueue_google_calendar_task_on_commit(backfill_google_calendar_cycles, str(connection.id))
+    if retained_inventory:
+        enqueue_google_calendar_task_on_commit(
+            reconcile_google_calendar_inventory,
+            str(connection.id),
+            force_local_scan=True,
+        )
     return "active"
+
+
+def _converge_present(connection, generation):
+    result = _converge_present_transaction(connection, generation)
+    if result == "replacement_prepared":
+        return _converge_present_transaction(connection, generation)
+    return result
 
 
 @transaction.atomic

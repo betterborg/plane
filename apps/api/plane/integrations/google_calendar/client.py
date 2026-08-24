@@ -3,8 +3,11 @@
 # See the LICENSE file for details.
 
 import hmac
+import random
+import time
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone as datetime_timezone
+from email.utils import parsedate_to_datetime
 from urllib.parse import quote
 
 import requests
@@ -24,6 +27,8 @@ GOOGLE_CALENDAR_API_URL = "https://www.googleapis.com/calendar/v3"
 GOOGLE_CALENDAR_SUMMARY = "Plane"
 GOOGLE_CALENDAR_OPERATION_DESCRIPTION_PREFIX = "Plane calendar operation:"
 GOOGLE_CALENDAR_TOKEN_EXPIRY_SKEW = timedelta(seconds=60)
+GOOGLE_CALENDAR_PROVIDER_MAX_RETRIES = 5
+GOOGLE_CALENDAR_PROVIDER_RETRY_BASE_SECONDS = 1
 
 
 class GoogleCalendarClientError(Exception):
@@ -46,6 +51,27 @@ class GoogleCalendarClientConflict(GoogleCalendarProviderError):
     """Raised when a deterministic provider event already exists."""
 
 
+class GoogleCalendarEventAbsent(GoogleCalendarProviderError):
+    """Raised when an event operation targets a provider tombstone or missing event."""
+
+
+class GoogleCalendarSyncTokenExpired(GoogleCalendarProviderError):
+    """Raised when Google requires a new bounded full inventory."""
+
+
+class GoogleCalendarCalendarAbsent(GoogleCalendarProviderError):
+    """Raised only after Google confirms the dedicated calendar is absent."""
+
+
+@dataclass(frozen=True)
+class GoogleCalendarEventPage:
+    """One provider inventory page and its opaque continuation state."""
+
+    events: tuple[dict, ...]
+    next_page_token: str | None
+    next_sync_token: str | None
+
+
 @dataclass(frozen=True)
 class GoogleCalendarAccessToken:
     """The access token currently used by the Calendar client."""
@@ -65,12 +91,14 @@ class GoogleCalendarClient:
         refresh_token="",
         token_expires_at=None,
         persist_access_token=None,
+        max_retries=GOOGLE_CALENDAR_PROVIDER_MAX_RETRIES,
     ):
         self._credential_fingerprint = credential_fingerprint
         self._access_token = access_token
         self._refresh_token = refresh_token
         self._token_expires_at = token_expires_at
         self._persist_access_token = persist_access_token
+        self._max_retries = max(0, int(max_retries))
 
     @property
     def access_token(self):
@@ -105,7 +133,7 @@ class GoogleCalendarClient:
             raise GoogleCalendarClientError("Google Calendar grant cannot refresh an access token")
 
         try:
-            response = requests.post(
+            response = self._post_with_retry(
                 GOOGLE_CALENDAR_TOKEN_URL,
                 data={
                     "client_id": credentials.client_id,
@@ -113,7 +141,6 @@ class GoogleCalendarClient:
                     "grant_type": "refresh_token",
                     "refresh_token": self._refresh_token,
                 },
-                timeout=GOOGLE_CALENDAR_OAUTH_TIMEOUT,
             )
             response.raise_for_status()
             payload = response.json()
@@ -152,13 +179,72 @@ class GoogleCalendarClient:
             **kwargs,
         )
 
-    def _calendar_request(self, method, path, **kwargs):
+    @staticmethod
+    def _retry_after_seconds(response):
+        value = response.headers.get("Retry-After") if response is not None and response.headers else None
+        if not isinstance(value, str) or not value:
+            return None
+        try:
+            delay = float(value)
+        except (TypeError, ValueError):
+            try:
+                retry_at = parsedate_to_datetime(value)
+                if retry_at.tzinfo is None:
+                    retry_at = retry_at.replace(tzinfo=datetime_timezone.utc)
+                delay = (retry_at - datetime.now(datetime_timezone.utc)).total_seconds()
+            except (TypeError, ValueError, OverflowError):
+                return None
+        return max(0, delay)
+
+    def _retry_delay(self, response, attempt):
+        retry_after = self._retry_after_seconds(response)
+        if retry_after is not None:
+            return retry_after
+        exponential = GOOGLE_CALENDAR_PROVIDER_RETRY_BASE_SECONDS * (2**attempt)
+        return exponential + random.uniform(0, exponential)
+
+    def _post_with_retry(self, url, **kwargs):
+        for attempt in range(self._max_retries + 1):
+            self._validated_credentials()
+            response = requests.post(url, timeout=GOOGLE_CALENDAR_OAUTH_TIMEOUT, **kwargs)
+            if response.status_code != 429 and response.status_code < 500:
+                return response
+            if attempt >= self._max_retries:
+                return response
+            time.sleep(self._retry_delay(response, attempt))
+        return response
+
+    def _calendar_request(
+        self,
+        method,
+        path,
+        *,
+        retry_server_errors=True,
+        retry_status_codes=(),
+        max_retries=None,
+        **kwargs,
+    ):
         try:
             access_token, refreshed = self._ensure_access_token()
-            response = self._send_calendar_request(method, path, access_token, **kwargs)
-            if response.status_code == 401 and self._refresh_token and not refreshed:
-                self._refresh_access_token()
-                response = self._send_calendar_request(method, path, self._access_token, **kwargs)
+            unauthorized_retried = refreshed
+            retry_limit = self._max_retries if max_retries is None else max(0, int(max_retries))
+            for attempt in range(retry_limit + 1):
+                response = self._send_calendar_request(method, path, access_token, **kwargs)
+                if response.status_code == 401 and self._refresh_token and not unauthorized_retried:
+                    self._refresh_access_token()
+                    access_token = self._access_token
+                    unauthorized_retried = True
+                    response = self._send_calendar_request(method, path, access_token, **kwargs)
+                should_retry = (
+                    response.status_code == 429
+                    or (retry_server_errors and response.status_code >= 500)
+                    or response.status_code in retry_status_codes
+                )
+                if not should_retry:
+                    return response
+                if attempt >= retry_limit:
+                    return response
+                time.sleep(self._retry_delay(response, attempt))
             return response
         except requests.RequestException as exc:
             raise GoogleCalendarProviderError("Google Calendar provider request failed") from exc
@@ -206,7 +292,42 @@ class GoogleCalendarClient:
         payload = {"summary": GOOGLE_CALENDAR_SUMMARY}
         if operation_id is not None:
             payload["description"] = self._operation_description(operation_id)
-        response = self._calendar_request("post", "/calendars", json=payload)
+        # Google does not accept a caller-defined calendar ID. Check the durable
+        # marker after every ambiguous attempt before another POST can run.
+        for attempt in range(self._max_retries + 1):
+            try:
+                response = self._calendar_request(
+                    "post",
+                    "/calendars",
+                    retry_server_errors=False,
+                    max_retries=0,
+                    json=payload,
+                )
+            except GoogleCalendarProviderError as exc:
+                if operation_id is not None:
+                    # Recovery is another provider attempt, so it must observe
+                    # the same retry boundary as a repeated create request.
+                    time.sleep(self._retry_delay(None, attempt))
+                    recovered_calendar_id = self.find_calendar(operation_id)
+                    if recovered_calendar_id is not None:
+                        return recovered_calendar_id
+                if operation_id is None or attempt >= self._max_retries:
+                    raise GoogleCalendarProviderError("Google Calendar creation failed") from exc
+                continue
+
+            if response.status_code >= 500:
+                if operation_id is None:
+                    break
+                time.sleep(self._retry_delay(response, attempt))
+                recovered_calendar_id = self.find_calendar(operation_id)
+                if recovered_calendar_id is not None:
+                    return recovered_calendar_id
+            if response.status_code != 429 and response.status_code < 500:
+                break
+            if attempt >= self._max_retries:
+                break
+            if response.status_code < 500:
+                time.sleep(self._retry_delay(response, attempt))
         try:
             response.raise_for_status()
             payload = response.json()
@@ -225,6 +346,8 @@ class GoogleCalendarClient:
         if not calendar_id:
             raise GoogleCalendarClientError("Google Calendar lookup requires a recorded calendar ID")
         response = self._calendar_request("get", f"/calendars/{quote(calendar_id, safe='')}")
+        if response.status_code in {404, 410}:
+            raise GoogleCalendarCalendarAbsent("Google Calendar dedicated calendar is absent")
         try:
             response.raise_for_status()
             payload = response.json()
@@ -240,7 +363,7 @@ class GoogleCalendarClient:
         if not calendar_id:
             raise GoogleCalendarClientError("Google Calendar deletion requires a recorded calendar ID")
         response = self._calendar_request("delete", f"/calendars/{quote(calendar_id, safe='')}")
-        if response.status_code == 404:
+        if response.status_code in {404, 410}:
             return
         try:
             response.raise_for_status()
@@ -268,10 +391,47 @@ class GoogleCalendarClient:
     def get_event(self, calendar_id, event_id):
         """Get one event, returning ``None`` when it is already absent."""
 
-        response = self._calendar_request("get", self._event_path(calendar_id, event_id))
-        if response.status_code == 404:
+        response = self._calendar_request(
+            "get",
+            self._event_path(calendar_id, event_id),
+            retry_status_codes=(409,),
+        )
+        if response.status_code in {404, 410}:
             return None
+        if response.status_code == 409:
+            raise GoogleCalendarClientConflict("Google Calendar event lookup conflicted")
         return self._event_payload(response, "Google Calendar event lookup failed")
+
+    def list_event_page(self, calendar_id, *, page_token=None, sync_token=None, max_results=250):
+        """Return one full or incremental inventory page without consuming its continuation."""
+
+        params = {
+            "maxResults": min(2500, max(1, int(max_results))),
+            "showDeleted": True,
+            "singleEvents": True,
+        }
+        if page_token:
+            params["pageToken"] = page_token
+        if sync_token:
+            params["syncToken"] = sync_token
+        response = self._calendar_request("get", self._event_path(calendar_id), params=params)
+        if response.status_code == 410 and sync_token:
+            raise GoogleCalendarSyncTokenExpired("Google Calendar inventory sync token expired")
+        if response.status_code in {404, 410}:
+            raise GoogleCalendarCalendarAbsent("Google Calendar dedicated calendar is absent")
+        payload = self._event_payload(response, "Google Calendar event inventory failed")
+        items = payload.get("items", [])
+        if not isinstance(items, list) or not all(isinstance(item, dict) for item in items):
+            raise GoogleCalendarProviderError("Google Calendar event inventory failed")
+        next_page_token = payload.get("nextPageToken")
+        next_sync_token = payload.get("nextSyncToken")
+        if next_page_token is not None and (not isinstance(next_page_token, str) or not next_page_token):
+            raise GoogleCalendarProviderError("Google Calendar event inventory failed")
+        if next_sync_token is not None and (not isinstance(next_sync_token, str) or not next_sync_token):
+            raise GoogleCalendarProviderError("Google Calendar event inventory failed")
+        if next_page_token and next_sync_token:
+            raise GoogleCalendarProviderError("Google Calendar event inventory failed")
+        return GoogleCalendarEventPage(tuple(items), next_page_token, next_sync_token)
 
     def list_events(self, calendar_id, *, private_extended_property=None):
         """List all matching events across provider pages."""
@@ -301,6 +461,8 @@ class GoogleCalendarClient:
 
         body = {**payload, "id": event_id}
         response = self._calendar_request("post", self._event_path(calendar_id), json=body)
+        if response.status_code in {404, 410}:
+            raise GoogleCalendarEventAbsent("Google Calendar event collection is absent")
         if response.status_code == 409:
             raise GoogleCalendarClientConflict("Google Calendar event already exists")
         return self._event_payload(response, "Google Calendar event insertion failed")
@@ -309,6 +471,10 @@ class GoogleCalendarClient:
         """Replace an event using Google Calendar's full-update operation."""
 
         response = self._calendar_request("put", self._event_path(calendar_id, event_id), json=payload)
+        if response.status_code in {404, 410}:
+            raise GoogleCalendarEventAbsent("Google Calendar event is absent")
+        if response.status_code == 409:
+            raise GoogleCalendarClientConflict("Google Calendar event update conflicted")
         return self._event_payload(response, "Google Calendar event update failed")
 
     def delete_event(self, calendar_id, event_id):
@@ -330,11 +496,7 @@ class GoogleCalendarClient:
         if not token:
             return
         try:
-            response = requests.post(
-                GOOGLE_CALENDAR_REVOCATION_URL,
-                data={"token": token},
-                timeout=GOOGLE_CALENDAR_OAUTH_TIMEOUT,
-            )
+            response = self._post_with_retry(GOOGLE_CALENDAR_REVOCATION_URL, data={"token": token})
             if response.status_code == 400:
                 try:
                     payload = response.json()

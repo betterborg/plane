@@ -31,6 +31,28 @@ def google_calendar_payload_hash(payload):
     return hashlib.sha256(encoded).hexdigest()
 
 
+def google_calendar_provider_payload_hash(event):
+    """Hash only the Plane-owned provider fields, excluding Google response metadata."""
+
+    if event.get("status") == "cancelled":
+        return ""
+    payload = {
+        key: event[key]
+        for key in (
+            "summary",
+            "description",
+            "start",
+            "end",
+            "status",
+            "reminders",
+            "extendedProperties",
+            "colorId",
+        )
+        if key in event
+    }
+    return google_calendar_payload_hash(payload)
+
+
 def canonical_issue_browse_url(issue):
     """Return the stable human-facing Plane work-item URL."""
 

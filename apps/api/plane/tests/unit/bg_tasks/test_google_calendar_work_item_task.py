@@ -19,6 +19,7 @@ from plane.bgtasks.google_calendar_task import (
     _synchronize_issue_for_connection,
     backfill_google_calendar_cycles,
     backfill_google_calendar_open_issues,
+    paced_google_calendar_issue_sync_tasks,
     reconcile_google_calendar_workspace_issue_resyncs,
     reconcile_google_calendar_connection,
     resync_google_calendar_label,
@@ -32,6 +33,7 @@ from plane.db.models import GoogleCalendarEvent, IssueLabel, Label
 from plane.integrations.google_calendar.client import (
     GoogleCalendarClient,
     GoogleCalendarClientConflict,
+    GoogleCalendarEventAbsent,
     GoogleCalendarProviderError,
 )
 from plane.integrations.google_calendar.dispatch import (
@@ -52,6 +54,7 @@ from plane.integrations.google_calendar.oauth import GoogleCalendarOAuthCredenti
 from plane.license.utils.google_calendar_credentials import google_calendar_credential_fingerprint
 from plane.tests.factories import (
     GoogleCalendarConnectionFactory,
+    GoogleCalendarEventFactory,
     IssueAssigneeFactory,
     IssueFactory,
     IssueLabelFactory,
@@ -124,6 +127,15 @@ class TestGoogleCalendarWorkItemTask:
     def test_insert_conflict_recovers_the_deterministic_event_without_a_duplicate(self):
         client = _provider_client()
         client.insert_event.side_effect = GoogleCalendarClientConflict("already exists")
+        client.get_event.return_value = {
+            "id": "existing-event",
+            "extendedProperties": {
+                "private": {
+                    "plane_entity_type": GoogleCalendarEvent.EntityType.WORK_ITEM,
+                    "plane_entity_id": str(self.issue.id),
+                }
+            },
+        }
 
         with patch("plane.bgtasks.google_calendar_task.GoogleCalendarClient", return_value=client):
             result = synchronize_google_calendar_issue.run(str(self.issue.id))
@@ -133,7 +145,102 @@ class TestGoogleCalendarWorkItemTask:
         client.get_event.assert_called_once()
         client.update_event.assert_called_once()
 
-    def test_provider_retry_commits_refreshed_access_token_once(self):
+    @pytest.mark.parametrize(
+        "private_marker",
+        [
+            None,
+            {"plane_entity_id": "issue-id"},
+            {
+                "plane_entity_type": GoogleCalendarEvent.EntityType.CYCLE,
+                "plane_entity_id": "issue-id",
+            },
+        ],
+    )
+    def test_insert_conflict_never_adopts_a_provider_event_without_exact_markers(self, private_marker):
+        client = _provider_client()
+        provider_event = {"id": "foreign-event"}
+        if private_marker is not None:
+            provider_event["extendedProperties"] = {
+                "private": {
+                    key: str(self.issue.id) if value == "issue-id" else value for key, value in private_marker.items()
+                }
+            }
+        client.insert_event.side_effect = GoogleCalendarClientConflict("foreign deterministic event")
+        client.get_event.return_value = provider_event
+        client.list_events.return_value = [provider_event]
+
+        with (
+            patch("plane.bgtasks.google_calendar_task.GoogleCalendarClient", return_value=client),
+            pytest.raises(GoogleCalendarClientConflict),
+        ):
+            synchronize_google_calendar_issue.run(str(self.issue.id), str(self.connection.id))
+
+        client.update_event.assert_not_called()
+        assert not GoogleCalendarEvent.objects.filter(connection=self.connection, entity_id=self.issue.id).exists()
+
+    def test_tombstone_conflict_does_not_adopt_a_partial_marker_match(self):
+        correlation = GoogleCalendarEventFactory(
+            connection=self.connection,
+            entity_id=self.issue.id,
+            google_event_id="missing-ledger-event",
+        )
+        client = _provider_client()
+        client.get_event.return_value = None
+        client.list_events.return_value = [
+            {
+                "id": "foreign-partial-marker",
+                "extendedProperties": {"private": {"plane_entity_id": str(self.issue.id)}},
+            }
+        ]
+        client.insert_event.side_effect = GoogleCalendarClientConflict("foreign deterministic event")
+
+        with (
+            patch("plane.bgtasks.google_calendar_task.GoogleCalendarClient", return_value=client),
+            pytest.raises(GoogleCalendarClientConflict),
+        ):
+            synchronize_google_calendar_issue.run(str(self.issue.id), str(self.connection.id))
+
+        client.update_event.assert_not_called()
+        correlation.refresh_from_db()
+        assert correlation.google_event_id == "missing-ledger-event"
+
+    @pytest.mark.parametrize("status_code", [404, 410])
+    def test_insert_absence_requests_calendar_replacement_without_a_ledger_row(self, status_code):
+        client = _provider_client()
+        client.insert_event.side_effect = GoogleCalendarEventAbsent(f"provider returned {status_code}")
+
+        with (
+            patch("plane.bgtasks.google_calendar_task.GoogleCalendarClient", return_value=client),
+            patch("plane.bgtasks.google_calendar_task.enqueue_google_calendar_task_on_commit") as enqueue,
+        ):
+            result = synchronize_google_calendar_issue.run(str(self.issue.id), str(self.connection.id))
+
+        assert result == ["replacement_pending"]
+        self.connection.refresh_from_db()
+        assert self.connection.status == "pending"
+        assert not GoogleCalendarEvent.objects.filter(connection=self.connection, entity_id=self.issue.id).exists()
+        assert enqueue.call_args.args[0].task == GOOGLE_CALENDAR_LIFECYCLE_TASK
+        assert enqueue.call_args.args[1:] == (str(self.connection.id), self.connection.lifecycle_generation)
+
+    def test_transient_update_conflict_then_tombstone_recreates_the_event(self):
+        client = _provider_client()
+
+        with patch("plane.bgtasks.google_calendar_task.GoogleCalendarClient", return_value=client):
+            assert synchronize_google_calendar_issue.run(str(self.issue.id)) == ["created"]
+            client.reset_mock()
+            client.access_token = None
+            client.get_event.side_effect = [{"id": "existing-event"}, None]
+            client.update_event.side_effect = GoogleCalendarClientConflict("transient conflict")
+            self.issue.name = "Changed while provider conflicted"
+            self.issue.save(update_fields=["name", "updated_at"])
+            result = synchronize_google_calendar_issue.run(str(self.issue.id))
+
+        assert result == ["updated"]
+        assert client.get_event.call_count == 2
+        client.insert_event.assert_called_once()
+        assert GoogleCalendarEvent.objects.filter(entity_id=self.issue.id).count() == 1
+
+    def test_provider_retry_is_owned_by_the_client_and_commits_the_refreshed_token_once(self):
         credentials = GoogleCalendarOAuthCredentials("client-id", "client-secret")
         self.connection.access_token = "expired-access-token"
         self.connection.refresh_token = "refresh-token"
@@ -171,34 +278,100 @@ class TestGoogleCalendarWorkItemTask:
                 "plane.integrations.google_calendar.client.requests.request",
                 side_effect=[failed_event_response, successful_event_response],
             ) as request,
-            pytest.raises(GoogleCalendarProviderError),
+            patch("plane.integrations.google_calendar.client.random.uniform", return_value=0),
+            patch("plane.integrations.google_calendar.client.time.sleep") as sleep,
+            patch.object(synchronize_google_calendar_issue, "retry") as task_retry,
         ):
-            _synchronize_issue_for_connection(self.issue.id, self.connection.id)
+            result = synchronize_google_calendar_issue.run(str(self.issue.id), str(self.connection.id))
 
         self.connection.refresh_from_db()
         assert self.connection.access_token == "fresh-access-token"
-        assert not GoogleCalendarEvent.objects.filter(connection=self.connection, entity_id=self.issue.id).exists()
+        assert result == ["created"]
+        assert GoogleCalendarEvent.objects.filter(connection=self.connection, entity_id=self.issue.id).exists()
+        assert post.call_count == 1
+        assert request.call_count == 2
+        sleep.assert_called_once_with(1)
+        task_retry.assert_not_called()
+
+    def test_exhausted_client_retry_is_not_retried_again_by_the_worker(self):
+        client = _provider_client()
+        client.insert_event.side_effect = GoogleCalendarProviderError("provider retry budget exhausted")
 
         with (
-            patch(
-                "plane.integrations.google_calendar.client.get_google_calendar_oauth_credentials",
-                return_value=credentials,
-            ),
-            patch(
-                "plane.integrations.google_calendar.client.requests.post",
-                return_value=refresh_response,
-            ) as retry_post,
-            patch(
-                "plane.integrations.google_calendar.client.requests.request",
-                return_value=successful_event_response,
-            ),
+            patch("plane.bgtasks.google_calendar_task.GoogleCalendarClient", return_value=client),
+            patch.object(synchronize_google_calendar_issue, "retry") as task_retry,
+            pytest.raises(GoogleCalendarProviderError, match="retry budget exhausted"),
         ):
-            result = _synchronize_issue_for_connection(self.issue.id, self.connection.id)
+            synchronize_google_calendar_issue.run(str(self.issue.id), str(self.connection.id))
 
-        assert result == "created"
-        assert post.call_count == 1
-        assert request.call_count == 1
-        retry_post.assert_not_called()
+        client.insert_event.assert_called_once()
+        task_retry.assert_not_called()
+
+    def test_multi_entity_fanout_advances_countdown_independently_per_connection(self):
+        second_connection = GoogleCalendarConnectionFactory(
+            workspace_integration=self.workspace_integration,
+            member=UserFactory(),
+            active=True,
+        )
+        issues = [self.issue, IssueFactory(project=self.issue.project), IssueFactory(project=self.issue.project)]
+        for issue in issues:
+            IssueAssigneeFactory(issue=issue, assignee=second_connection.member, project=issue.project)
+        for issue in issues[1:]:
+            IssueAssigneeFactory(issue=issue, assignee=self.connection.member, project=issue.project)
+
+        tasks = list(paced_google_calendar_issue_sync_tasks([issue.id for issue in issues]))
+        countdowns_by_connection = {}
+        for task, _, connection_id in tasks:
+            countdowns_by_connection.setdefault(connection_id, []).append(task.options["countdown"])
+
+        assert countdowns_by_connection == {
+            str(self.connection.id): [0, 1, 2],
+            str(second_connection.id): [0, 1, 2],
+        }
+
+    def test_backfill_and_configuration_resync_pace_each_connection_independently(self):
+        second_connection = GoogleCalendarConnectionFactory(
+            workspace_integration=self.workspace_integration,
+            member=UserFactory(),
+            active=True,
+        )
+        issues = [self.issue, IssueFactory(project=self.issue.project), IssueFactory(project=self.issue.project)]
+        IssueAssigneeFactory(issue=self.issue, assignee=second_connection.member, project=self.issue.project)
+        for issue in issues[1:]:
+            IssueAssigneeFactory(issue=issue, assignee=self.connection.member, project=issue.project)
+            IssueAssigneeFactory(issue=issue, assignee=second_connection.member, project=issue.project)
+
+        with patch("plane.bgtasks.google_calendar_task.enqueue_google_calendar_task_on_commit") as enqueue:
+            backfill_google_calendar_open_issues.run(str(self.connection.id))
+            backfill_google_calendar_open_issues.run(str(second_connection.id))
+
+        backfill_countdowns = {}
+        for queued in enqueue.call_args_list:
+            task, _, connection_id = queued.args
+            backfill_countdowns.setdefault(connection_id, []).append(task.options["countdown"])
+        assert backfill_countdowns == {
+            str(self.connection.id): [0, 1, 2],
+            str(second_connection.id): [0, 1, 2],
+        }
+
+        for resync, resync_id in (
+            (resync_google_calendar_project_issues, self.issue.project_id),
+            (resync_google_calendar_workspace_issues, self.workspace_integration.workspace_id),
+        ):
+            with patch("plane.bgtasks.google_calendar_task.publish_google_calendar_task") as publish:
+                assert resync.run(str(resync_id)) == 3
+
+            resync_countdowns = {}
+            for queued in publish.call_args_list:
+                task = queued.args[0]
+                if task.task != GOOGLE_CALENDAR_ISSUE_SYNC_TASK:
+                    continue
+                connection_id = queued.args[2]
+                resync_countdowns.setdefault(connection_id, []).append(task.options["countdown"])
+            assert resync_countdowns == {
+                str(self.connection.id): [0, 1, 2],
+                str(second_connection.id): [0, 1, 2],
+            }
 
     def test_completion_updates_then_reopening_restores_the_normal_payload(self):
         client = _provider_client()
@@ -334,16 +507,17 @@ class TestGoogleCalendarWorkItemTask:
         expected_ids = sorted((issue.id for issue in matching_issues), key=str)
 
         with (
-            patch("plane.db.signals.dispatch_google_calendar_issue_sync") as dispatch,
+            patch("plane.db.signals.dispatch_google_calendar_issue_syncs") as dispatch,
             patch("plane.bgtasks.google_calendar_task.publish_google_calendar_task") as publish,
         ):
             published = resync_google_calendar_state_issues.run(str(state.id), batch_size=2)
 
         assert published == 2
-        assert [call.args[0] for call in dispatch.call_args_list] == expected_ids[:2]
+        dispatch.assert_called_once_with(expected_ids[:2])
         publish.assert_called_once()
         continuation = publish.call_args
         assert continuation.args[0].task == GOOGLE_CALENDAR_STATE_ISSUE_RESYNC_TASK
+        assert continuation.args[0].options["countdown"] == 2
         assert continuation.args[1:] == (
             str(state.id),
             str(expected_ids[1]),
@@ -351,7 +525,7 @@ class TestGoogleCalendarWorkItemTask:
         )
 
         with (
-            patch("plane.db.signals.dispatch_google_calendar_issue_sync") as dispatch,
+            patch("plane.db.signals.dispatch_google_calendar_issue_syncs") as dispatch,
             patch("plane.bgtasks.google_calendar_task.publish_google_calendar_task") as publish,
         ):
             published = resync_google_calendar_state_issues.run(
@@ -361,19 +535,19 @@ class TestGoogleCalendarWorkItemTask:
             )
 
         assert published == 1
-        dispatch.assert_called_once_with(expected_ids[2])
+        dispatch.assert_called_once_with(expected_ids[2:])
         publish.assert_not_called()
 
     def test_state_resync_converges_saved_terminal_and_reopened_definitions(self):
         client = _provider_client()
         state = self.issue.state
 
-        def synchronize_now(issue_id):
-            return synchronize_google_calendar_issue.run(str(issue_id))
+        def synchronize_now(issue_ids):
+            return [synchronize_google_calendar_issue.run(str(issue_id)) for issue_id in issue_ids]
 
         with (
             patch("plane.bgtasks.google_calendar_task.GoogleCalendarClient", return_value=client),
-            patch("plane.db.signals.dispatch_google_calendar_issue_sync", side_effect=synchronize_now),
+            patch("plane.db.signals.dispatch_google_calendar_issue_syncs", side_effect=synchronize_now),
         ):
             synchronize_google_calendar_issue.run(str(self.issue.id))
 
@@ -413,12 +587,12 @@ class TestGoogleCalendarWorkItemTask:
         client = _provider_client()
         state = self.issue.state
 
-        def synchronize_now(issue_id):
-            return synchronize_google_calendar_issue.run(str(issue_id))
+        def synchronize_now(issue_ids):
+            return [synchronize_google_calendar_issue.run(str(issue_id)) for issue_id in issue_ids]
 
         with (
             patch("plane.bgtasks.google_calendar_task.GoogleCalendarClient", return_value=client),
-            patch("plane.db.signals.dispatch_google_calendar_issue_sync", side_effect=synchronize_now),
+            patch("plane.db.signals.dispatch_google_calendar_issue_syncs", side_effect=synchronize_now),
         ):
             synchronize_google_calendar_issue.run(str(self.issue.id))
             self.workspace_integration.config["update_on_completion"] = False
@@ -443,20 +617,21 @@ class TestGoogleCalendarWorkItemTask:
         expected_ids = sorted((issue.id for issue in linked_issues), key=str)
 
         with (
-            patch("plane.db.signals.dispatch_google_calendar_issue_sync") as dispatch,
+            patch("plane.db.signals.dispatch_google_calendar_issue_syncs") as dispatch,
             patch("plane.bgtasks.google_calendar_task.publish_google_calendar_task") as publish,
         ):
             published = resync_google_calendar_label.run(str(label.id), batch_size=2)
 
         assert published == 2
-        assert [call.args[0] for call in dispatch.call_args_list] == expected_ids[:2]
+        dispatch.assert_called_once_with(expected_ids[:2])
         publish.assert_called_once()
         continuation = publish.call_args
         assert continuation.args[0].task == GOOGLE_CALENDAR_LABEL_ISSUE_RESYNC_TASK
+        assert continuation.args[0].options["countdown"] == 2
         assert continuation.args[1:] == (str(label.id), str(expected_ids[1]), 2)
 
         with (
-            patch("plane.db.signals.dispatch_google_calendar_issue_sync") as dispatch,
+            patch("plane.db.signals.dispatch_google_calendar_issue_syncs") as dispatch,
             patch("plane.bgtasks.google_calendar_task.publish_google_calendar_task") as publish,
         ):
             published = resync_google_calendar_label.run(
@@ -466,7 +641,7 @@ class TestGoogleCalendarWorkItemTask:
             )
 
         assert published == 1
-        dispatch.assert_called_once_with(expected_ids[2])
+        dispatch.assert_called_once_with(expected_ids[2:])
         publish.assert_not_called()
 
     def test_label_resync_converges_renamed_and_recursively_deleted_descriptions(self):
@@ -474,12 +649,12 @@ class TestGoogleCalendarWorkItemTask:
         label = LabelFactory(project=self.issue.project, name="Needs review")
         relation = IssueLabelFactory(issue=self.issue, label=label, project=self.issue.project)
 
-        def synchronize_now(issue_id):
-            return synchronize_google_calendar_issue.run(str(issue_id))
+        def synchronize_now(issue_ids):
+            return [synchronize_google_calendar_issue.run(str(issue_id)) for issue_id in issue_ids]
 
         with (
             patch("plane.bgtasks.google_calendar_task.GoogleCalendarClient", return_value=client),
-            patch("plane.db.signals.dispatch_google_calendar_issue_sync", side_effect=synchronize_now),
+            patch("plane.db.signals.dispatch_google_calendar_issue_syncs", side_effect=synchronize_now),
         ):
             synchronize_google_calendar_issue.run(str(self.issue.id))
 
@@ -517,12 +692,12 @@ class TestGoogleCalendarWorkItemTask:
         }
         self.workspace_integration.save(update_fields=["config", "updated_at"])
 
-        def synchronize_now(issue_id):
-            return synchronize_google_calendar_issue.run(str(issue_id))
+        def synchronize_now(issue_ids):
+            return [synchronize_google_calendar_issue.run(str(issue_id)) for issue_id in issue_ids]
 
         with (
             patch("plane.bgtasks.google_calendar_task.GoogleCalendarClient", return_value=client),
-            patch("plane.db.signals.dispatch_google_calendar_issue_sync", side_effect=synchronize_now),
+            patch("plane.db.signals.dispatch_google_calendar_issue_syncs", side_effect=synchronize_now),
         ):
             synchronize_google_calendar_issue.run(str(self.issue.id))
             Label.all_objects.filter(id=label.id).update(deleted_at=timezone.now())
@@ -536,8 +711,8 @@ class TestGoogleCalendarWorkItemTask:
     def test_project_resync_converges_committed_inclusion_and_archive_state(self):
         client = _provider_client()
 
-        def synchronize_now(task, issue_id):
-            return synchronize_google_calendar_issue.run(issue_id)
+        def synchronize_now(task, issue_id, connection_id):
+            return synchronize_google_calendar_issue.run(issue_id, connection_id)
 
         with (
             patch("plane.bgtasks.google_calendar_task.GoogleCalendarClient", return_value=client),
@@ -588,8 +763,8 @@ class TestGoogleCalendarWorkItemTask:
         IssueAssigneeFactory(issue=self.issue, assignee=second_connection.member, project=self.issue.project)
         client = _provider_client()
 
-        def synchronize_now(task, issue_id):
-            return synchronize_google_calendar_issue.run(issue_id)
+        def synchronize_now(task, issue_id, connection_id):
+            return synchronize_google_calendar_issue.run(issue_id, connection_id)
 
         with (
             patch("plane.bgtasks.google_calendar_task.GoogleCalendarClient", return_value=client),
@@ -611,6 +786,8 @@ class TestGoogleCalendarWorkItemTask:
         second_issue = IssueFactory(project=self.issue.project)
         third_issue = IssueFactory(project=self.issue.project)
         foreign_issue = IssueFactory(project__workspace=self.workspace_integration.workspace)
+        for issue in (second_issue, third_issue):
+            IssueAssigneeFactory(issue=issue, assignee=self.connection.member, project=issue.project)
 
         with patch("plane.bgtasks.google_calendar_task.publish_google_calendar_task") as publish:
             published = resync_google_calendar_project_issues.run(str(self.issue.project_id), batch_size=2)
@@ -665,6 +842,8 @@ class TestGoogleCalendarWorkItemTask:
     def test_workspace_resync_paces_pages(self):
         second_issue = IssueFactory(project=self.issue.project)
         third_issue = IssueFactory(project=self.issue.project)
+        for issue in (second_issue, third_issue):
+            IssueAssigneeFactory(issue=issue, assignee=self.connection.member, project=issue.project)
 
         with patch("plane.bgtasks.google_calendar_task.publish_google_calendar_task") as publish:
             published = resync_google_calendar_workspace_issues.run(

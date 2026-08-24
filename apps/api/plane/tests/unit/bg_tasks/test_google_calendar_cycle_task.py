@@ -250,9 +250,9 @@ class TestGoogleCalendarCycleTask:
         )
         client = _provider_client()
 
-        def publish_cycle_immediately(task, cycle_id):
+        def publish_cycle_immediately(task, cycle_id, connection_id):
             assert task.task == GOOGLE_CALENDAR_CYCLE_SYNC_TASK
-            return synchronize_google_calendar_cycle.run(cycle_id)
+            return synchronize_google_calendar_cycle.run(cycle_id, connection_id)
 
         with (
             patch("plane.bgtasks.google_calendar_task.GoogleCalendarClient", return_value=client),

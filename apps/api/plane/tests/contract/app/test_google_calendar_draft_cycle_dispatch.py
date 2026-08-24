@@ -14,6 +14,11 @@ from plane.bgtasks.google_calendar_task import (
     synchronize_google_calendar_issue,
 )
 from plane.db.models import CycleIssue, DraftIssue, GoogleCalendarEvent, IssueAssignee
+from plane.integrations.google_calendar.dispatch import (
+    GOOGLE_CALENDAR_CYCLE_SYNC_TASK,
+    GOOGLE_CALENDAR_ISSUE_SYNC_TASK,
+)
+from plane.tests.contract.app.google_calendar_helpers import targeted_task
 from plane.tests.factories import (
     CycleFactory,
     GoogleCalendarConnectionFactory,
@@ -91,7 +96,7 @@ class TestGoogleCalendarDraftCycleDispatch:
             integration__provider="google_calendar",
             config={"enabled": True, "recipients": "cycle_members"},
         )
-        GoogleCalendarConnectionFactory(
+        connection = GoogleCalendarConnectionFactory(
             workspace_integration=workspace_integration,
             member=create_user,
             active=True,
@@ -102,27 +107,38 @@ class TestGoogleCalendarDraftCycleDispatch:
         callbacks = []
         observed_cycle_ids = []
 
-        def converge_from_final_state(cycle_id):
+        def converge_from_final_state(cycle_id, connection_id):
+            assert connection_id == str(connection.id)
             membership = CycleIssue.objects.get(cycle_id=cycle_id)
             assert IssueAssignee.objects.filter(
                 issue_id=membership.issue_id,
                 assignee=create_user,
             ).exists()
             observed_cycle_ids.append(cycle_id)
-            return synchronize_google_calendar_cycle.run(cycle_id)
+            return synchronize_google_calendar_cycle.run(cycle_id, connection_id)
+
+        targeted_issue_task = targeted_task()
+        targeted_cycle_task = targeted_task(converge_from_final_state)
+
+        def targeted_signature(task_name):
+            if task_name == GOOGLE_CALENDAR_ISSUE_SYNC_TASK:
+                return targeted_issue_task
+            if task_name == GOOGLE_CALENDAR_CYCLE_SYNC_TASK:
+                return targeted_cycle_task
+            raise AssertionError(f"Unexpected task: {task_name}")
 
         with (
             patch("plane.bgtasks.google_calendar_task.GoogleCalendarClient", return_value=provider_client),
             patch(
+                "plane.bgtasks.google_calendar_task.current_app.signature",
+                side_effect=targeted_signature,
+            ) as signature,
+            patch(
                 "plane.integrations.google_calendar.dispatch.transaction.on_commit",
                 side_effect=_capture_on_commit(callbacks),
             ),
-            patch.object(synchronize_google_calendar_issue, "delay") as issue_dispatch,
-            patch.object(
-                synchronize_google_calendar_cycle,
-                "delay",
-                side_effect=converge_from_final_state,
-            ) as cycle_dispatch,
+            patch.object(synchronize_google_calendar_issue, "delay") as fallback_issue_dispatch,
+            patch.object(synchronize_google_calendar_cycle, "delay") as fallback_cycle_dispatch,
             patch("plane.app.views.workspace.draft.issue_activity.delay"),
             patch("plane.db.mixins.soft_delete_related_objects.delay"),
         ):
@@ -137,8 +153,19 @@ class TestGoogleCalendarDraftCycleDispatch:
             assert len(callbacks) == 2
             _run_callbacks(callbacks)
 
-        issue_dispatch.assert_called_once_with(str(response.data["id"]))
-        cycle_dispatch.assert_called_once_with(str(cycle.id))
+        assert {call.args[0] for call in signature.call_args_list} == {
+            GOOGLE_CALENDAR_ISSUE_SYNC_TASK,
+            GOOGLE_CALENDAR_CYCLE_SYNC_TASK,
+        }
+        targeted_issue_task.set.assert_called_once_with(countdown=0)
+        targeted_issue_task.delay.assert_called_once_with(str(response.data["id"]), str(connection.id))
+        assert [invocation.kwargs for invocation in targeted_cycle_task.set.call_args_list] == [
+            {"countdown": 0},
+            {"countdown": 0},
+        ]
+        targeted_cycle_task.delay.assert_called_once_with(str(cycle.id), str(connection.id))
+        fallback_issue_dispatch.assert_not_called()
+        fallback_cycle_dispatch.assert_not_called()
         assert observed_cycle_ids == [str(cycle.id)]
         assert (
             GoogleCalendarEvent.objects.filter(
@@ -205,19 +232,24 @@ class TestGoogleCalendarDraftCycleDispatch:
             integration__provider="google_calendar",
             config={"enabled": True, "recipients": "cycle_members"},
         )
-        GoogleCalendarConnectionFactory(
+        connection = GoogleCalendarConnectionFactory(
             workspace_integration=workspace_integration,
             member=create_user,
             active=True,
         )
         callbacks = []
+        targeted_issue_task = targeted_task()
 
         with (
+            patch(
+                "plane.bgtasks.google_calendar_task.current_app.signature",
+                return_value=targeted_issue_task,
+            ) as signature,
             patch(
                 "plane.integrations.google_calendar.dispatch.transaction.on_commit",
                 side_effect=_capture_on_commit(callbacks),
             ),
-            patch.object(synchronize_google_calendar_issue, "delay"),
+            patch.object(synchronize_google_calendar_issue, "delay") as fallback_issue_dispatch,
             patch.object(
                 synchronize_google_calendar_cycle,
                 "delay",
@@ -236,6 +268,10 @@ class TestGoogleCalendarDraftCycleDispatch:
             assert len(callbacks) == 2
             _run_callbacks(callbacks)
 
+        signature.assert_called_once_with(GOOGLE_CALENDAR_ISSUE_SYNC_TASK)
+        targeted_issue_task.set.assert_called_once_with(countdown=0)
+        targeted_issue_task.delay.assert_called_once_with(str(response.data["id"]), str(connection.id))
+        fallback_issue_dispatch.assert_not_called()
         cycle_dispatch.assert_called_once_with(str(cycle.id))
         assert not GoogleCalendarEvent.objects.filter(
             entity_type=GoogleCalendarEvent.EntityType.CYCLE,

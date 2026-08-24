@@ -16,7 +16,7 @@ from django.utils import timezone
 # Module imports
 from plane.bgtasks.issue_activities_task import issue_activity
 from plane.db.models import Issue, Project, State
-from plane.db.signals import dispatch_google_calendar_issue_sync
+from plane.db.signals import dispatch_google_calendar_issue_syncs
 from plane.utils.exception_logger import log_exception
 
 
@@ -27,6 +27,7 @@ def archive_and_close_old_issues():
 
 
 def archive_old_issues():
+    affected_issue_ids = []
     try:
         # Get all the projects whose archive_in is greater than 0
         projects = Project.objects.filter(archive_in__gt=0)
@@ -67,8 +68,7 @@ def archive_old_issues():
                 # Bulk Update the issues and log the activity
                 if issues_to_update:
                     Issue.objects.bulk_update(issues_to_update, ["archived_at"], batch_size=100)
-                    for issue in issues_to_update:
-                        dispatch_google_calendar_issue_sync(issue.id)
+                    affected_issue_ids.extend(issue.id for issue in issues_to_update)
                     _ = [
                         issue_activity.delay(
                             type="issue.activity.updated",
@@ -87,9 +87,12 @@ def archive_old_issues():
     except Exception as e:
         log_exception(e)
         return
+    finally:
+        dispatch_google_calendar_issue_syncs(affected_issue_ids)
 
 
 def close_old_issues():
+    affected_issue_ids = []
     try:
         # Get all the projects whose close_in is greater than 0
         projects = Project.objects.filter(close_in__gt=0).select_related("default_state")
@@ -132,8 +135,7 @@ def close_old_issues():
                 # Bulk Update the issues and log the activity
                 if issues_to_update:
                     Issue.objects.bulk_update(issues_to_update, ["state"], batch_size=100)
-                    for issue in issues_to_update:
-                        dispatch_google_calendar_issue_sync(issue.id)
+                    affected_issue_ids.extend(issue.id for issue in issues_to_update)
                     [
                         issue_activity.delay(
                             type="issue.activity.updated",
@@ -152,3 +154,5 @@ def close_old_issues():
     except Exception as e:
         log_exception(e)
         return
+    finally:
+        dispatch_google_calendar_issue_syncs(affected_issue_ids)
