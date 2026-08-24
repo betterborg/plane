@@ -24,6 +24,30 @@ def _old_issues(project, state):
 @pytest.mark.unit
 @pytest.mark.django_db(transaction=True)
 class TestGoogleCalendarIssueAutomationTask:
+    @pytest.mark.parametrize(
+        ("task", "project_kwargs", "state_group"),
+        [
+            (archive_old_issues, {"archive_in": 1}, "completed"),
+            (close_old_issues, {"close_in": 1}, "started"),
+        ],
+    )
+    def test_dispatches_persisted_mutations_when_activity_publication_fails(self, task, project_kwargs, state_group):
+        project = ProjectFactory(**project_kwargs)
+        state = StateFactory(project=project, group=state_group)
+        issues = _old_issues(project, state)
+
+        with (
+            patch(
+                "plane.bgtasks.issue_automation_task.issue_activity.delay",
+                side_effect=RuntimeError("broker unavailable"),
+            ),
+            patch("plane.bgtasks.issue_automation_task.dispatch_google_calendar_issue_syncs") as dispatch,
+        ):
+            task()
+
+        dispatch.assert_called_once()
+        assert set(dispatch.call_args.args[0]) == {issue.id for issue in issues}
+
     def test_archive_dispatches_every_issue_after_persistence_when_broker_fails(self):
         project = ProjectFactory(archive_in=1)
         completed_state = StateFactory(project=project, group="completed")

@@ -293,7 +293,43 @@ class TestGoogleCalendarClient:
 
         assert calendar_id == "recovered-calendar@example.com"
         assert [call.args[0] for call in request.call_args_list] == ["post", "get"]
-        sleep.assert_not_called()
+        sleep.assert_called_once_with(1)
+
+    def test_ambiguous_calendar_creation_honors_retry_after_before_recovery_lookup(self):
+        unavailable = Mock(status_code=503, headers={"Retry-After": "7"})
+        recovered = Mock(status_code=200)
+        recovered.json.return_value = {
+            "items": [
+                {
+                    "id": "recovered-calendar@example.com",
+                    "description": "Plane calendar operation: 12345678-1234-5678-1234-567812345678",
+                }
+            ]
+        }
+        client = _client(
+            access_token="access-token",
+            token_expires_at=timezone.now() + timedelta(hours=1),
+        )
+        operation_id = UUID("12345678-1234-5678-1234-567812345678")
+        provider_attempts = []
+
+        def request(*args, **kwargs):
+            provider_attempts.append(args[0])
+            return unavailable if len(provider_attempts) == 1 else recovered
+
+        def sleep(delay):
+            assert provider_attempts == ["post"]
+            assert delay == 7
+
+        with (
+            patch("plane.integrations.google_calendar.client.requests.request", side_effect=request),
+            patch("plane.integrations.google_calendar.client.time.sleep", side_effect=sleep) as retry_sleep,
+        ):
+            calendar_id = client.create_calendar(operation_id)
+
+        assert calendar_id == "recovered-calendar@example.com"
+        assert provider_attempts == ["post", "get"]
+        retry_sleep.assert_called_once_with(7)
 
     def test_calendar_creation_checks_the_marker_before_retrying_an_ambiguous_post(self):
         unavailable = Mock(status_code=503, headers={})

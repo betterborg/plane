@@ -304,17 +304,20 @@ class GoogleCalendarClient:
                 )
             except GoogleCalendarProviderError as exc:
                 if operation_id is not None:
+                    # Recovery is another provider attempt, so it must observe
+                    # the same retry boundary as a repeated create request.
+                    time.sleep(self._retry_delay(None, attempt))
                     recovered_calendar_id = self.find_calendar(operation_id)
                     if recovered_calendar_id is not None:
                         return recovered_calendar_id
                 if operation_id is None or attempt >= self._max_retries:
                     raise GoogleCalendarProviderError("Google Calendar creation failed") from exc
-                time.sleep(self._retry_delay(None, attempt))
                 continue
 
             if response.status_code >= 500:
                 if operation_id is None:
                     break
+                time.sleep(self._retry_delay(response, attempt))
                 recovered_calendar_id = self.find_calendar(operation_id)
                 if recovered_calendar_id is not None:
                     return recovered_calendar_id
@@ -322,7 +325,8 @@ class GoogleCalendarClient:
                 break
             if attempt >= self._max_retries:
                 break
-            time.sleep(self._retry_delay(response, attempt))
+            if response.status_code < 500:
+                time.sleep(self._retry_delay(response, attempt))
         try:
             response.raise_for_status()
             payload = response.json()

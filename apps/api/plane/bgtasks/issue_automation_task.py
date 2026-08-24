@@ -27,8 +27,8 @@ def archive_and_close_old_issues():
 
 
 def archive_old_issues():
+    affected_issue_ids = []
     try:
-        affected_issue_ids = []
         # Get all the projects whose archive_in is greater than 0
         projects = Project.objects.filter(archive_in__gt=0)
 
@@ -83,16 +83,17 @@ def archive_old_issues():
                         )
                         for issue in issues_to_update
                     ]
-        dispatch_google_calendar_issue_syncs(affected_issue_ids)
         return
     except Exception as e:
         log_exception(e)
         return
+    finally:
+        dispatch_google_calendar_issue_syncs(affected_issue_ids)
 
 
 def close_old_issues():
+    affected_issue_ids = []
     try:
-        affected_issue_ids = []
         # Get all the projects whose close_in is greater than 0
         projects = Project.objects.filter(close_in__gt=0).select_related("default_state")
 
@@ -149,8 +150,9 @@ def close_old_issues():
                         )
                         for issue in issues_to_update
                     ]
-        dispatch_google_calendar_issue_syncs(affected_issue_ids)
         return
     except Exception as e:
         log_exception(e)
         return
+    finally:
+        dispatch_google_calendar_issue_syncs(affected_issue_ids)
