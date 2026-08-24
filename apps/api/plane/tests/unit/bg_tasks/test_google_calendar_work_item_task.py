@@ -16,6 +16,7 @@ from django.utils import timezone
 from plane.bgtasks.google_calendar_task import (
     _connection_ids_for_issue,
     _synchronize_issue_for_connection,
+    backfill_google_calendar_cycles,
     backfill_google_calendar_open_issues,
     reconcile_google_calendar_workspace_issue_resyncs,
     reconcile_google_calendar_connection,
@@ -698,7 +699,7 @@ class TestGoogleCalendarWorkItemTask:
         retry.assert_called_once_with(countdown=5)
         publish.assert_not_called()
 
-    def test_successful_initial_provisioning_enqueues_open_item_backfill(self):
+    def test_successful_initial_provisioning_enqueues_open_item_and_cycle_backfills(self):
         connection = GoogleCalendarConnectionFactory(
             workspace_integration=self.workspace_integration,
             provider_account_id="google-account",
@@ -719,10 +720,12 @@ class TestGoogleCalendarWorkItemTask:
             result = reconcile_google_calendar_connection.run(str(connection.id), 3)
 
         assert result == "active"
-        publish.assert_called_once()
-        assert publish.call_args.args[1:] == (str(connection.id),)
+        assert [call.args for call in publish.call_args_list] == [
+            (backfill_google_calendar_open_issues, str(connection.id)),
+            (backfill_google_calendar_cycles, str(connection.id)),
+        ]
 
-    def test_cleanup_complete_reenable_enqueues_open_item_backfill(self):
+    def test_cleanup_complete_reenable_enqueues_open_item_and_cycle_backfills(self):
         connection = GoogleCalendarConnectionFactory(
             workspace_integration=self.workspace_integration,
             provider_account_id="google-account",
@@ -745,8 +748,10 @@ class TestGoogleCalendarWorkItemTask:
             result = reconcile_google_calendar_connection.run(str(connection.id), command.generation)
 
         assert result == "active"
-        publish.assert_called_once()
-        assert publish.call_args.args[1:] == (str(connection.id),)
+        assert [call.args for call in publish.call_args_list] == [
+            (backfill_google_calendar_open_issues, str(connection.id)),
+            (backfill_google_calendar_cycles, str(connection.id)),
+        ]
 
     def test_workspace_disable_cleanup_removes_durable_event_correlations(self):
         client = _provider_client()
