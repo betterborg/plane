@@ -9,10 +9,11 @@ from django.db.models.signals import post_delete, post_save
 from django.dispatch import receiver
 
 from plane.bgtasks.google_calendar_task import (
+    resync_google_calendar_label,
     resync_google_calendar_state_issues,
     synchronize_google_calendar_issue,
 )
-from plane.db.models import Issue, IssueAssignee, IssueLabel, State
+from plane.db.models import Issue, IssueAssignee, IssueLabel, Label, State
 from plane.integrations.google_calendar.dispatch import enqueue_google_calendar_task_on_commit
 
 
@@ -66,3 +67,11 @@ def dispatch_google_calendar_state_model_signal(sender, instance, created, **kwa
 
     if not created:
         enqueue_google_calendar_task_on_commit(resync_google_calendar_state_issues, str(instance.id))
+
+
+@receiver(post_save, sender=Label, dispatch_uid="google_calendar_label_post_save")
+def dispatch_google_calendar_label_model_signal(sender, instance, created, **kwargs):
+    """Resync linked issues only when an existing Label definition is saved."""
+
+    if not created:
+        enqueue_google_calendar_task_on_commit(resync_google_calendar_label, str(instance.id))
