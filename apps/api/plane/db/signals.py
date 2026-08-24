@@ -9,6 +9,8 @@ from django.db.models.signals import post_delete, post_save
 from django.dispatch import receiver
 
 from plane.bgtasks.google_calendar_task import (
+    paced_google_calendar_cycle_sync_tasks,
+    paced_google_calendar_issue_sync_tasks,
     resync_google_calendar_label,
     resync_google_calendar_state_issues,
     synchronize_google_calendar_cycle,
@@ -55,23 +57,41 @@ def suppress_google_calendar_cycle_signal_dispatch():
 def dispatch_google_calendar_issue_sync(issue_id):
     """Enqueue convergence for one issue and its current cycle after commit."""
 
-    enqueue_google_calendar_task_on_commit(synchronize_google_calendar_issue, str(issue_id))
+    issue_tasks = list(paced_google_calendar_issue_sync_tasks([issue_id]))
+    if issue_tasks:
+        for sync_task, target_issue_id, connection_id in issue_tasks:
+            enqueue_google_calendar_task_on_commit(sync_task, target_issue_id, connection_id)
+    else:
+        enqueue_google_calendar_task_on_commit(synchronize_google_calendar_issue, str(issue_id))
     cycle_id = CycleIssue.objects.filter(issue_id=issue_id).values_list("cycle_id", flat=True).first()
     if cycle_id is not None:
-        dispatch_google_calendar_cycle_sync(cycle_id)
+        dispatch_google_calendar_cycle_sync(cycle_id, countdown=1)
 
 
-def dispatch_google_calendar_cycle_sync(cycle_id):
+def dispatch_google_calendar_cycle_sync(cycle_id, countdown=0):
     """Enqueue convergence for one cycle after the current transaction commits."""
 
-    enqueue_google_calendar_task_on_commit(synchronize_google_calendar_cycle, str(cycle_id))
+    cycle_tasks = list(paced_google_calendar_cycle_sync_tasks([cycle_id]))
+    if cycle_tasks:
+        for sync_task, target_cycle_id, connection_id in cycle_tasks:
+            sync_task = sync_task.set(countdown=countdown)
+            enqueue_google_calendar_task_on_commit(sync_task, target_cycle_id, connection_id)
+    else:
+        enqueue_google_calendar_task_on_commit(synchronize_google_calendar_cycle, str(cycle_id))
 
 
 def dispatch_google_calendar_cycle_syncs(cycle_ids):
     """Enqueue each affected cycle once after the current transaction commits."""
 
-    for cycle_id in dict.fromkeys(str(cycle_id) for cycle_id in cycle_ids):
-        dispatch_google_calendar_cycle_sync(cycle_id)
+    unique_cycle_ids = list(dict.fromkeys(str(cycle_id) for cycle_id in cycle_ids))
+    paced_tasks = list(paced_google_calendar_cycle_sync_tasks(unique_cycle_ids))
+    targeted_cycle_ids = set()
+    for sync_task, cycle_id, connection_id in paced_tasks:
+        targeted_cycle_ids.add(cycle_id)
+        enqueue_google_calendar_task_on_commit(sync_task, cycle_id, connection_id)
+    for cycle_id in unique_cycle_ids:
+        if cycle_id not in targeted_cycle_ids:
+            enqueue_google_calendar_task_on_commit(synchronize_google_calendar_cycle, cycle_id)
 
 
 def _google_calendar_issue_signal_dispatch_is_suppressed():

@@ -127,6 +127,33 @@ class TestGoogleCalendarClient:
             "syncToken": "sync-token",
         }
 
+    def test_incremental_inventory_repeats_sync_token_on_follow_up_pages(self):
+        response = Mock(status_code=200)
+        response.json.return_value = {
+            "items": [],
+            "nextSyncToken": "next-sync-token",
+        }
+        client = _client(
+            access_token="access-token",
+            token_expires_at=timezone.now() + timedelta(hours=1),
+        )
+
+        with patch("plane.integrations.google_calendar.client.requests.request", return_value=response) as request:
+            page = client.list_event_page(
+                "calendar",
+                page_token="next-page",
+                sync_token="sync-token",
+            )
+
+        assert page.next_sync_token == "next-sync-token"
+        assert request.call_args.kwargs["params"] == {
+            "maxResults": 250,
+            "showDeleted": True,
+            "singleEvents": True,
+            "pageToken": "next-page",
+            "syncToken": "sync-token",
+        }
+
     def test_expired_incremental_token_requires_full_inventory(self):
         response = Mock(status_code=410)
         client = _client(

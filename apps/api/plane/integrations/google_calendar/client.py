@@ -350,8 +350,6 @@ class GoogleCalendarClient:
     def list_event_page(self, calendar_id, *, page_token=None, sync_token=None, max_results=250):
         """Return one full or incremental inventory page without consuming its continuation."""
 
-        if page_token and sync_token:
-            raise GoogleCalendarClientError("Google Calendar inventory cannot combine page and sync tokens")
         params = {
             "maxResults": min(2500, max(1, int(max_results))),
             "showDeleted": True,
@@ -359,7 +357,7 @@ class GoogleCalendarClient:
         }
         if page_token:
             params["pageToken"] = page_token
-        elif sync_token:
+        if sync_token:
             params["syncToken"] = sync_token
         response = self._calendar_request("get", self._event_path(calendar_id), params=params)
         if response.status_code == 410 and sync_token:

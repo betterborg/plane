@@ -197,12 +197,44 @@ def _converge_provider_event(connection, entity_type, entity_id, payload, correl
             payload_hash,
             correlation,
         )
+    except GoogleCalendarEventAbsent:
+        return _request_event_calendar_replacement(connection)
     except GoogleCalendarCredentialMismatch:
         _mark_credential_mismatch(connection)
         return "credential_mismatch"
     except GoogleCalendarClientError as exc:
         _persist_refreshed_access_token(connection, client)
         return _GoogleCalendarProviderRetry(exc)
+
+
+def _request_event_calendar_replacement(connection):
+    """Move an active connection back through lifecycle validation after collection absence."""
+
+    if (
+        connection.desired_state != GoogleCalendarConnection.DesiredState.CONNECTED
+        or connection.status != GoogleCalendarConnection.Status.ACTIVE
+    ):
+        return "stale"
+    connection.status = GoogleCalendarConnection.Status.PENDING
+    connection.reconciliation_phase = ""
+    connection.reconciliation_cursor = ""
+    connection.reconciliation_lease_expires_at = None
+    connection.save(
+        update_fields=[
+            "status",
+            "reconciliation_phase",
+            "reconciliation_cursor",
+            "reconciliation_lease_expires_at",
+            "updated_at",
+        ]
+    )
+    lifecycle_task = current_app.signature(GOOGLE_CALENDAR_LIFECYCLE_TASK)
+    enqueue_google_calendar_task_on_commit(
+        lifecycle_task,
+        str(connection.id),
+        connection.lifecycle_generation,
+    )
+    return "replacement_pending"
 
 
 def _converge_provider_event_with_client(
@@ -438,12 +470,7 @@ def _connection_ids_for_issue(issue, connection_id=None):
     return sorted(set(eligible_connection_ids) | set(correlated_connection_ids), key=str)
 
 
-@shared_task(
-    autoretry_for=(GoogleCalendarClientError, GoogleCalendarOAuthConfigurationError),
-    retry_backoff=True,
-    retry_kwargs={"max_retries": 5},
-    rate_limit="120/m",
-)
+@shared_task
 def synchronize_google_calendar_issue(issue_id, connection_id=None):
     """Converge one work item for all relevant assignee connections."""
 
@@ -556,12 +583,65 @@ def _connection_ids_for_cycle(cycle, connection_id=None):
     return sorted(set(recipient_connection_ids) | set(correlated_connection_ids), key=str)
 
 
-@shared_task(
-    autoretry_for=(GoogleCalendarClientError, GoogleCalendarOAuthConfigurationError),
-    retry_backoff=True,
-    retry_kwargs={"max_retries": 5},
-    rate_limit="120/m",
-)
+def _connection_ids_for_issue_id(issue_id):
+    try:
+        issue = _issue_queryset().get(id=issue_id)
+    except Issue.DoesNotExist:
+        return list(
+            GoogleCalendarEvent.objects.filter(
+                entity_type=GoogleCalendarEvent.EntityType.WORK_ITEM,
+                entity_id=issue_id,
+            ).values_list("connection_id", flat=True)
+        )
+    return _connection_ids_for_issue(issue)
+
+
+def _connection_ids_for_cycle_id(cycle_id):
+    try:
+        cycle = _cycle_queryset().get(id=cycle_id)
+    except Cycle.DoesNotExist:
+        return list(
+            GoogleCalendarEvent.objects.filter(
+                entity_type=GoogleCalendarEvent.EntityType.CYCLE,
+                entity_id=cycle_id,
+            ).values_list("connection_id", flat=True)
+        )
+    return _connection_ids_for_cycle(cycle)
+
+
+def _paced_google_calendar_sync_tasks(entity_ids, task_name, connection_ids_for_entity):
+    """Build targeted tasks whose countdown advances independently for each connection."""
+
+    next_countdown_by_connection = {}
+    for entity_id in dict.fromkeys(entity_ids):
+        for connection_id in connection_ids_for_entity(entity_id):
+            countdown = next_countdown_by_connection.get(connection_id, 0)
+            task = current_app.signature(task_name).set(countdown=countdown)
+            yield task, str(entity_id), str(connection_id)
+            next_countdown_by_connection[connection_id] = countdown + 1
+
+
+def paced_google_calendar_issue_sync_tasks(issue_ids):
+    """Build a bounded issue fan-out with one independent sequence per connection."""
+
+    return _paced_google_calendar_sync_tasks(
+        issue_ids,
+        GOOGLE_CALENDAR_ISSUE_SYNC_TASK,
+        _connection_ids_for_issue_id,
+    )
+
+
+def paced_google_calendar_cycle_sync_tasks(cycle_ids):
+    """Build a bounded cycle fan-out with one independent sequence per connection."""
+
+    return _paced_google_calendar_sync_tasks(
+        cycle_ids,
+        GOOGLE_CALENDAR_CYCLE_SYNC_TASK,
+        _connection_ids_for_cycle_id,
+    )
+
+
+@shared_task
 def synchronize_google_calendar_cycle(cycle_id, connection_id=None):
     """Converge one cycle block for every current or previously correlated recipient."""
 
@@ -736,9 +816,8 @@ def resync_google_calendar_project_issues(project_id, after_id=None, batch_size=
     issue_ids = list(issue_ids.values_list("id", flat=True)[: int(batch_size) + 1])
     current_batch = issue_ids[: int(batch_size)]
 
-    for index, issue_id in enumerate(current_batch):
-        sync_task = current_app.signature(GOOGLE_CALENDAR_ISSUE_SYNC_TASK).set(countdown=index)
-        publish_google_calendar_task(sync_task, str(issue_id))
+    for sync_task, issue_id, connection_id in paced_google_calendar_issue_sync_tasks(current_batch):
+        publish_google_calendar_task(sync_task, issue_id, connection_id)
 
     if len(issue_ids) > len(current_batch) and current_batch:
         continuation = current_app.signature(GOOGLE_CALENDAR_PROJECT_ISSUE_RESYNC_TASK).set(
@@ -773,9 +852,8 @@ def resync_google_calendar_project_cycles(project_id, after_id=None, batch_size=
     cycle_ids = list(cycle_ids.values_list("id", flat=True)[: int(batch_size) + 1])
     current_batch = cycle_ids[: int(batch_size)]
 
-    for index, cycle_id in enumerate(current_batch):
-        sync_task = current_app.signature(GOOGLE_CALENDAR_CYCLE_SYNC_TASK).set(countdown=index)
-        publish_google_calendar_task(sync_task, str(cycle_id))
+    for sync_task, cycle_id, connection_id in paced_google_calendar_cycle_sync_tasks(current_batch):
+        publish_google_calendar_task(sync_task, cycle_id, connection_id)
 
     if len(cycle_ids) > len(current_batch) and current_batch:
         continuation = current_app.signature(GOOGLE_CALENDAR_PROJECT_CYCLE_RESYNC_TASK).set(
@@ -894,9 +972,8 @@ def resync_google_calendar_workspace_issues(
     current_batch = issue_ids[: int(batch_size)]
 
     try:
-        for index, issue_id in enumerate(current_batch):
-            sync_task = current_app.signature(GOOGLE_CALENDAR_ISSUE_SYNC_TASK).set(countdown=index)
-            publish_google_calendar_task(sync_task, str(issue_id))
+        for sync_task, issue_id, connection_id in paced_google_calendar_issue_sync_tasks(current_batch):
+            publish_google_calendar_task(sync_task, issue_id, connection_id)
 
         if len(issue_ids) > len(current_batch) and current_batch:
             next_batch = current_app.signature(GOOGLE_CALENDAR_WORKSPACE_ISSUE_RESYNC_TASK).set(
@@ -947,9 +1024,8 @@ def resync_google_calendar_workspace_cycles(
     current_batch = cycle_ids[: int(batch_size)]
 
     try:
-        for index, cycle_id in enumerate(current_batch):
-            sync_task = current_app.signature(GOOGLE_CALENDAR_CYCLE_SYNC_TASK).set(countdown=index)
-            publish_google_calendar_task(sync_task, str(cycle_id))
+        for sync_task, cycle_id, connection_id in paced_google_calendar_cycle_sync_tasks(current_batch):
+            publish_google_calendar_task(sync_task, cycle_id, connection_id)
 
         if len(cycle_ids) > len(current_batch) and current_batch:
             next_batch = current_app.signature(GOOGLE_CALENDAR_WORKSPACE_CYCLE_RESYNC_TASK).set(
@@ -1281,8 +1357,10 @@ def _expire_inventory_sync_token(connection_id, run_id):
     return True
 
 
-def _publish_reconciliation_continuation(connection_id, run_id):
+def _publish_reconciliation_continuation(connection_id, run_id, countdown=None):
     continuation = current_app.signature(GOOGLE_CALENDAR_INVENTORY_TASK)
+    if countdown is not None:
+        continuation = continuation.set(countdown=countdown)
     publish_google_calendar_task(continuation, str(connection_id), str(run_id))
 
 
@@ -1418,12 +1496,7 @@ def _finish_reconciliation(connection_id, run_id):
     return _complete_reconciliation_run(connection, state)
 
 
-@shared_task(
-    autoretry_for=(GoogleCalendarClientError, GoogleCalendarOAuthConfigurationError),
-    retry_backoff=True,
-    retry_jitter=True,
-    retry_kwargs={"max_retries": 5},
-)
+@shared_task
 def reconcile_google_calendar_inventory(connection_id, run_id=None, force_local_scan=False):
     """Reconcile one connection within five provider pages or one 1,000-row local page."""
 
@@ -1444,7 +1517,7 @@ def reconcile_google_calendar_inventory(connection_id, run_id=None, force_local_
                 page = client.list_event_page(
                     connection.calendar_id,
                     page_token=connection.page_token or None,
-                    sync_token=(connection.sync_token or None) if not connection.page_token else None,
+                    sync_token=connection.sync_token or None,
                 )
             except GoogleCalendarSyncTokenExpired:
                 if not _expire_inventory_sync_token(connection.id, run_id):
@@ -1484,7 +1557,7 @@ def reconcile_google_calendar_inventory(connection_id, run_id=None, force_local_
             return "stale"
         if not _release_reconciliation_lease(connection.id, run_id):
             return "stale"
-        _publish_reconciliation_continuation(connection.id, run_id)
+        _publish_reconciliation_continuation(connection.id, run_id, countdown=len(correlations))
         return "continued"
     return _finish_reconciliation(connection.id, run_id)
 
