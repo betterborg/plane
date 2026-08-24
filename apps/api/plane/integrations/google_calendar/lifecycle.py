@@ -12,6 +12,7 @@ from django.db.transaction import TransactionManagementError
 from django.utils import timezone
 
 from plane.db.models import GoogleCalendarConnection
+from plane.integrations.google_calendar.contracts import has_google_calendar_provider_state
 
 
 class GoogleCalendarLifecycleError(Exception):
@@ -282,30 +283,12 @@ def _clear_provider_grant(connection):
     connection.credential_fingerprint = ""
 
 
-def _has_google_calendar_provider_state(connection):
-    return any(
-        (
-            connection.provider_account_id,
-            connection.provider_email,
-            connection.calendar_id,
-            connection.calendar_operation_id,
-            connection.access_token,
-            connection.refresh_token,
-            connection.sync_token,
-            connection.page_token,
-            connection.token_expires_at,
-            connection.scopes,
-            connection.credential_fingerprint,
-        )
-    )
-
-
 def _request_google_calendar_disconnect_locked(calendar_connection, expected_generation):
     _assert_generation(calendar_connection, expected_generation)
     if (
         calendar_connection.desired_state == GoogleCalendarConnection.DesiredState.DISCONNECTED
         and calendar_connection.status == GoogleCalendarConnection.Status.DISCONNECTED
-        and not _has_google_calendar_provider_state(calendar_connection)
+        and not has_google_calendar_provider_state(calendar_connection)
     ):
         clear_google_calendar_oauth_attempt(calendar_connection)
         calendar_connection.retain_grant_after_cleanup = False
@@ -545,7 +528,7 @@ def request_google_calendar_workspace_teardown(workspace_id):
 
     commands = []
     for calendar_connection in lock_google_calendar_workspace_cleanup_connections(workspace_id):
-        if _has_google_calendar_provider_state(calendar_connection):
+        if has_google_calendar_provider_state(calendar_connection):
             command = _request_google_calendar_disconnect_locked(
                 calendar_connection,
                 calendar_connection.lifecycle_generation,

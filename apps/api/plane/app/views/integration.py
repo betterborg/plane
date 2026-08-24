@@ -2,7 +2,6 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # See the LICENSE file for details.
 
-import hmac
 import logging
 
 from celery import current_app
@@ -42,6 +41,10 @@ from plane.integrations.google_calendar.dispatch import (
     enqueue_google_calendar_task_on_commit,
     enqueue_google_calendar_workspace_policy_resyncs_on_commit,
 )
+from plane.integrations.google_calendar.contracts import (
+    has_google_calendar_provider_state,
+    is_google_calendar_reconciliation_overdue,
+)
 from plane.integrations.google_calendar.lifecycle import (
     GoogleCalendarDisableCleanupInProgress,
     lock_google_calendar_connection,
@@ -60,12 +63,11 @@ from plane.integrations.google_calendar.telemetry import (
     publish_google_calendar_analytics,
 )
 from plane.license.api.permissions import InstanceAdminPermission
-from plane.license.utils.google_calendar_credentials import google_calendar_credential_fingerprint
+from plane.license.utils.google_calendar_credentials import google_calendar_credential_binding_matches
 from plane.utils.analytics_events import GOOGLE_CALENDAR_ADOPTED
 
 
 logger = logging.getLogger(__name__)
-GOOGLE_CALENDAR_READINESS_OVERDUE_SECONDS = 18 * 60 * 60
 
 
 def _has_complete_google_calendar_credentials():
@@ -86,29 +88,13 @@ def _google_calendar_release_readiness(at=None):
         credentials = None
 
     connections = GoogleCalendarConnection.all_objects.all()
-    provider_connections = connections.filter(
-        Q(provider_account_id__gt="")
-        | Q(provider_email__gt="")
-        | Q(calendar_id__gt="")
-        | Q(calendar_operation_id__isnull=False)
-        | Q(access_token__gt="")
-        | Q(refresh_token__gt="")
-        | Q(sync_token__gt="")
-        | Q(page_token__gt="")
-        | Q(token_expires_at__isnull=False)
-        | ~Q(scopes=[])
-        | Q(credential_fingerprint__gt="")
-    )
-    binding_fingerprints = list(provider_connections.values_list("credential_fingerprint", flat=True))
+    provider_connections = [connection for connection in connections if has_google_calendar_provider_state(connection)]
+    binding_fingerprints = [connection.credential_fingerprint for connection in provider_connections]
     if credentials is None:
         credential_mismatch_count = len(binding_fingerprints)
     else:
-        effective_fingerprint = google_calendar_credential_fingerprint(
-            credentials.client_id,
-            credentials.client_secret,
-        )
         credential_mismatch_count = sum(
-            not fingerprint or not hmac.compare_digest(fingerprint, effective_fingerprint)
+            not google_calendar_credential_binding_matches(fingerprint, credentials)
             for fingerprint in binding_fingerprints
         )
 
@@ -138,9 +124,7 @@ def _google_calendar_release_readiness(at=None):
     ]
     completion_ages = [max(0, int((at - completed_at).total_seconds())) for completed_at in completed_times]
     overdue_count = sum(
-        not calendar_id
-        or completed_at is None
-        or (at - completed_at).total_seconds() >= GOOGLE_CALENDAR_READINESS_OVERDUE_SECONDS
+        not calendar_id or is_google_calendar_reconciliation_overdue(completed_at, at)
         for calendar_id, completed_at in required_verification_states
     )
 

@@ -41,6 +41,7 @@ from plane.integrations.google_calendar.client import (
     GoogleCalendarInvalidGrant,
     GoogleCalendarSyncTokenExpired,
 )
+from plane.integrations.google_calendar.contracts import is_google_calendar_reconciliation_overdue
 from plane.integrations.google_calendar.dispatch import (
     GOOGLE_CALENDAR_CYCLE_BACKFILL_TASK,
     GOOGLE_CALENDAR_CYCLE_SYNC_TASK,
@@ -105,7 +106,6 @@ GOOGLE_CALENDAR_RECONCILIATION_LOCAL_PAGE_SIZE = 1000
 GOOGLE_CALENDAR_RECONCILIATION_PROVIDER_PHASE = "provider_inventory"
 GOOGLE_CALENDAR_RECONCILIATION_LOCAL_PHASE = "local_scan"
 GOOGLE_CALENDAR_HEALTHY_RECONCILIATION_INTERVAL = timedelta(hours=6)
-GOOGLE_CALENDAR_HEALTHY_RECONCILIATION_OVERDUE = timedelta(hours=18)
 GOOGLE_CALENDAR_SCHEDULER_LEASE = timedelta(hours=2)
 GOOGLE_CALENDAR_RECONCILIATION_MAX_STAGGER_SECONDS = 30 * 60
 GOOGLE_CALENDAR_OAUTH_ATTEMPT_EXPIRY_PAGE_SIZE = 100
@@ -531,10 +531,7 @@ def schedule_google_calendar_reconciliations():
         if claim is None:
             continue
         connection, lease_expires_at = claim
-        overdue = (
-            connection.reconciliation_completed_at is None
-            or connection.reconciliation_completed_at <= at - GOOGLE_CALENDAR_HEALTHY_RECONCILIATION_OVERDUE
-        )
+        overdue = is_google_calendar_reconciliation_overdue(connection.reconciliation_completed_at, at)
         countdown = 0 if overdue else _healthy_reconciliation_countdown(connection.id)
         inventory_task = current_app.signature(GOOGLE_CALENDAR_INVENTORY_TASK).set(countdown=countdown)
         publish_started_at = time.monotonic()
@@ -2337,6 +2334,7 @@ def _advance_local_scan(connection_id, run_id, lease_token):
         "local_inventory",
         outcome="page_selected",
         attempt=1,
+        google_status_class="not_requested",
         inventory_mode="local",
         provider_page_count=0,
         local_candidate_count=len(current_page),

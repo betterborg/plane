@@ -1095,7 +1095,7 @@ class TestGoogleCalendarReconciliationTask:
             "sync_token": "current-sync-token",
         }
 
-    def test_local_scan_uses_bounded_keyset_pages_without_overlapping_pacing_windows(self):
+    def test_local_scan_uses_bounded_keyset_pages_without_overlapping_pacing_windows(self, caplog):
         run_id = str(uuid4())
         connection = GoogleCalendarConnectionFactory(
             active=True,
@@ -1128,7 +1128,10 @@ class TestGoogleCalendarReconciliationTask:
             ]
         )
 
-        with patch("plane.bgtasks.google_calendar_task.publish_google_calendar_task") as publish:
+        with (
+            caplog.at_level(logging.INFO, logger="plane.worker"),
+            patch("plane.bgtasks.google_calendar_task.publish_google_calendar_task") as publish,
+        ):
             assert reconcile_google_calendar_inventory.run(str(connection.id), run_id) == "continued"
 
             first_page_calls = publish.call_args_list
@@ -1146,6 +1149,24 @@ class TestGoogleCalendarReconciliationTask:
 
         assert publish.call_count == 1
         assert publish.call_args.args[0].task == GOOGLE_CALENDAR_ISSUE_SYNC_TASK
+        local_inventory_records = [
+            record for record in caplog.records if getattr(record, "operation", None) == "local_inventory"
+        ]
+        assert len(local_inventory_records) == 2
+        assert [record.local_candidate_count for record in local_inventory_records] == [1000, 1]
+        assert [record.reconciliation_action for record in local_inventory_records] == [
+            "continue_local_scan",
+            "complete_local_scan",
+        ]
+        for record in local_inventory_records:
+            assert record.workspace_id == str(connection.workspace_integration.workspace_id)
+            assert record.connection_id == str(connection.id)
+            assert record.outcome == "page_selected"
+            assert record.attempt == 1
+            assert record.google_status_class == "not_requested"
+            assert record.inventory_mode == "local"
+            assert record.provider_page_count == 0
+            assert record.calendar_generation == connection.calendar_generation
         connection.refresh_from_db()
         assert connection.reconciliation_phase == ""
         assert connection.reconciliation_completed_at is not None
