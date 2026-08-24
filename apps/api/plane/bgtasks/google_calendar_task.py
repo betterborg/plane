@@ -151,7 +151,7 @@ def _release_scheduler_lease(connection_id, lease_expires_at):
     ).update(reconciliation_lease_expires_at=None)
 
 
-def _present_recovery_candidates(at):
+def _present_recovery_candidates():
     active_membership = WorkspaceMember.objects.filter(
         workspace_id=OuterRef("workspace_integration__workspace_id"),
         member_id=OuterRef("member_id"),
@@ -170,11 +170,11 @@ def _present_recovery_candidates(at):
         .filter(has_active_membership=True)
         .order_by("id")
     )
-    return (connection for connection in candidates.iterator() if has_usable_google_calendar_grant(connection, at=at))
+    return (connection for connection in candidates.iterator() if has_usable_google_calendar_grant(connection))
 
 
 @transaction.atomic
-def _claim_present_recovery(connection_id, at):
+def _claim_present_recovery(connection_id):
     try:
         connection = lock_google_calendar_connection(connection_id)
     except GoogleCalendarConnection.DoesNotExist:
@@ -191,7 +191,7 @@ def _claim_present_recovery(connection_id, at):
             is_active=True,
             deleted_at__isnull=True,
         ).exists()
-        or not has_usable_google_calendar_grant(connection, at=at)
+        or not has_usable_google_calendar_grant(connection)
     ):
         return None
     return connection.lifecycle_generation
@@ -238,8 +238,8 @@ def schedule_google_calendar_reconciliations():
             continue
         published += 1
 
-    for candidate in _present_recovery_candidates(at):
-        generation = _claim_present_recovery(candidate.id, at)
+    for candidate in _present_recovery_candidates():
+        generation = _claim_present_recovery(candidate.id)
         if generation is None:
             continue
         lifecycle_task = current_app.signature(GOOGLE_CALENDAR_LIFECYCLE_TASK)

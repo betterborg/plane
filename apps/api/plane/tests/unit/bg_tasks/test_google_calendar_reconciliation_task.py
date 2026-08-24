@@ -306,33 +306,34 @@ class TestScheduleGoogleCalendarReconciliations:
         }
         assert not excluded_ids.intersection(call.args[1] for call in publish.call_args_list)
 
-    @freeze_time("2026-08-24 12:00:00")
     def test_present_recovery_rechecks_the_grant_under_the_connection_lock(self):
-        workspace_integration = _enabled_calendar_integration()
-        connection = GoogleCalendarConnectionFactory(
-            workspace_integration=workspace_integration,
-            provider_account_id="google-account",
-            refresh_token="refresh-token",
-            desired_state=GoogleCalendarConnection.DesiredState.CONNECTED,
-            status=GoogleCalendarConnection.Status.PENDING,
-            lifecycle_generation=5,
-        )
-        WorkspaceMemberFactory(
-            workspace=workspace_integration.workspace,
-            member=connection.member,
-        )
+        with freeze_time("2026-08-24 12:00:00") as frozen_time:
+            workspace_integration = _enabled_calendar_integration()
+            connection = GoogleCalendarConnectionFactory(
+                workspace_integration=workspace_integration,
+                provider_account_id="google-account",
+                refresh_token="",
+                access_token="access-token",
+                token_expires_at=timezone.now() + timedelta(minutes=1),
+                desired_state=GoogleCalendarConnection.DesiredState.CONNECTED,
+                status=GoogleCalendarConnection.Status.PENDING,
+                lifecycle_generation=5,
+            )
+            WorkspaceMemberFactory(
+                workspace=workspace_integration.workspace,
+                member=connection.member,
+            )
 
-        with (
-            patch("plane.integrations.google_calendar.lifecycle._acquire_advisory_xact_lock"),
-            patch(
-                "plane.bgtasks.google_calendar_task.has_usable_google_calendar_grant",
-                side_effect=[True, False],
-            ) as has_usable_grant,
-            patch("plane.bgtasks.google_calendar_task.publish_google_calendar_task") as publish,
-        ):
-            assert schedule_google_calendar_reconciliations.run() == 0
+            with (
+                patch(
+                    "plane.integrations.google_calendar.lifecycle._acquire_advisory_xact_lock",
+                    side_effect=lambda _lock_key: frozen_time.tick(delta=timedelta(minutes=2)),
+                ) as acquire_lock,
+                patch("plane.bgtasks.google_calendar_task.publish_google_calendar_task") as publish,
+            ):
+                assert schedule_google_calendar_reconciliations.run() == 0
 
-        assert has_usable_grant.call_count == 2
+        assert acquire_lock.call_count == 2
         publish.assert_not_called()
 
 
