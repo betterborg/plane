@@ -254,6 +254,23 @@ class TestGoogleCalendarClient:
 
         assert "secret" not in str(error.value)
 
+    def test_tokenless_revoke_still_validates_the_credential_binding(self):
+        client = GoogleCalendarClient(
+            credential_fingerprint=google_calendar_credential_fingerprint("original-id", "original-secret")
+        )
+
+        with (
+            patch(
+                "plane.integrations.google_calendar.client.get_google_calendar_oauth_credentials",
+                return_value=GoogleCalendarOAuthCredentials("changed-id", "changed-secret"),
+            ),
+            patch("plane.integrations.google_calendar.client.requests.post") as post,
+            pytest.raises(GoogleCalendarCredentialMismatch),
+        ):
+            client.revoke_grant()
+
+        post.assert_not_called()
+
     def test_expired_access_token_is_refreshed_before_calendar_creation(self):
         refresh_response = Mock(status_code=200)
         refresh_response.json.return_value = {"access_token": "fresh-access-token", "expires_in": 3600}

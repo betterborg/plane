@@ -113,6 +113,13 @@ def _mark_credential_mismatch(connection):
     connection.save(update_fields=update_fields)
 
 
+class _GoogleCalendarProviderRetry:
+    """Carry a provider failure through a transaction so refreshed tokens can commit."""
+
+    def __init__(self, error):
+        self.error = error
+
+
 def _issue_queryset():
     return Issue.all_objects.select_related("workspace", "project", "state")
 
@@ -146,6 +153,9 @@ def _delete_provider_event(connection, correlation):
         except GoogleCalendarCredentialMismatch:
             _mark_credential_mismatch(connection)
             return False
+        except GoogleCalendarClientError as exc:
+            _persist_refreshed_access_token(connection, client)
+            return _GoogleCalendarProviderRetry(exc)
         _persist_refreshed_access_token(connection, client)
     correlation.delete(soft=False)
     return True
@@ -170,6 +180,9 @@ def _converge_provider_event(connection, entity_type, entity_id, payload, correl
     except GoogleCalendarCredentialMismatch:
         _mark_credential_mismatch(connection)
         return "credential_mismatch"
+    except GoogleCalendarClientError as exc:
+        _persist_refreshed_access_token(connection, client)
+        return _GoogleCalendarProviderRetry(exc)
 
 
 def _converge_provider_event_with_client(
@@ -234,7 +247,7 @@ def _converge_provider_event_with_client(
 
 
 @transaction.atomic
-def _synchronize_issue_for_connection(issue_id, connection_id):
+def _synchronize_issue_for_connection_transaction(issue_id, connection_id):
     try:
         connection = (
             GoogleCalendarConnection.objects.select_for_update()
@@ -254,7 +267,10 @@ def _synchronize_issue_for_connection(issue_id, connection_id):
     except Issue.DoesNotExist:
         if correlation is None:
             return "missing"
-        if not _delete_provider_event(connection, correlation):
+        delete_result = _delete_provider_event(connection, correlation)
+        if isinstance(delete_result, _GoogleCalendarProviderRetry):
+            return delete_result
+        if not delete_result:
             return "credential_mismatch"
         return "deleted"
 
@@ -264,7 +280,10 @@ def _synchronize_issue_for_connection(issue_id, connection_id):
     if not eligible or (terminal and not update_terminal):
         if correlation is None:
             return "ineligible"
-        if not _delete_provider_event(connection, correlation):
+        delete_result = _delete_provider_event(connection, correlation)
+        if isinstance(delete_result, _GoogleCalendarProviderRetry):
+            return delete_result
+        if not delete_result:
             return "credential_mismatch"
         return "deleted"
 
@@ -276,6 +295,13 @@ def _synchronize_issue_for_connection(issue_id, connection_id):
         payload,
         correlation,
     )
+
+
+def _synchronize_issue_for_connection(issue_id, connection_id):
+    result = _synchronize_issue_for_connection_transaction(issue_id, connection_id)
+    if isinstance(result, _GoogleCalendarProviderRetry):
+        raise result.error
+    return result
 
 
 def _connection_ids_for_issue(issue, connection_id=None):
@@ -327,7 +353,7 @@ def synchronize_google_calendar_issue(issue_id, connection_id=None):
 
 
 @transaction.atomic
-def _synchronize_cycle_for_connection(cycle_id, connection_id):
+def _synchronize_cycle_for_connection_transaction(cycle_id, connection_id):
     try:
         connection = (
             GoogleCalendarConnection.objects.select_for_update()
@@ -347,7 +373,10 @@ def _synchronize_cycle_for_connection(cycle_id, connection_id):
     except Cycle.DoesNotExist:
         if correlation is None:
             return "missing"
-        if not _delete_provider_event(connection, correlation):
+        delete_result = _delete_provider_event(connection, correlation)
+        if isinstance(delete_result, _GoogleCalendarProviderRetry):
+            return delete_result
+        if not delete_result:
             return "credential_mismatch"
         return "deleted"
 
@@ -371,7 +400,10 @@ def _synchronize_cycle_for_connection(cycle_id, connection_id):
     if not creatable:
         if correlation is None:
             return "ineligible"
-        if not _delete_provider_event(connection, correlation):
+        delete_result = _delete_provider_event(connection, correlation)
+        if isinstance(delete_result, _GoogleCalendarProviderRetry):
+            return delete_result
+        if not delete_result:
             return "credential_mismatch"
         return "deleted"
 
@@ -383,6 +415,13 @@ def _synchronize_cycle_for_connection(cycle_id, connection_id):
         payload,
         correlation,
     )
+
+
+def _synchronize_cycle_for_connection(cycle_id, connection_id):
+    result = _synchronize_cycle_for_connection_transaction(cycle_id, connection_id)
+    if isinstance(result, _GoogleCalendarProviderRetry):
+        raise result.error
+    return result
 
 
 def _connection_ids_for_cycle(cycle, connection_id=None):
@@ -1030,11 +1069,11 @@ def _delete_absent_calendar(connection, generation):
     connection.workspace_integration = WorkspaceIntegration.objects.select_for_update().get(
         id=connection.workspace_integration_id
     )
-    if not connection.calendar_id and connection.calendar_operation_id is None:
-        return "ready"
-
     client = _client_for(connection)
     try:
+        client.validate_credentials()
+        if not connection.calendar_id and connection.calendar_operation_id is None:
+            return "ready"
         if not connection.calendar_id and connection.calendar_operation_id is not None:
             connection.calendar_id = client.find_calendar(connection.calendar_operation_id) or ""
         if connection.calendar_id:
@@ -1086,11 +1125,22 @@ def _complete_absent(connection, generation):
     if connection.calendar_id or connection.calendar_operation_id is not None:
         return "pending"
 
+    client = _client_for(connection)
+    try:
+        client.validate_credentials()
+    except GoogleCalendarCredentialMismatch:
+        return _record_cleanup_error(
+            connection,
+            generation,
+            GoogleCalendarCredentialMismatch.classification,
+        )
+    except (GoogleCalendarClientError, GoogleCalendarOAuthConfigurationError) as exc:
+        return _record_cleanup_error(connection, generation, exc)
+
     GoogleCalendarEvent.objects.filter(connection=connection).delete(soft=False)
 
     retain_grant = connection.retain_grant_after_cleanup
     if not retain_grant and not _account_has_other_token_bearing_connection(connection):
-        client = _client_for(connection)
         try:
             client.revoke_grant()
         except GoogleCalendarCredentialMismatch:

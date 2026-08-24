@@ -12,7 +12,11 @@ import pytest
 from django.db import close_old_connections, transaction
 from django.utils import timezone
 
-from plane.bgtasks.google_calendar_task import _converge_provider_event, reconcile_google_calendar_connection
+from plane.bgtasks.google_calendar_task import (
+    _complete_absent,
+    _converge_provider_event,
+    reconcile_google_calendar_connection,
+)
 from plane.db.models import GoogleCalendarConnection, GoogleCalendarEvent
 from plane.integrations.google_calendar.client import GoogleCalendarClientError
 from plane.integrations.google_calendar.lifecycle import (
@@ -160,6 +164,81 @@ class TestGoogleCalendarConvergenceTask:
         assert connection.last_error == ""
         request.assert_called_once()
         post.assert_called_once()
+
+    def test_calendarless_cleanup_validates_credentials_before_completing(self):
+        connection = GoogleCalendarConnectionFactory(
+            provider_account_id="google-account",
+            refresh_token="refresh-token",
+            credential_fingerprint=google_calendar_credential_fingerprint("original-id", "original-secret"),
+            desired_state=GoogleCalendarConnection.DesiredState.DISCONNECTED,
+            status=GoogleCalendarConnection.Status.CLEANUP_PENDING,
+            lifecycle_generation=4,
+            retain_grant_after_cleanup=True,
+        )
+
+        with (
+            patch("plane.integrations.google_calendar.lifecycle._acquire_advisory_xact_lock"),
+            patch(
+                "plane.integrations.google_calendar.client.get_google_calendar_oauth_credentials",
+                return_value=GoogleCalendarOAuthCredentials("changed-id", "changed-secret"),
+            ),
+            patch("plane.integrations.google_calendar.client.requests.post") as post,
+            patch("plane.integrations.google_calendar.client.requests.request") as request,
+        ):
+            result = reconcile_google_calendar_connection(str(connection.id), 4)
+
+        connection.refresh_from_db()
+        assert result == "error"
+        assert connection.status == GoogleCalendarConnection.Status.CLEANUP_PENDING
+        assert connection.refresh_token == "refresh-token"
+        assert connection.last_error == "oauth_credentials_changed"
+        post.assert_not_called()
+        request.assert_not_called()
+
+    @pytest.mark.parametrize("retain_grant", [True, False], ids=["retained-grant", "shared-account"])
+    def test_cleanup_completion_validates_credentials_before_skipping_revocation(self, retain_grant):
+        connection = GoogleCalendarConnectionFactory(
+            provider_account_id="shared-google-account",
+            refresh_token="refresh-token",
+            credential_fingerprint=google_calendar_credential_fingerprint("original-id", "original-secret"),
+            desired_state=GoogleCalendarConnection.DesiredState.DISCONNECTED,
+            status=GoogleCalendarConnection.Status.CLEANUP_PENDING,
+            lifecycle_generation=4,
+            retain_grant_after_cleanup=retain_grant,
+        )
+        if not retain_grant:
+            GoogleCalendarConnectionFactory(
+                provider_account_id="shared-google-account",
+                refresh_token="other-refresh-token",
+            )
+        correlation = GoogleCalendarEvent.objects.create(
+            connection=connection,
+            entity_type=GoogleCalendarEvent.EntityType.WORK_ITEM,
+            entity_id=uuid4(),
+            google_event_id="event-id",
+            payload_hash="payload-hash",
+            calendar_generation=1,
+            last_synced_at=timezone.now(),
+        )
+
+        with (
+            patch("plane.integrations.google_calendar.lifecycle._acquire_advisory_xact_lock"),
+            patch(
+                "plane.integrations.google_calendar.client.get_google_calendar_oauth_credentials",
+                return_value=GoogleCalendarOAuthCredentials("changed-id", "changed-secret"),
+            ),
+            patch("plane.integrations.google_calendar.client.requests.post") as post,
+            patch("plane.integrations.google_calendar.client.requests.request") as request,
+        ):
+            result = _complete_absent(connection, 4)
+
+        connection.refresh_from_db()
+        assert result == "error"
+        assert connection.status == GoogleCalendarConnection.Status.CLEANUP_PENDING
+        assert connection.last_error == "oauth_credentials_changed"
+        assert GoogleCalendarEvent.objects.filter(id=correlation.id).exists()
+        post.assert_not_called()
+        request.assert_not_called()
 
     def test_event_write_mismatch_marks_active_connection_broken_without_provider_http(self):
         connection = GoogleCalendarConnectionFactory(
@@ -434,8 +513,10 @@ class TestGoogleCalendarConvergenceTask:
 
         connection.refresh_from_db()
         assert result == "disconnected"
-        assert client.method_calls[:2] == [
+        assert client.method_calls == [
+            call.validate_credentials(),
             call.delete_calendar("old-plane-calendar"),
+            call.validate_credentials(),
             call.revoke_grant(),
         ]
         assert connection.calendar_id == ""

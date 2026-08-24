@@ -325,10 +325,10 @@ class GoogleCalendarClient:
     def revoke_grant(self):
         """Revoke this connection's refresh grant, treating an absent grant as converged."""
 
+        self._validated_credentials()
         token = self._refresh_token or self._access_token
         if not token:
             return
-        self._validated_credentials()
         try:
             response = requests.post(
                 GOOGLE_CALENDAR_REVOCATION_URL,

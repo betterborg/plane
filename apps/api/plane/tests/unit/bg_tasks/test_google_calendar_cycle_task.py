@@ -9,6 +9,7 @@ import pytest
 from django.utils import timezone
 
 from plane.bgtasks.google_calendar_task import (
+    _synchronize_cycle_for_connection,
     backfill_google_calendar_cycles,
     backfill_google_calendar_open_issues,
     reconcile_google_calendar_connection,
@@ -19,6 +20,7 @@ from plane.bgtasks.google_calendar_task import (
     synchronize_google_calendar_cycle,
 )
 from plane.db.models import GoogleCalendarConnection, GoogleCalendarEvent, IssueAssignee
+from plane.integrations.google_calendar.client import GoogleCalendarAccessToken, GoogleCalendarProviderError
 from plane.integrations.google_calendar.dispatch import (
     GOOGLE_CALENDAR_CYCLE_SYNC_TASK,
     GOOGLE_CALENDAR_PROJECT_CYCLE_RESYNC_TASK,
@@ -88,6 +90,32 @@ class TestGoogleCalendarCycleTask:
             == 2
         )
         assert client.insert_event.call_count == 2
+
+    def test_provider_retry_commits_a_refreshed_access_token(self):
+        refreshed_token = GoogleCalendarAccessToken(
+            "fresh-access-token",
+            timezone.now() + timedelta(hours=1),
+        )
+        failed_client = _provider_client()
+        failed_client.access_token = refreshed_token
+        failed_client.insert_event.side_effect = GoogleCalendarProviderError("provider unavailable")
+
+        with (
+            patch("plane.bgtasks.google_calendar_task.GoogleCalendarClient", return_value=failed_client),
+            pytest.raises(GoogleCalendarProviderError),
+        ):
+            _synchronize_cycle_for_connection(self.cycle.id, self.connection.id)
+
+        self.connection.refresh_from_db()
+        assert self.connection.access_token == "fresh-access-token"
+        assert not GoogleCalendarEvent.objects.filter(connection=self.connection, entity_id=self.cycle.id).exists()
+
+        retry_client = _provider_client()
+        retry_client.access_token = refreshed_token
+        with patch("plane.bgtasks.google_calendar_task.GoogleCalendarClient", return_value=retry_client):
+            result = _synchronize_cycle_for_connection(self.cycle.id, self.connection.id)
+
+        assert result == "created"
 
     def test_recipient_removal_archive_and_deletion_remove_marked_blocks(self):
         client = _provider_client()

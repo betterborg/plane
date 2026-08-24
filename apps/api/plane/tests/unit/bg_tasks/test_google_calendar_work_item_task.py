@@ -9,6 +9,7 @@ from unittest.mock import Mock, patch
 from uuid import uuid4
 
 import pytest
+import requests
 from celery.exceptions import Retry
 from django.db import close_old_connections
 from django.utils import timezone
@@ -28,7 +29,11 @@ from plane.bgtasks.google_calendar_task import (
 )
 from plane.celery import app as celery_app
 from plane.db.models import GoogleCalendarEvent, IssueLabel, Label
-from plane.integrations.google_calendar.client import GoogleCalendarClient, GoogleCalendarClientConflict
+from plane.integrations.google_calendar.client import (
+    GoogleCalendarClient,
+    GoogleCalendarClientConflict,
+    GoogleCalendarProviderError,
+)
 from plane.integrations.google_calendar.dispatch import (
     GOOGLE_CALENDAR_ISSUE_SYNC_TASK,
     GOOGLE_CALENDAR_LABEL_ISSUE_RESYNC_TASK,
@@ -127,6 +132,73 @@ class TestGoogleCalendarWorkItemTask:
         assert GoogleCalendarEvent.objects.filter(entity_id=self.issue.id).count() == 1
         client.get_event.assert_called_once()
         client.update_event.assert_called_once()
+
+    def test_provider_retry_commits_refreshed_access_token_once(self):
+        credentials = GoogleCalendarOAuthCredentials("client-id", "client-secret")
+        self.connection.access_token = "expired-access-token"
+        self.connection.refresh_token = "refresh-token"
+        self.connection.token_expires_at = timezone.now() - timedelta(minutes=1)
+        self.connection.credential_fingerprint = google_calendar_credential_fingerprint(
+            credentials.client_id,
+            credentials.client_secret,
+        )
+        self.connection.save(
+            update_fields=[
+                "access_token",
+                "refresh_token",
+                "token_expires_at",
+                "credential_fingerprint",
+                "updated_at",
+            ]
+        )
+        refresh_response = Mock(status_code=200)
+        refresh_response.json.return_value = {"access_token": "fresh-access-token", "expires_in": 3600}
+        failed_event_response = Mock(status_code=503)
+        failed_event_response.raise_for_status.side_effect = requests.HTTPError("provider unavailable")
+        successful_event_response = Mock(status_code=200)
+        successful_event_response.json.return_value = {"id": "provider-event-id"}
+
+        with (
+            patch(
+                "plane.integrations.google_calendar.client.get_google_calendar_oauth_credentials",
+                return_value=credentials,
+            ),
+            patch(
+                "plane.integrations.google_calendar.client.requests.post",
+                return_value=refresh_response,
+            ) as post,
+            patch(
+                "plane.integrations.google_calendar.client.requests.request",
+                side_effect=[failed_event_response, successful_event_response],
+            ) as request,
+            pytest.raises(GoogleCalendarProviderError),
+        ):
+            _synchronize_issue_for_connection(self.issue.id, self.connection.id)
+
+        self.connection.refresh_from_db()
+        assert self.connection.access_token == "fresh-access-token"
+        assert not GoogleCalendarEvent.objects.filter(connection=self.connection, entity_id=self.issue.id).exists()
+
+        with (
+            patch(
+                "plane.integrations.google_calendar.client.get_google_calendar_oauth_credentials",
+                return_value=credentials,
+            ),
+            patch(
+                "plane.integrations.google_calendar.client.requests.post",
+                return_value=refresh_response,
+            ) as retry_post,
+            patch(
+                "plane.integrations.google_calendar.client.requests.request",
+                return_value=successful_event_response,
+            ),
+        ):
+            result = _synchronize_issue_for_connection(self.issue.id, self.connection.id)
+
+        assert result == "created"
+        assert post.call_count == 1
+        assert request.call_count == 1
+        retry_post.assert_not_called()
 
     def test_completion_updates_then_reopening_restores_the_normal_payload(self):
         client = _provider_client()
