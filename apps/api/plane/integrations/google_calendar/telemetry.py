@@ -4,6 +4,8 @@
 
 """Secret-free operational telemetry for the Google Calendar integration."""
 
+from uuid import UUID
+
 _OPERATIONAL_FIELDS = frozenset(
     {
         "workspace_id",
@@ -27,11 +29,15 @@ _OPERATIONAL_FIELDS = frozenset(
 def _safe_operational_fields(fields):
     """Return only the explicitly approved, scalar operational fields."""
 
-    return {
-        key: str(value) if key.endswith("_id") else value
-        for key, value in fields.items()
-        if key in _OPERATIONAL_FIELDS and value is not None and isinstance(value, (str, int, float, bool))
-    }
+    safe_fields = {}
+    for key, value in fields.items():
+        if key not in _OPERATIONAL_FIELDS or value is None:
+            continue
+        if key.endswith("_id") and isinstance(value, (str, int, UUID)):
+            safe_fields[key] = str(value)
+        elif isinstance(value, (str, int, float, bool)):
+            safe_fields[key] = value
+    return safe_fields
 
 
 def log_google_calendar_operation(logger, operation, **fields):

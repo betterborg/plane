@@ -288,13 +288,16 @@ class TestGoogleCalendarReleaseReadiness:
 @pytest.mark.contract
 def test_structured_calendar_logs_are_complete_and_secret_free(caplog):
     logger = logging.getLogger("plane.tests.google_calendar.telemetry")
+    workspace_id = uuid.uuid4()
+    connection_id = uuid.uuid4()
+    entity_id = uuid.uuid4()
     with caplog.at_level(logging.INFO, logger=logger.name):
         log_google_calendar_operation(
             logger,
             "provider_inventory",
-            workspace_id="workspace-id",
-            connection_id="connection-id",
-            entity_id="entity-id",
+            workspace_id=workspace_id,
+            connection_id=connection_id,
+            entity_id=entity_id,
             outcome="continued",
             attempt=2,
             enqueue_latency_ms=12.5,
@@ -317,9 +320,9 @@ def test_structured_calendar_logs_are_complete_and_secret_free(caplog):
     record = caplog.records[-1]
     assert record.operation == "provider_inventory"
     for field, expected in {
-        "workspace_id": "workspace-id",
-        "connection_id": "connection-id",
-        "entity_id": "entity-id",
+        "workspace_id": str(workspace_id),
+        "connection_id": str(connection_id),
+        "entity_id": str(entity_id),
         "outcome": "continued",
         "attempt": 2,
         "enqueue_latency_ms": 12.5,
@@ -347,13 +350,15 @@ def test_structured_calendar_logs_are_complete_and_secret_free(caplog):
 
 @pytest.mark.contract
 def test_calendar_analytics_are_allowlisted_and_secret_free():
+    workspace_id = uuid.uuid4()
+    connection_id = uuid.uuid4()
     with patch("plane.bgtasks.event_tracking_task.track_event.delay") as track:
         assert publish_google_calendar_analytics(
             "google_calendar_inventory_reset",
             user_id="member-id",
-            workspace_id="workspace-id",
+            workspace_id=workspace_id,
             workspace_slug="workspace-slug",
-            connection_id="connection-id",
+            connection_id=connection_id,
             outcome="reset",
             attempt=2,
             google_status_class="4xx",
@@ -371,8 +376,8 @@ def test_calendar_analytics_are_allowlisted_and_secret_free():
 
     properties = track.call_args.kwargs["event_properties"]
     assert properties == {
-        "workspace_id": "workspace-id",
-        "connection_id": "connection-id",
+        "workspace_id": str(workspace_id),
+        "connection_id": str(connection_id),
         "outcome": "reset",
         "attempt": 2,
         "google_status_class": "4xx",
