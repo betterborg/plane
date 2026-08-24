@@ -397,15 +397,22 @@ def apply_google_calendar_oauth_success(
     calendar_connection.scopes = list(scopes or [])
     calendar_connection.credential_fingerprint = credential_fingerprint
     calendar_connection.desired_state = GoogleCalendarConnection.DesiredState.CONNECTED
-    if not credential_fingerprint or not has_usable_google_calendar_grant(calendar_connection):
+    reconnect_requires_refresh_token = calendar_connection.broken_notified_at is not None
+    if (
+        not credential_fingerprint
+        or (reconnect_requires_refresh_token and not refresh_token)
+        or not has_usable_google_calendar_grant(calendar_connection)
+    ):
         raise UnusableGoogleCalendarGrant(
-            "OAuth success requires provider identity, a usable token, and a credential fingerprint"
+            "OAuth success requires provider identity, a durable usable token, and a credential fingerprint"
         )
 
     calendar_connection.desired_state, calendar_connection.status = oauth_success_state
     calendar_connection.lifecycle_generation = expected_generation + 1
     calendar_connection.retain_grant_after_cleanup = False
     calendar_connection.last_error = ""
+    calendar_connection.broken_notified_at = None
+    calendar_connection.broken_email_sent_at = None
     clear_google_calendar_oauth_attempt(calendar_connection)
     calendar_connection.save(
         update_fields=[
@@ -415,6 +422,8 @@ def apply_google_calendar_oauth_success(
             "lifecycle_generation",
             "retain_grant_after_cleanup",
             "last_error",
+            "broken_notified_at",
+            "broken_email_sent_at",
             *_OAUTH_ATTEMPT_FIELDS,
             "updated_at",
         ]
@@ -429,6 +438,8 @@ def request_google_calendar_workspace_reconciliation(workspace_id):
     commands = []
     for calendar_connection in lock_google_calendar_workspace_connections(workspace_id):
         if calendar_connection.desired_state != GoogleCalendarConnection.DesiredState.CONNECTED:
+            continue
+        if calendar_connection.broken_notified_at is not None:
             continue
         if not has_usable_google_calendar_grant(calendar_connection):
             continue
@@ -467,6 +478,8 @@ def request_google_calendar_workspace_policy_enable(workspace_id):
         if calendar_connection.desired_state != GoogleCalendarConnection.DesiredState.DISCONNECTED:
             continue
         if not calendar_connection.retain_grant_after_cleanup:
+            continue
+        if calendar_connection.broken_notified_at is not None:
             continue
         if not has_usable_google_calendar_grant(calendar_connection):
             continue

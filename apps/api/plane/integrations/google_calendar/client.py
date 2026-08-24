@@ -47,6 +47,18 @@ class GoogleCalendarProviderError(GoogleCalendarClientError):
     classification = "provider_error"
 
 
+class GoogleCalendarInvalidGrant(GoogleCalendarProviderError):
+    """Raised when Google confirms that the durable refresh grant is invalid."""
+
+    classification = "refresh_token_invalid"
+
+
+class GoogleCalendarAuthorizationError(GoogleCalendarProviderError):
+    """Raised when authorization still fails after the one allowed refresh."""
+
+    classification = "authorization_failed"
+
+
 class GoogleCalendarClientConflict(GoogleCalendarProviderError):
     """Raised when a deterministic provider event already exists."""
 
@@ -142,14 +154,23 @@ class GoogleCalendarClient:
                     "refresh_token": self._refresh_token,
                 },
             )
+            try:
+                payload = response.json()
+            except (TypeError, ValueError):
+                payload = None
+            if response.status_code == 400 and isinstance(payload, dict) and payload.get("error") == "invalid_grant":
+                raise GoogleCalendarInvalidGrant("Google Calendar refresh grant is invalid")
+            if response.status_code in {401, 403}:
+                raise GoogleCalendarAuthorizationError("Google Calendar access-token refresh was not authorized")
             response.raise_for_status()
-            payload = response.json()
             if not isinstance(payload, dict):
                 raise ValueError("Token response is not an object")
             access_token = payload.get("access_token", "")
             expires_in = int(payload.get("expires_in", 0))
             if not access_token or expires_in <= 0:
                 raise ValueError("Token response omitted a usable access token")
+        except (GoogleCalendarInvalidGrant, GoogleCalendarAuthorizationError):
+            raise
         except (requests.RequestException, TypeError, ValueError) as exc:
             raise GoogleCalendarProviderError("Google Calendar access-token refresh failed") from exc
 
@@ -214,6 +235,29 @@ class GoogleCalendarClient:
             time.sleep(self._retry_delay(response, attempt))
         return response
 
+    @staticmethod
+    def _is_persistent_authorization_failure(response):
+        if response.status_code == 401:
+            return True
+        if response.status_code != 403:
+            return False
+        try:
+            payload = response.json()
+        except (TypeError, ValueError):
+            return False
+        if not isinstance(payload, dict):
+            return False
+        error = payload.get("error")
+        if not isinstance(error, dict):
+            return False
+        reasons = error.get("errors", [])
+        if not isinstance(reasons, list):
+            return False
+        return any(
+            isinstance(item, dict) and item.get("reason") in {"authError", "forbidden", "insufficientPermissions"}
+            for item in reasons
+        )
+
     def _calendar_request(
         self,
         method,
@@ -241,6 +285,10 @@ class GoogleCalendarClient:
                     or response.status_code in retry_status_codes
                 )
                 if not should_retry:
+                    if self._is_persistent_authorization_failure(response):
+                        raise GoogleCalendarAuthorizationError(
+                            "Google Calendar authorization failed after access-token refresh"
+                        )
                     return response
                 if attempt >= retry_limit:
                     return response
@@ -303,6 +351,8 @@ class GoogleCalendarClient:
                     max_retries=0,
                     json=payload,
                 )
+            except (GoogleCalendarInvalidGrant, GoogleCalendarAuthorizationError):
+                raise
             except GoogleCalendarProviderError as exc:
                 if operation_id is not None:
                     # Recovery is another provider attempt, so it must observe

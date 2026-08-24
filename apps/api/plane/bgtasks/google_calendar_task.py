@@ -8,8 +8,12 @@ from datetime import timedelta
 from uuid import UUID, uuid4
 
 from celery import current_app, shared_task
+from django.conf import settings
+from django.core.exceptions import ImproperlyConfigured
+from django.core.mail import EmailMultiAlternatives, get_connection
 from django.db import transaction
 from django.db.models import Exists, OuterRef, Q
+from django.template.loader import render_to_string
 from django.utils import timezone
 
 from plane.db.models import (
@@ -19,18 +23,21 @@ from plane.db.models import (
     Issue,
     IssueAssignee,
     IssueLabel,
+    Notification,
     Project,
     WorkspaceIntegration,
     WorkspaceMember,
 )
 from plane.db.models.state import StateGroup
 from plane.integrations.google_calendar.client import (
+    GoogleCalendarAuthorizationError,
     GoogleCalendarCalendarAbsent,
     GoogleCalendarClient,
     GoogleCalendarClientConflict,
     GoogleCalendarClientError,
     GoogleCalendarCredentialMismatch,
     GoogleCalendarEventAbsent,
+    GoogleCalendarInvalidGrant,
     GoogleCalendarSyncTokenExpired,
 )
 from plane.integrations.google_calendar.dispatch import (
@@ -78,6 +85,7 @@ from plane.integrations.google_calendar.lifecycle import (
     record_google_calendar_cleanup_error,
 )
 from plane.integrations.google_calendar.oauth import GoogleCalendarOAuthConfigurationError
+from plane.license.utils.instance_value import get_email_configuration
 
 
 GOOGLE_CALENDAR_RECONCILIATION_LEASE = timedelta(minutes=5)
@@ -92,6 +100,146 @@ GOOGLE_CALENDAR_RECONCILIATION_MAX_STAGGER_SECONDS = 30 * 60
 GOOGLE_CALENDAR_OAUTH_ATTEMPT_EXPIRY_PAGE_SIZE = 100
 
 logger = logging.getLogger("plane.worker")
+
+
+def _google_calendar_settings_path(workspace_slug):
+    return f"/{workspace_slug}/settings/integrations/google-calendar"
+
+
+def _google_calendar_settings_url(workspace_slug):
+    base_url = settings.APP_BASE_URL or settings.WEB_URL
+    if not base_url:
+        raise ImproperlyConfigured("APP_BASE_URL or WEB_URL is required for Google Calendar reconnect links")
+    return f"{base_url.rstrip('/')}{_google_calendar_settings_path(workspace_slug)}"
+
+
+def _send_google_calendar_disconnected_email(receiver_email, workspace_name, workspace_slug):
+    """Send the member a multipart reconnect notice."""
+
+    settings_url = _google_calendar_settings_url(workspace_slug)
+    context = {
+        "workspace_name": workspace_name,
+        "settings_url": settings_url,
+    }
+    html_content = render_to_string("emails/notifications/google-calendar-disconnected.html", context)
+    text_content = render_to_string("emails/notifications/google-calendar-disconnected.txt", context)
+    (
+        email_host,
+        email_host_user,
+        email_host_password,
+        email_port,
+        email_use_tls,
+        email_use_ssl,
+        email_from,
+    ) = get_email_configuration()
+    connection = get_connection(
+        host=email_host,
+        port=int(email_port),
+        username=email_host_user,
+        password=email_host_password,
+        use_tls=email_use_tls == "1",
+        use_ssl=email_use_ssl == "1",
+    )
+    message = EmailMultiAlternatives(
+        subject=f"Reconnect Google Calendar to {workspace_name}",
+        body=text_content,
+        from_email=email_from,
+        to=[receiver_email],
+        connection=connection,
+    )
+    message.attach_alternative(html_content, "text/html")
+    message.send()
+
+
+@transaction.atomic
+def _deliver_google_calendar_disconnected_email(connection_id, broken_notified_at):
+    connection = (
+        GoogleCalendarConnection.objects.select_for_update()
+        .select_related("member", "workspace_integration__workspace")
+        .filter(id=connection_id)
+        .first()
+    )
+    if (
+        connection is None
+        or connection.desired_state != GoogleCalendarConnection.DesiredState.CONNECTED
+        or connection.status != GoogleCalendarConnection.Status.ERROR
+        or connection.broken_notified_at is None
+        or connection.broken_notified_at.isoformat() != broken_notified_at
+        or connection.broken_email_sent_at is not None
+    ):
+        return "stale"
+
+    workspace = connection.workspace_integration.workspace
+    _send_google_calendar_disconnected_email(connection.member.email, workspace.name, workspace.slug)
+    connection.broken_email_sent_at = timezone.now()
+    connection.save(update_fields=["broken_email_sent_at", "updated_at"])
+    return "sent"
+
+
+@shared_task(
+    autoretry_for=(Exception,),
+    retry_backoff=60,
+    retry_backoff_max=3600,
+    retry_jitter=True,
+    max_retries=12,
+)
+def send_google_calendar_disconnected_email(connection_id, broken_notified_at):
+    """Deliver one reconnect email, retrying while its broken transition is current."""
+
+    return _deliver_google_calendar_disconnected_email(connection_id, broken_notified_at)
+
+
+def _google_calendar_connection_notification_payload(connection, error):
+    return {
+        "google_calendar_connection": {
+            "id": str(connection.id),
+            "provider_email": connection.provider_email,
+            "status": "broken",
+            "error": error,
+            "action_url": _google_calendar_settings_path(connection.workspace_integration.workspace.slug),
+        }
+    }
+
+
+def _mark_google_calendar_connection_broken(connection, error):
+    """Persist one permanent broken transition and its deduplicated notices."""
+
+    error = str(error)
+    first_notice = connection.broken_notified_at is None
+    connection.status = GoogleCalendarConnection.Status.ERROR
+    connection.last_error = error
+    update_fields = ["status", "last_error", "updated_at"]
+    if first_notice:
+        connection.broken_notified_at = timezone.now()
+        connection.broken_email_sent_at = None
+        update_fields.extend(["broken_notified_at", "broken_email_sent_at"])
+    connection.save(update_fields=update_fields)
+    if not first_notice:
+        return False
+
+    workspace = connection.workspace_integration.workspace
+    Notification.objects.create(
+        workspace=workspace,
+        project=None,
+        receiver=connection.member,
+        triggered_by=None,
+        sender="in_app:google_calendar:connection_broken",
+        entity_identifier=connection.id,
+        entity_name="google_calendar_connection",
+        title="Google Calendar disconnected",
+        message={"verb": "disconnected"},
+        message_html="<p>Reconnect Google Calendar to resume syncing.</p>",
+        message_stripped="Reconnect Google Calendar to resume syncing.",
+        data=_google_calendar_connection_notification_payload(connection, error),
+    )
+    connection_id = str(connection.id)
+    broken_notified_at = connection.broken_notified_at.isoformat()
+
+    def _send_disconnected_email():
+        send_google_calendar_disconnected_email.delay(connection_id, broken_notified_at)
+
+    transaction.on_commit(_send_disconnected_email, robust=True)
+    return True
 
 
 def _owns_generation(connection, generation, *, desired_state, status):
@@ -258,6 +406,19 @@ def _cleanup_recovery_candidates():
     )
 
 
+def _broken_email_recovery_candidates():
+    return (
+        GoogleCalendarConnection.objects.filter(
+            desired_state=GoogleCalendarConnection.DesiredState.CONNECTED,
+            status=GoogleCalendarConnection.Status.ERROR,
+            broken_notified_at__isnull=False,
+            broken_email_sent_at__isnull=True,
+        )
+        .order_by("id")
+        .values_list("id", "broken_notified_at")
+    )
+
+
 @transaction.atomic
 def _claim_cleanup_recovery(connection_id):
     try:
@@ -279,7 +440,7 @@ def _claim_cleanup_recovery(connection_id):
 
 @shared_task
 def schedule_google_calendar_reconciliations():
-    """Reconcile healthy, present, expired-attempt, and cleanup Calendar state."""
+    """Reconcile Calendar lifecycle state and pending broken-connection emails."""
 
     at = timezone.now()
     due_connection_ids = (
@@ -351,6 +512,17 @@ def schedule_google_calendar_reconciliations():
             )
             continue
         published += 1
+
+    for connection_id, broken_notified_at in _broken_email_recovery_candidates().iterator():
+        try:
+            send_google_calendar_disconnected_email.delay(str(connection_id), broken_notified_at.isoformat())
+        except Exception:
+            logger.exception(
+                "Failed to publish Google Calendar disconnected email recovery",
+                extra={"connection_id": str(connection_id)},
+            )
+            continue
+        published += 1
     return published
 
 
@@ -372,12 +544,20 @@ def _persist_refreshed_access_token(connection, client):
 
 
 def _mark_credential_mismatch(connection):
-    update_fields = ["last_error", "updated_at"]
-    connection.last_error = GoogleCalendarCredentialMismatch.classification
     if connection.desired_state == GoogleCalendarConnection.DesiredState.CONNECTED:
-        connection.status = GoogleCalendarConnection.Status.ERROR
-        update_fields.append("status")
-    connection.save(update_fields=update_fields)
+        _mark_google_calendar_connection_broken(connection, GoogleCalendarCredentialMismatch.classification)
+        return
+    connection.last_error = GoogleCalendarCredentialMismatch.classification
+    connection.save(update_fields=["last_error", "updated_at"])
+
+
+def _mark_authorization_failure(connection, error):
+    classification = error.classification
+    if connection.desired_state == GoogleCalendarConnection.DesiredState.CONNECTED:
+        _mark_google_calendar_connection_broken(connection, classification)
+        return
+    connection.last_error = classification
+    connection.save(update_fields=["last_error", "updated_at"])
 
 
 class _GoogleCalendarProviderRetry:
@@ -431,6 +611,9 @@ def _delete_provider_event(connection, correlation):
         except GoogleCalendarCredentialMismatch:
             _mark_credential_mismatch(connection)
             return False
+        except (GoogleCalendarInvalidGrant, GoogleCalendarAuthorizationError) as exc:
+            _mark_authorization_failure(connection, exc)
+            return False
         except GoogleCalendarClientError as exc:
             _persist_refreshed_access_token(connection, client)
             return _GoogleCalendarProviderRetry(exc)
@@ -466,6 +649,9 @@ def _converge_provider_event(connection, entity_type, entity_id, payload, correl
     except GoogleCalendarCredentialMismatch:
         _mark_credential_mismatch(connection)
         return "credential_mismatch"
+    except (GoogleCalendarInvalidGrant, GoogleCalendarAuthorizationError) as exc:
+        _mark_authorization_failure(connection, exc)
+        return "authorization_failed"
     except GoogleCalendarClientError as exc:
         _persist_refreshed_access_token(connection, client)
         return _GoogleCalendarProviderRetry(exc)
@@ -1811,6 +1997,22 @@ def _record_reconciliation_credential_mismatch(connection_id, run_id, lease_toke
     return True
 
 
+@transaction.atomic
+def _record_reconciliation_authorization_failure(connection_id, run_id, lease_token, error):
+    connection = GoogleCalendarConnection.objects.select_for_update().get(id=connection_id)
+    state = _reconciliation_state(connection)
+    if not _owns_reconciliation_lease(
+        connection,
+        state,
+        run_id,
+        lease_token,
+        phase=GOOGLE_CALENDAR_RECONCILIATION_PROVIDER_PHASE,
+    ):
+        return False
+    _mark_authorization_failure(connection, error)
+    return True
+
+
 def _publish_correlation_sync(correlation, countdown):
     if correlation.entity_type == GoogleCalendarEvent.EntityType.WORK_ITEM:
         task_name = GOOGLE_CALENDAR_ISSUE_SYNC_TASK
@@ -1933,6 +2135,10 @@ def reconcile_google_calendar_inventory(connection_id, run_id=None, force_local_
                 if not _record_reconciliation_credential_mismatch(connection.id, run_id, lease_token):
                     return "stale"
                 return "credential_mismatch"
+            except (GoogleCalendarInvalidGrant, GoogleCalendarAuthorizationError) as exc:
+                if not _record_reconciliation_authorization_failure(connection.id, run_id, lease_token, exc):
+                    return "stale"
+                return "authorization_failed"
             result = _record_inventory_page(connection.id, run_id, lease_token, page)
             if result == "stale":
                 return result
@@ -1975,6 +2181,18 @@ def _record_present_error(connection, generation, error):
     ):
         return "stale"
     mark_google_calendar_connection_error(connection.id, generation, error)
+    return "error"
+
+
+def _record_present_authorization_failure(connection, generation, error):
+    if not _owns_generation(
+        connection,
+        generation,
+        desired_state=GoogleCalendarConnection.DesiredState.CONNECTED,
+        status=GoogleCalendarConnection.Status.PENDING,
+    ):
+        return "stale"
+    _mark_authorization_failure(connection, error)
     return "error"
 
 
@@ -2118,11 +2336,17 @@ def _converge_present_transaction(connection, generation):
         else:
             return _record_present_error(connection, generation, "Google Calendar creation identity is missing")
     except GoogleCalendarCredentialMismatch:
-        return _record_present_error(
+        if not _owns_generation(
             connection,
             generation,
-            GoogleCalendarCredentialMismatch.classification,
-        )
+            desired_state=GoogleCalendarConnection.DesiredState.CONNECTED,
+            status=GoogleCalendarConnection.Status.PENDING,
+        ):
+            return "stale"
+        _mark_credential_mismatch(connection)
+        return "error"
+    except (GoogleCalendarInvalidGrant, GoogleCalendarAuthorizationError) as exc:
+        return _record_present_authorization_failure(connection, generation, exc)
     except (GoogleCalendarClientError, GoogleCalendarOAuthConfigurationError) as exc:
         _persist_refreshed_access_token(connection, client)
         return _record_present_error(connection, generation, exc)
