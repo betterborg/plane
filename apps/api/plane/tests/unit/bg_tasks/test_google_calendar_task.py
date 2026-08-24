@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # See the LICENSE file for details.
 
+import logging
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 from threading import Event
@@ -100,6 +101,7 @@ class TestGoogleCalendarConvergenceTask:
         )
 
         with (
+            caplog.at_level(logging.INFO, logger="plane.worker"),
             patch("plane.integrations.google_calendar.lifecycle._acquire_advisory_xact_lock"),
             patch(
                 "plane.integrations.google_calendar.client.get_google_calendar_oauth_credentials",
@@ -107,6 +109,7 @@ class TestGoogleCalendarConvergenceTask:
             ),
             patch("plane.integrations.google_calendar.client.requests.post") as post,
             patch("plane.integrations.google_calendar.client.requests.request") as request,
+            patch("plane.bgtasks.google_calendar_task.publish_google_calendar_analytics") as analytics,
         ):
             result = reconcile_google_calendar_connection(str(connection.id), 3)
 
@@ -116,6 +119,20 @@ class TestGoogleCalendarConvergenceTask:
         assert connection.last_error == "oauth_credentials_changed"
         post.assert_not_called()
         request.assert_not_called()
+        mismatch_record = next(
+            record for record in caplog.records if getattr(record, "operation", None) == "credential_binding"
+        )
+        assert mismatch_record.workspace_id == str(connection.workspace_integration.workspace_id)
+        assert mismatch_record.connection_id == str(connection.id)
+        assert mismatch_record.outcome == "mismatch"
+        assert mismatch_record.google_status_class == "not_requested"
+        assert mismatch_record.calendar_generation == connection.calendar_generation
+        assert mismatch_record.reconciliation_action == "blocked"
+        mismatch_analytics = [
+            call for call in analytics.call_args_list if call.args == ("google_calendar_credential_mismatch",)
+        ]
+        assert len(mismatch_analytics) == 1
+        assert mismatch_analytics[0].kwargs["connection_id"] == connection.id
         for private_value in (
             "original-id",
             "original-secret",

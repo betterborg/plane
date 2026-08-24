@@ -6,13 +6,22 @@ import json
 import logging
 import uuid
 from datetime import timedelta
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 from django.urls import reverse
 from django.utils import timezone
 from rest_framework import status
 
+from plane.bgtasks.google_calendar_task import (
+    _synchronize_issue_for_connection,
+    reconcile_google_calendar_connection,
+)
+from plane.db.models import GoogleCalendarConnection
+from plane.integrations.google_calendar.dispatch import (
+    GOOGLE_CALENDAR_LIFECYCLE_TASK,
+    publish_google_calendar_task,
+)
 from plane.integrations.google_calendar.oauth import GoogleCalendarOAuthCredentials
 from plane.integrations.google_calendar.telemetry import (
     log_google_calendar_operation,
@@ -108,8 +117,23 @@ class TestGoogleCalendarReleaseReadiness:
                 },
                 "lifecycle_recovery_complete",
             ),
+            (
+                {
+                    "active": False,
+                    "desired_state": GoogleCalendarConnection.DesiredState.CONNECTED,
+                    "status": GoogleCalendarConnection.Status.ERROR,
+                    "reconciliation_completed_at": None,
+                },
+                "lifecycle_recovery_complete",
+            ),
         ],
-        ids=["credential-mismatch", "overdue", "verification-incomplete", "lifecycle-incomplete"],
+        ids=[
+            "credential-mismatch",
+            "overdue",
+            "verification-incomplete",
+            "lifecycle-incomplete",
+            "connected-error",
+        ],
     )
     def test_incomplete_readiness_contracts_fail_closed(
         self,
@@ -137,6 +161,90 @@ class TestGoogleCalendarReleaseReadiness:
         response = api_client.get(reverse("google-calendar-release-readiness"))
 
         assert response.status_code in {status.HTTP_401_UNAUTHORIZED, status.HTTP_403_FORBIDDEN}
+
+    def test_entity_noop_production_log_does_not_claim_provider_success(self, caplog):
+        connection = _verified_connection()
+        missing_issue_id = uuid.uuid4()
+
+        with (
+            caplog.at_level(logging.INFO, logger="plane.worker"),
+            patch("plane.bgtasks.google_calendar_task._client_for") as client_for,
+        ):
+            result = _synchronize_issue_for_connection(missing_issue_id, connection.id)
+
+        assert result == "missing"
+        client_for.assert_not_called()
+        record = next(
+            record for record in caplog.records if getattr(record, "operation", None) == "work_item_publication"
+        )
+        assert record.workspace_id == str(connection.workspace_integration.workspace_id)
+        assert record.connection_id == str(connection.id)
+        assert record.entity_id == str(missing_issue_id)
+        assert record.outcome == "missing"
+        assert record.attempt == 1
+        assert record.google_status_class == "not_requested"
+        assert record.calendar_generation == connection.calendar_generation
+        assert record.reconciliation_action == "converge_entity"
+
+    def test_local_only_lifecycle_production_log_does_not_claim_provider_success(self, caplog):
+        connection = GoogleCalendarConnectionFactory(
+            pending_cleanup=True,
+            calendar_id="",
+            calendar_operation_id=None,
+            retain_grant_after_cleanup=True,
+        )
+        client = Mock()
+
+        with (
+            caplog.at_level(logging.INFO, logger="plane.worker"),
+            patch("plane.integrations.google_calendar.lifecycle._acquire_advisory_xact_lock"),
+            patch("plane.bgtasks.google_calendar_task._client_for", return_value=client),
+        ):
+            result = reconcile_google_calendar_connection(str(connection.id), connection.lifecycle_generation)
+
+        assert result == "disabled"
+        client.delete_calendar.assert_not_called()
+        client.revoke_grant.assert_not_called()
+        record = next(
+            record for record in caplog.records if getattr(record, "operation", None) == "lifecycle_reconciliation"
+        )
+        assert record.outcome == "disabled"
+        assert record.google_status_class == "unknown"
+        assert record.reconciliation_action == "cleanup"
+
+    def test_production_publication_failure_has_context_analytics_and_no_task_secrets(self, caplog):
+        connection = _verified_connection()
+        task = Mock()
+        task.task = GOOGLE_CALENDAR_LIFECYCLE_TASK
+        task.delay.side_effect = RuntimeError("forbidden-broker-message")
+
+        with (
+            caplog.at_level(logging.ERROR, logger="plane.integrations.google_calendar.dispatch"),
+            patch("plane.integrations.google_calendar.dispatch.publish_google_calendar_analytics") as analytics,
+            pytest.raises(RuntimeError, match="forbidden-broker-message"),
+        ):
+            publish_google_calendar_task(task, str(connection.id), "forbidden-secret-task-argument")
+
+        record = next(record for record in caplog.records if getattr(record, "operation", None) == "task_publication")
+        assert record.workspace_id == str(connection.workspace_integration.workspace_id)
+        assert record.connection_id == str(connection.id)
+        assert record.outcome == "failed"
+        assert record.attempt == 1
+        assert record.enqueue_latency_ms >= 0
+        assert record.google_status_class == "not_requested"
+        assert record.calendar_generation == connection.calendar_generation
+        assert record.reconciliation_action == "reconcile_google_calendar_connection"
+        assert record.publication_failure_class == "RuntimeError"
+        analytics.assert_called_once()
+        assert analytics.call_args.args == ("google_calendar_publication_failure",)
+        assert analytics.call_args.kwargs["workspace_id"] == connection.workspace_integration.workspace_id
+        assert analytics.call_args.kwargs["connection_id"] == connection.id
+        serialized_record = repr(record.__dict__)
+        serialized_analytics = repr(analytics.call_args)
+        assert "forbidden-secret-task-argument" not in serialized_record
+        assert "forbidden-secret-task-argument" not in serialized_analytics
+        assert "forbidden-broker-message" not in serialized_record
+        assert "forbidden-broker-message" not in serialized_analytics
 
 
 @pytest.mark.contract

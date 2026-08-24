@@ -114,6 +114,13 @@ def _google_calendar_release_readiness(at=None):
 
     incomplete_lifecycle_count = connections.filter(
         Q(status__in=[GoogleCalendarConnection.Status.PENDING, GoogleCalendarConnection.Status.CLEANUP_PENDING])
+        | (
+            Q(
+                workspace_integration__config__enabled=True,
+                desired_state=GoogleCalendarConnection.DesiredState.CONNECTED,
+            )
+            & ~Q(status=GoogleCalendarConnection.Status.ACTIVE)
+        )
         | ~Q(reconciliation_phase="")
     ).count()
     required_verifications = connections.filter(
@@ -228,6 +235,7 @@ class GoogleCalendarReleaseReadinessEndpoint(BaseAPIView):
             logger,
             "release_readiness",
             outcome="ready" if readiness["ready"] else "not_ready",
+            google_status_class="not_requested",
             local_candidate_count=readiness["required_verification_count"],
             reconciliation_action=action,
             last_completion_age_seconds=readiness["last_completion_age_seconds"],
@@ -445,6 +453,7 @@ class GoogleCalendarWorkspacePolicyEndpoint(BaseAPIView):
                     "workspace_adoption",
                     workspace_id=workspace.id,
                     outcome="enabled",
+                    google_status_class="not_requested",
                     reconciliation_action="adopt",
                 )
                 publish_google_calendar_analytics(
@@ -453,6 +462,7 @@ class GoogleCalendarWorkspacePolicyEndpoint(BaseAPIView):
                     workspace_id=workspace.id,
                     workspace_slug=workspace.slug,
                     outcome="enabled",
+                    google_status_class="not_requested",
                     reconciliation_action="adopt",
                 )
 
