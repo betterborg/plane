@@ -42,6 +42,7 @@ from plane.integrations.google_calendar.dispatch import (
     enqueue_google_calendar_workspace_policy_resyncs_on_commit,
 )
 from plane.integrations.google_calendar.contracts import (
+    expired_google_calendar_oauth_attempts,
     has_google_calendar_provider_state,
     is_google_calendar_reconciliation_overdue,
 )
@@ -100,6 +101,7 @@ def _google_calendar_release_readiness(at=None):
 
     incomplete_lifecycle_count = connections.filter(
         Q(status__in=[GoogleCalendarConnection.Status.PENDING, GoogleCalendarConnection.Status.CLEANUP_PENDING])
+        | expired_google_calendar_oauth_attempts(at)
         | (
             Q(
                 workspace_integration__config__enabled=True,

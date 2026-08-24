@@ -4,7 +4,15 @@
 
 from datetime import timedelta
 
+from django.db.models import Q
+
 GOOGLE_CALENDAR_HEALTHY_RECONCILIATION_OVERDUE = timedelta(hours=18)
+
+
+def expired_google_calendar_oauth_attempts(at):
+    """Return the shared selector for OAuth attempts awaiting expiry recovery."""
+
+    return Q(oauth_attempt_expires_at__lte=at) & ~Q(oauth_state="")
 
 
 def has_google_calendar_provider_state(connection):

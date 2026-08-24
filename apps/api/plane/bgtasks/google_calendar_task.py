@@ -41,7 +41,10 @@ from plane.integrations.google_calendar.client import (
     GoogleCalendarInvalidGrant,
     GoogleCalendarSyncTokenExpired,
 )
-from plane.integrations.google_calendar.contracts import is_google_calendar_reconciliation_overdue
+from plane.integrations.google_calendar.contracts import (
+    expired_google_calendar_oauth_attempts,
+    is_google_calendar_reconciliation_overdue,
+)
 from plane.integrations.google_calendar.dispatch import (
     GOOGLE_CALENDAR_CYCLE_BACKFILL_TASK,
     GOOGLE_CALENDAR_CYCLE_SYNC_TASK,
@@ -404,7 +407,7 @@ def _claim_present_recovery(connection_id):
 def _expired_oauth_attempt_pages(at):
     after_id = None
     while True:
-        candidates = GoogleCalendarConnection.objects.filter(oauth_attempt_expires_at__lte=at).exclude(oauth_state="")
+        candidates = GoogleCalendarConnection.objects.filter(expired_google_calendar_oauth_attempts(at))
         if after_id is not None:
             candidates = candidates.filter(id__gt=after_id)
         page = list(
@@ -2789,6 +2792,7 @@ def reconcile_google_calendar_connection(connection_id, generation):
 
     prepared_state = _prepare_reconciliation(connection_id, generation)
     if prepared_state in {"missing", "stale"}:
+        _log_lifecycle_reconciliation_outcome(connection_id, prepared_state, "prepare")
         return prepared_state
     connection_manager = (
         GoogleCalendarConnection.all_objects
@@ -2798,6 +2802,7 @@ def reconcile_google_calendar_connection(connection_id, generation):
     try:
         connection = connection_manager.get(id=connection_id)
     except GoogleCalendarConnection.DoesNotExist:
+        _log_lifecycle_reconciliation_outcome(connection_id, "missing", "prepare")
         return "missing"
     if prepared_state == GoogleCalendarConnection.DesiredState.CONNECTED:
         result = _converge_present(connection, generation)
@@ -2817,6 +2822,18 @@ def reconcile_google_calendar_connection(connection_id, generation):
         **_google_calendar_log_context(connection),
     )
     return result
+
+
+def _log_lifecycle_reconciliation_outcome(connection_id, outcome, action):
+    log_google_calendar_operation(
+        logger,
+        "lifecycle_reconciliation",
+        connection_id=connection_id,
+        outcome=outcome,
+        attempt=1,
+        google_status_class=_lifecycle_google_status_class(outcome),
+        reconciliation_action=action,
+    )
 
 
 def _lifecycle_google_status_class(outcome):

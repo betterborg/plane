@@ -126,6 +126,17 @@ class TestGoogleCalendarReleaseReadiness:
                 },
                 "lifecycle_recovery_complete",
             ),
+            (
+                {
+                    "active": False,
+                    "desired_state": GoogleCalendarConnection.DesiredState.DISCONNECTED,
+                    "status": GoogleCalendarConnection.Status.DISCONNECTED,
+                    "oauth_state": "expired-attempt-state",
+                    "oauth_attempt_expires_at": timezone.now() - timedelta(minutes=1),
+                    "reconciliation_completed_at": None,
+                },
+                "lifecycle_recovery_complete",
+            ),
         ],
         ids=[
             "credential-mismatch",
@@ -133,6 +144,7 @@ class TestGoogleCalendarReleaseReadiness:
             "verification-incomplete",
             "lifecycle-incomplete",
             "connected-error",
+            "expired-oauth-attempt",
         ],
     )
     def test_incomplete_readiness_contracts_fail_closed(
@@ -211,6 +223,32 @@ class TestGoogleCalendarReleaseReadiness:
         assert record.outcome == "disabled"
         assert record.google_status_class == "unknown"
         assert record.reconciliation_action == "cleanup"
+
+    @pytest.mark.parametrize("outcome", ["missing", "stale"])
+    def test_lifecycle_early_outcomes_have_production_telemetry(self, caplog, outcome):
+        if outcome == "stale":
+            connection = GoogleCalendarConnectionFactory(pending=True, lifecycle_generation=3)
+            connection_id = str(connection.id)
+            generation = 2
+        else:
+            connection_id = str(uuid.uuid4())
+            generation = 1
+
+        with (
+            caplog.at_level(logging.INFO, logger="plane.worker"),
+            patch("plane.integrations.google_calendar.lifecycle._acquire_advisory_xact_lock"),
+        ):
+            result = reconcile_google_calendar_connection(connection_id, generation)
+
+        assert result == outcome
+        record = next(
+            record for record in caplog.records if getattr(record, "operation", None) == "lifecycle_reconciliation"
+        )
+        assert record.connection_id == connection_id
+        assert record.outcome == outcome
+        assert record.attempt == 1
+        assert record.google_status_class == "not_requested"
+        assert record.reconciliation_action == "prepare"
 
     def test_production_publication_failure_has_context_analytics_and_no_task_secrets(self, caplog):
         connection = _verified_connection()
