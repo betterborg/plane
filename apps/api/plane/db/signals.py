@@ -22,6 +22,10 @@ _google_calendar_issue_signal_suppression_depth = ContextVar(
     "google_calendar_issue_signal_suppression_depth",
     default=0,
 )
+_google_calendar_cycle_signal_suppression_depth = ContextVar(
+    "google_calendar_cycle_signal_suppression_depth",
+    default=0,
+)
 
 
 @contextmanager
@@ -34,6 +38,18 @@ def suppress_google_calendar_issue_signal_dispatch():
         yield
     finally:
         _google_calendar_issue_signal_suppression_depth.reset(token)
+
+
+@contextmanager
+def suppress_google_calendar_cycle_signal_dispatch():
+    """Temporarily leave Calendar cycle dispatch to an owning mutation boundary."""
+
+    depth = _google_calendar_cycle_signal_suppression_depth.get()
+    token = _google_calendar_cycle_signal_suppression_depth.set(depth + 1)
+    try:
+        yield
+    finally:
+        _google_calendar_cycle_signal_suppression_depth.reset(token)
 
 
 def dispatch_google_calendar_issue_sync(issue_id):
@@ -51,8 +67,19 @@ def dispatch_google_calendar_cycle_sync(cycle_id):
     enqueue_google_calendar_task_on_commit(synchronize_google_calendar_cycle, str(cycle_id))
 
 
+def dispatch_google_calendar_cycle_syncs(cycle_ids):
+    """Enqueue each affected cycle once after the current transaction commits."""
+
+    for cycle_id in dict.fromkeys(str(cycle_id) for cycle_id in cycle_ids):
+        dispatch_google_calendar_cycle_sync(cycle_id)
+
+
 def _google_calendar_issue_signal_dispatch_is_suppressed():
     return _google_calendar_issue_signal_suppression_depth.get() > 0
+
+
+def _google_calendar_cycle_signal_dispatch_is_suppressed():
+    return _google_calendar_cycle_signal_suppression_depth.get() > 0
 
 
 @receiver(post_save, sender=Issue, dispatch_uid="google_calendar_issue_post_save")
@@ -92,5 +119,5 @@ def dispatch_google_calendar_label_model_signal(sender, instance, created, **kwa
 def dispatch_google_calendar_cycle_model_signal(sender, instance, **kwargs):
     """Converge an existing cycle after a lifecycle mutation is durable."""
 
-    if not kwargs.get("created", False):
+    if not kwargs.get("created", False) and not _google_calendar_cycle_signal_dispatch_is_suppressed():
         dispatch_google_calendar_cycle_sync(instance.id)

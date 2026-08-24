@@ -23,6 +23,7 @@ from .. import BaseViewSet
 from plane.app.serializers import CycleIssueSerializer
 from plane.bgtasks.issue_activities_task import issue_activity
 from plane.db.models import Cycle, CycleIssue, Issue, FileAsset, IssueLink
+from plane.db.signals import dispatch_google_calendar_cycle_syncs
 from plane.utils.grouper import (
     issue_group_values,
     issue_on_results,
@@ -247,6 +248,7 @@ class CycleIssueViewSet(BaseViewSet):
                 project_id=project_id,
             )
         )
+        affected_cycle_ids = [cycle_id, *(cycle_issue.cycle_id for cycle_issue in cycle_issues)]
         existing_issues = [str(cycle_issue.issue_id) for cycle_issue in cycle_issues]
         new_issues = list(set(issues) - set(existing_issues))
 
@@ -297,6 +299,7 @@ class CycleIssueViewSet(BaseViewSet):
 
         # Update the cycle issues
         CycleIssue.objects.bulk_update(updated_records, ["cycle_id"], batch_size=100)
+        dispatch_google_calendar_cycle_syncs(affected_cycle_ids)
         # Capture Issue Activity
         issue_activity.delay(
             type="cycle.activity.created",
@@ -341,4 +344,5 @@ class CycleIssueViewSet(BaseViewSet):
             origin=base_host(request=request, is_app=True),
         )
         cycle_issue.delete()
+        dispatch_google_calendar_cycle_syncs([cycle_id])
         return Response(status=status.HTTP_204_NO_CONTENT)

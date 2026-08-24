@@ -27,6 +27,10 @@ from plane.db.models import (
     Issue,
     Project,
 )
+from plane.db.signals import (
+    dispatch_google_calendar_cycle_syncs,
+    suppress_google_calendar_cycle_signal_dispatch,
+)
 from plane.utils.analytics_plot import burndown_plot
 from plane.bgtasks.issue_activities_task import issue_activity
 from plane.utils.host import base_host
@@ -429,7 +433,8 @@ def transfer_cycle_issues(
             }
         ),
     }
-    current_cycle.save(update_fields=["progress_snapshot"])
+    with suppress_google_calendar_cycle_signal_dispatch():
+        current_cycle.save(update_fields=["progress_snapshot"])
 
     # Get issues to transfer (only incomplete issues)
     cycle_issues = CycleIssue.objects.filter(
@@ -456,6 +461,7 @@ def transfer_cycle_issues(
 
     # Bulk update cycle issues
     cycle_issues = CycleIssue.objects.bulk_update(updated_cycles, ["cycle_id"], batch_size=100)
+    dispatch_google_calendar_cycle_syncs([cycle_id, new_cycle_id])
 
     # Capture Issue Activity
     issue_activity.delay(
