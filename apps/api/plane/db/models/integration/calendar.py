@@ -83,6 +83,7 @@ class GoogleCalendarConnection(BaseModel):
     last_success_at = models.DateTimeField(null=True, blank=True)
     last_error = models.TextField(blank=True)
     broken_notified_at = models.DateTimeField(null=True, blank=True)
+    broken_email_sent_at = models.DateTimeField(null=True, blank=True)
 
     # Short-lived OAuth attempt state is kept separate from the durable lifecycle.
     oauth_state = models.CharField(max_length=255, blank=True)

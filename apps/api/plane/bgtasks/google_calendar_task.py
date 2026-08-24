@@ -113,9 +113,8 @@ def _google_calendar_settings_url(workspace_slug):
     return f"{base_url.rstrip('/')}{_google_calendar_settings_path(workspace_slug)}"
 
 
-@shared_task
-def send_google_calendar_disconnected_email(receiver_email, workspace_name, workspace_slug):
-    """Send the member a multipart reconnect notice for one broken grant."""
+def _send_google_calendar_disconnected_email(receiver_email, workspace_name, workspace_slug):
+    """Send the member a multipart reconnect notice."""
 
     settings_url = _google_calendar_settings_url(workspace_slug)
     context = {
@@ -152,6 +151,44 @@ def send_google_calendar_disconnected_email(receiver_email, workspace_name, work
     message.send()
 
 
+@transaction.atomic
+def _deliver_google_calendar_disconnected_email(connection_id, broken_notified_at):
+    connection = (
+        GoogleCalendarConnection.objects.select_for_update()
+        .select_related("member", "workspace_integration__workspace")
+        .filter(id=connection_id)
+        .first()
+    )
+    if (
+        connection is None
+        or connection.desired_state != GoogleCalendarConnection.DesiredState.CONNECTED
+        or connection.status != GoogleCalendarConnection.Status.ERROR
+        or connection.broken_notified_at is None
+        or connection.broken_notified_at.isoformat() != broken_notified_at
+        or connection.broken_email_sent_at is not None
+    ):
+        return "stale"
+
+    workspace = connection.workspace_integration.workspace
+    _send_google_calendar_disconnected_email(connection.member.email, workspace.name, workspace.slug)
+    connection.broken_email_sent_at = timezone.now()
+    connection.save(update_fields=["broken_email_sent_at", "updated_at"])
+    return "sent"
+
+
+@shared_task(
+    autoretry_for=(Exception,),
+    retry_backoff=60,
+    retry_backoff_max=3600,
+    retry_jitter=True,
+    max_retries=12,
+)
+def send_google_calendar_disconnected_email(connection_id, broken_notified_at):
+    """Deliver one reconnect email, retrying while its broken transition is current."""
+
+    return _deliver_google_calendar_disconnected_email(connection_id, broken_notified_at)
+
+
 def _google_calendar_connection_notification_payload(connection, error):
     return {
         "google_calendar_connection": {
@@ -174,7 +211,8 @@ def _mark_google_calendar_connection_broken(connection, error):
     update_fields = ["status", "last_error", "updated_at"]
     if first_notice:
         connection.broken_notified_at = timezone.now()
-        update_fields.append("broken_notified_at")
+        connection.broken_email_sent_at = None
+        update_fields.extend(["broken_notified_at", "broken_email_sent_at"])
     connection.save(update_fields=update_fields)
     if not first_notice:
         return False
@@ -194,12 +232,11 @@ def _mark_google_calendar_connection_broken(connection, error):
         message_stripped="Reconnect Google Calendar to resume syncing.",
         data=_google_calendar_connection_notification_payload(connection, error),
     )
-    receiver_email = connection.member.email
-    workspace_name = workspace.name
-    workspace_slug = workspace.slug
+    connection_id = str(connection.id)
+    broken_notified_at = connection.broken_notified_at.isoformat()
 
     def _send_disconnected_email():
-        send_google_calendar_disconnected_email.run(receiver_email, workspace_name, workspace_slug)
+        send_google_calendar_disconnected_email.delay(connection_id, broken_notified_at)
 
     transaction.on_commit(_send_disconnected_email, robust=True)
     return True
@@ -369,6 +406,19 @@ def _cleanup_recovery_candidates():
     )
 
 
+def _broken_email_recovery_candidates():
+    return (
+        GoogleCalendarConnection.objects.filter(
+            desired_state=GoogleCalendarConnection.DesiredState.CONNECTED,
+            status=GoogleCalendarConnection.Status.ERROR,
+            broken_notified_at__isnull=False,
+            broken_email_sent_at__isnull=True,
+        )
+        .order_by("id")
+        .values_list("id", "broken_notified_at")
+    )
+
+
 @transaction.atomic
 def _claim_cleanup_recovery(connection_id):
     try:
@@ -390,7 +440,7 @@ def _claim_cleanup_recovery(connection_id):
 
 @shared_task
 def schedule_google_calendar_reconciliations():
-    """Reconcile healthy, present, expired-attempt, and cleanup Calendar state."""
+    """Reconcile Calendar lifecycle state and pending broken-connection emails."""
 
     at = timezone.now()
     due_connection_ids = (
@@ -459,6 +509,17 @@ def schedule_google_calendar_reconciliations():
             logger.exception(
                 "Failed to publish Google Calendar cleanup recovery",
                 extra={"connection_id": str(connection_id), "generation": generation},
+            )
+            continue
+        published += 1
+
+    for connection_id, broken_notified_at in _broken_email_recovery_candidates().iterator():
+        try:
+            send_google_calendar_disconnected_email.delay(str(connection_id), broken_notified_at.isoformat())
+        except Exception:
+            logger.exception(
+                "Failed to publish Google Calendar disconnected email recovery",
+                extra={"connection_id": str(connection_id)},
             )
             continue
         published += 1

@@ -13,7 +13,9 @@ from django.test import override_settings
 from django.utils import timezone
 
 from plane.bgtasks.google_calendar_task import (
+    _deliver_google_calendar_disconnected_email,
     _mark_authorization_failure,
+    schedule_google_calendar_reconciliations,
     send_google_calendar_disconnected_email,
 )
 from plane.db.models import GoogleCalendarConnection, Notification
@@ -134,7 +136,7 @@ class TestGoogleCalendarBrokenNotice:
             workspace_integration__workspace__name="Acme",
         )
 
-        with patch.object(send_google_calendar_disconnected_email, "run") as send_email:
+        with patch.object(send_google_calendar_disconnected_email, "delay") as send_email:
             _mark_authorization_failure(connection, failure)
             connection.refresh_from_db()
             _mark_authorization_failure(connection, failure)
@@ -143,6 +145,7 @@ class TestGoogleCalendarBrokenNotice:
         assert connection.status == GoogleCalendarConnection.Status.ERROR
         assert connection.last_error == classification
         assert connection.broken_notified_at is not None
+        assert connection.broken_email_sent_at is None
         notification = Notification.objects.get(receiver=connection.member)
         assert notification.project_id is None
         assert notification.entity_name == "google_calendar_connection"
@@ -156,13 +159,45 @@ class TestGoogleCalendarBrokenNotice:
                 "action_url": "/acme/settings/integrations/google-calendar",
             }
         }
-        send_email.assert_called_once_with(connection.member.email, "Acme", "acme")
+        send_email.assert_called_once_with(str(connection.id), connection.broken_notified_at.isoformat())
 
-    def test_rejected_reconnect_preserves_health_until_usable_grant_is_validated(self):
-        notified_at = timezone.now() - timedelta(hours=1)
+    def test_failed_email_remains_due_and_is_republished(self):
+        notified_at = timezone.now()
         connection = GoogleCalendarConnectionFactory(
             bound_broken=True,
             broken_notified_at=notified_at,
+        )
+
+        with (
+            patch(
+                "plane.bgtasks.google_calendar_task._send_google_calendar_disconnected_email",
+                side_effect=OSError("mail server unavailable"),
+            ),
+            pytest.raises(OSError, match="mail server unavailable"),
+        ):
+            _deliver_google_calendar_disconnected_email(str(connection.id), notified_at.isoformat())
+
+        connection.refresh_from_db()
+        assert connection.broken_email_sent_at is None
+
+        with patch.object(
+            send_google_calendar_disconnected_email,
+            "delay",
+            side_effect=[OSError("broker unavailable"), None],
+        ) as send_email:
+            assert schedule_google_calendar_reconciliations.run() == 0
+            assert schedule_google_calendar_reconciliations.run() == 1
+
+        assert send_email.call_count == 2
+        send_email.assert_called_with(str(connection.id), notified_at.isoformat())
+
+    def test_rejected_reconnect_preserves_health_until_usable_grant_is_validated(self):
+        notified_at = timezone.now() - timedelta(hours=1)
+        email_sent_at = notified_at + timedelta(minutes=1)
+        connection = GoogleCalendarConnectionFactory(
+            bound_broken=True,
+            broken_notified_at=notified_at,
+            broken_email_sent_at=email_sent_at,
             oauth_state="attempt",
             refresh_token="invalid-old-refresh-token",
         )
@@ -186,6 +221,7 @@ class TestGoogleCalendarBrokenNotice:
         assert connection.status == GoogleCalendarConnection.Status.ERROR
         assert connection.last_error == "refresh_token_invalid"
         assert connection.broken_notified_at == notified_at
+        assert connection.broken_email_sent_at == email_sent_at
         assert connection.oauth_state == "attempt"
         assert connection.refresh_token == "invalid-old-refresh-token"
         assert connection.access_token == ""
@@ -205,20 +241,44 @@ class TestGoogleCalendarBrokenNotice:
         assert connection.status == GoogleCalendarConnection.Status.PENDING
         assert connection.last_error == ""
         assert connection.broken_notified_at is None
+        assert connection.broken_email_sent_at is None
         assert connection.oauth_state == ""
 
 
 @pytest.mark.unit
 class TestGoogleCalendarBrokenEmail:
+    def test_transient_delivery_failure_is_retried(self):
+        with patch(
+            "plane.bgtasks.google_calendar_task._deliver_google_calendar_disconnected_email",
+            side_effect=[OSError("mail server unavailable"), "sent"],
+        ) as deliver_email:
+            result = send_google_calendar_disconnected_email.apply(args=("connection-id", "notice-timestamp"))
+
+        assert result.successful()
+        assert result.result == "sent"
+        assert deliver_email.call_count == 2
+
     @override_settings(APP_BASE_URL="https://plane.example", WEB_URL="https://api.plane.example")
-    def test_disconnected_email_html_and_text_link_to_member_settings(self, mailoutbox):
+    @pytest.mark.django_db(transaction=True)
+    def test_disconnected_email_is_deduplicated_and_links_to_member_settings(self, mailoutbox):
+        notified_at = timezone.now()
+        connection = GoogleCalendarConnectionFactory(
+            bound_broken=True,
+            broken_notified_at=notified_at,
+            member__email="member@example.com",
+            workspace_integration__workspace__slug="acme",
+            workspace_integration__workspace__name="Acme",
+        )
         with patch(
             "plane.bgtasks.google_calendar_task.get_email_configuration",
             return_value=(None, None, None, 587, "0", "0", "Plane <team@plane.example>"),
         ):
-            send_google_calendar_disconnected_email.run("member@example.com", "Acme", "acme")
+            assert send_google_calendar_disconnected_email.run(str(connection.id), notified_at.isoformat()) == "sent"
+            assert send_google_calendar_disconnected_email.run(str(connection.id), notified_at.isoformat()) == "stale"
 
         assert len(mailoutbox) == 1
+        connection.refresh_from_db()
+        assert connection.broken_email_sent_at is not None
         email = mailoutbox[0]
         expected_url = "https://plane.example/acme/settings/integrations/google-calendar"
         text_action = re.search(r"Reconnect Google Calendar: (\S+)", email.body)

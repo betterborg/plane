@@ -412,6 +412,7 @@ def apply_google_calendar_oauth_success(
     calendar_connection.retain_grant_after_cleanup = False
     calendar_connection.last_error = ""
     calendar_connection.broken_notified_at = None
+    calendar_connection.broken_email_sent_at = None
     clear_google_calendar_oauth_attempt(calendar_connection)
     calendar_connection.save(
         update_fields=[
@@ -422,6 +423,7 @@ def apply_google_calendar_oauth_success(
             "retain_grant_after_cleanup",
             "last_error",
             "broken_notified_at",
+            "broken_email_sent_at",
             *_OAUTH_ATTEMPT_FIELDS,
             "updated_at",
         ]
