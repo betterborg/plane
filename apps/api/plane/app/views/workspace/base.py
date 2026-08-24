@@ -9,8 +9,9 @@ import os
 from datetime import date
 import uuid
 
+from celery import current_app
 from dateutil.relativedelta import relativedelta
-from django.db import IntegrityError
+from django.db import IntegrityError, transaction
 from django.db.models import Count, F, Func, OuterRef, Prefetch, Q
 
 from django.db.models.fields import DateField
@@ -47,6 +48,11 @@ from plane.utils.constants import RESTRICTED_WORKSPACE_SLUGS
 from plane.license.utils.instance_value import get_configuration_value
 from plane.bgtasks.workspace_seed_task import workspace_seed
 from plane.bgtasks.event_tracking_task import track_event
+from plane.integrations.google_calendar.dispatch import (
+    GOOGLE_CALENDAR_LIFECYCLE_TASK,
+    enqueue_google_calendar_task_on_commit,
+)
+from plane.integrations.google_calendar.lifecycle import request_google_calendar_workspace_teardown
 from plane.utils.url import contains_url
 from plane.utils.analytics_events import WORKSPACE_CREATED, WORKSPACE_DELETED
 from plane.utils.csv_utils import sanitize_csv_row
@@ -181,24 +187,41 @@ class WorkSpaceViewSet(BaseViewSet):
         return
 
     @allow_permission([ROLE.ADMIN], level="WORKSPACE")
+    @transaction.atomic
     def destroy(self, request, *args, **kwargs):
-        # Get the workspace
         workspace = self.get_object()
+        workspace_slug = workspace.slug
+        workspace_deleted_at = str(timezone.now().isoformat())
+
+        commands = request_google_calendar_workspace_teardown(workspace.id)
+        for command in commands:
+            lifecycle_task = current_app.signature(GOOGLE_CALENDAR_LIFECYCLE_TASK)
+            enqueue_google_calendar_task_on_commit(
+                lifecycle_task,
+                str(command.connection_id),
+                command.generation,
+            )
+
         self.remove_last_workspace_ids_from_user_settings(workspace.id)
-        track_event.delay(
-            user_id=request.user.id,
-            event_name=WORKSPACE_DELETED,
-            slug=workspace.slug,
-            event_properties={
-                "user_id": request.user.id,
-                "workspace_id": workspace.id,
-                "workspace_slug": workspace.slug,
-                "role": "owner",
-                "workspace_name": workspace.name,
-                "deleted_at": str(timezone.now().isoformat()),
-            },
-        )
-        return super().destroy(request, *args, **kwargs)
+        self.perform_destroy(workspace)
+
+        def _publish_workspace_deleted_analytics():
+            track_event.delay(
+                user_id=request.user.id,
+                event_name=WORKSPACE_DELETED,
+                slug=workspace_slug,
+                event_properties={
+                    "user_id": request.user.id,
+                    "workspace_id": workspace.id,
+                    "workspace_slug": workspace_slug,
+                    "role": "owner",
+                    "workspace_name": workspace.name,
+                    "deleted_at": workspace_deleted_at,
+                },
+            )
+
+        transaction.on_commit(_publish_workspace_deleted_analytics, robust=True)
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
 
 class UserWorkSpacesEndpoint(BaseAPIView):
