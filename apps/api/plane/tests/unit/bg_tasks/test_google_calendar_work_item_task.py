@@ -19,15 +19,17 @@ from plane.bgtasks.google_calendar_task import (
     backfill_google_calendar_open_issues,
     reconcile_google_calendar_workspace_issue_resyncs,
     reconcile_google_calendar_connection,
+    resync_google_calendar_label,
     resync_google_calendar_state_issues,
     resync_google_calendar_workspace_issues,
     synchronize_google_calendar_issue,
 )
 from plane.celery import app as celery_app
-from plane.db.models import GoogleCalendarEvent
+from plane.db.models import GoogleCalendarEvent, IssueLabel, Label
 from plane.integrations.google_calendar.client import GoogleCalendarClient, GoogleCalendarClientConflict
 from plane.integrations.google_calendar.dispatch import (
     GOOGLE_CALENDAR_ISSUE_SYNC_TASK,
+    GOOGLE_CALENDAR_LABEL_ISSUE_RESYNC_TASK,
     GOOGLE_CALENDAR_LIFECYCLE_TASK,
     GOOGLE_CALENDAR_STATE_ISSUE_RESYNC_TASK,
     GOOGLE_CALENDAR_WORKSPACE_ISSUE_RESYNC_METADATA_KEY,
@@ -42,6 +44,8 @@ from plane.tests.factories import (
     GoogleCalendarConnectionFactory,
     IssueAssigneeFactory,
     IssueFactory,
+    IssueLabelFactory,
+    LabelFactory,
     StateFactory,
     UserFactory,
     WorkspaceIntegrationFactory,
@@ -336,6 +340,107 @@ class TestGoogleCalendarWorkItemTask:
             state.save(update_fields=["group", "updated_at"])
 
             published = resync_google_calendar_state_issues.run(str(state.id))
+
+        assert published == 1
+        assert GoogleCalendarEvent.objects.filter(entity_id=self.issue.id).count() == 0
+        client.delete_event.assert_called_once()
+
+    def test_label_resync_dispatches_distinct_linked_issues_in_keyset_pages(self):
+        label = LabelFactory(project=self.issue.project)
+        linked_issues = [self.issue, IssueFactory(project=self.issue.project), IssueFactory(project=self.issue.project)]
+        relations = [IssueLabelFactory(issue=issue, label=label, project=self.issue.project) for issue in linked_issues]
+        IssueLabelFactory(issue=self.issue, label=label, project=self.issue.project)
+        other_label = LabelFactory(project=self.issue.project)
+        IssueLabelFactory(issue=IssueFactory(project=self.issue.project), label=other_label, project=self.issue.project)
+        IssueLabel.objects.filter(id=relations[1].id).delete()
+        expected_ids = sorted((issue.id for issue in linked_issues), key=str)
+
+        with (
+            patch("plane.db.signals.dispatch_google_calendar_issue_sync") as dispatch,
+            patch("plane.bgtasks.google_calendar_task.publish_google_calendar_task") as publish,
+        ):
+            published = resync_google_calendar_label.run(str(label.id), batch_size=2)
+
+        assert published == 2
+        assert [call.args[0] for call in dispatch.call_args_list] == expected_ids[:2]
+        publish.assert_called_once()
+        continuation = publish.call_args
+        assert continuation.args[0].task == GOOGLE_CALENDAR_LABEL_ISSUE_RESYNC_TASK
+        assert continuation.args[1:] == (str(label.id), str(expected_ids[1]), 2)
+
+        with (
+            patch("plane.db.signals.dispatch_google_calendar_issue_sync") as dispatch,
+            patch("plane.bgtasks.google_calendar_task.publish_google_calendar_task") as publish,
+        ):
+            published = resync_google_calendar_label.run(
+                str(label.id),
+                after_id=str(expected_ids[1]),
+                batch_size=2,
+            )
+
+        assert published == 1
+        dispatch.assert_called_once_with(expected_ids[2])
+        publish.assert_not_called()
+
+    def test_label_resync_converges_renamed_and_recursively_deleted_descriptions(self):
+        client = _provider_client()
+        label = LabelFactory(project=self.issue.project, name="Needs review")
+        relation = IssueLabelFactory(issue=self.issue, label=label, project=self.issue.project)
+
+        def synchronize_now(issue_id):
+            return synchronize_google_calendar_issue.run(str(issue_id))
+
+        with (
+            patch("plane.bgtasks.google_calendar_task.GoogleCalendarClient", return_value=client),
+            patch("plane.db.signals.dispatch_google_calendar_issue_sync", side_effect=synchronize_now),
+        ):
+            synchronize_google_calendar_issue.run(str(self.issue.id))
+
+            label.name = "Customer request"
+            label.save(update_fields=["name", "updated_at"])
+            renamed_result = resync_google_calendar_label.run(str(label.id))
+            repeated_renamed_result = resync_google_calendar_label.run(str(label.id))
+
+            Label.all_objects.filter(id=label.id).update(deleted_at=timezone.now())
+            IssueLabel.all_objects.filter(id=relation.id).update(deleted_at=timezone.now())
+            deleted_result = resync_google_calendar_label.run(str(label.id))
+            repeated_deleted_result = resync_google_calendar_label.run(str(label.id))
+
+        assert renamed_result == 1
+        assert repeated_renamed_result == 1
+        assert deleted_result == 1
+        assert repeated_deleted_result == 1
+        assert client.update_event.call_count == 2
+        renamed_payload, deleted_payload = [call.args[2] for call in client.update_event.call_args_list[-2:]]
+        assert "Labels: Customer request" in renamed_payload["description"]
+        assert "Needs review" not in renamed_payload["description"]
+        assert deleted_payload["description"].endswith("Labels: ")
+        assert "Customer request" not in deleted_payload["description"]
+
+    def test_label_resync_rechecks_filter_eligibility_after_recursive_deletion(self):
+        client = _provider_client()
+        label = LabelFactory(project=self.issue.project)
+        relation = IssueLabelFactory(issue=self.issue, label=label, project=self.issue.project)
+        self.workspace_integration.config = {
+            "enabled": True,
+            "mode": "filter",
+            "priorities": [],
+            "label_ids": [str(label.id)],
+            "label_match": "any",
+        }
+        self.workspace_integration.save(update_fields=["config", "updated_at"])
+
+        def synchronize_now(issue_id):
+            return synchronize_google_calendar_issue.run(str(issue_id))
+
+        with (
+            patch("plane.bgtasks.google_calendar_task.GoogleCalendarClient", return_value=client),
+            patch("plane.db.signals.dispatch_google_calendar_issue_sync", side_effect=synchronize_now),
+        ):
+            synchronize_google_calendar_issue.run(str(self.issue.id))
+            Label.all_objects.filter(id=label.id).update(deleted_at=timezone.now())
+            IssueLabel.all_objects.filter(id=relation.id).update(deleted_at=timezone.now())
+            published = resync_google_calendar_label.run(str(label.id))
 
         assert published == 1
         assert GoogleCalendarEvent.objects.filter(entity_id=self.issue.id).count() == 0
