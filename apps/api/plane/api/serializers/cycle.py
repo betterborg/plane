@@ -56,6 +56,7 @@ class CycleCreateSerializer(BaseSerializer):
             "created_at",
             "updated_at",
             "deleted_at",
+            "timezone",
         ]
 
     def validate(self, data):
@@ -73,23 +74,24 @@ class CycleCreateSerializer(BaseSerializer):
             raise serializers.ValidationError("Project not found")
         if not project.cycle_view:
             raise serializers.ValidationError("Cycles are not enabled for this project")
-        if (
-            data.get("start_date", None) is not None
-            and data.get("end_date", None) is not None
-            and data.get("start_date", None) > data.get("end_date", None)
-        ):
-            raise serializers.ValidationError("Start date cannot exceed end date")
+        date_fields = ("start_date", "end_date")
+        dates_changed = any(field in data for field in date_fields)
 
-        if data.get("start_date", None) is not None and data.get("end_date", None) is not None:
-            data["start_date"] = convert_to_utc(
-                date=str(data.get("start_date").date()),
-                project_id=project_id,
-                is_start_date=True,
-            )
-            data["end_date"] = convert_to_utc(
-                date=str(data.get("end_date", None).date()),
-                project_id=project_id,
-            )
+        if self.instance is None or dates_changed:
+            for field, is_start_date in (("start_date", True), ("end_date", False)):
+                if field in data and data[field] is not None:
+                    data[field] = convert_to_utc(
+                        date=str(data[field].date()),
+                        project_id=project_id,
+                        is_start_date=is_start_date,
+                        project_timezone=project.timezone,
+                    )
+            data["timezone"] = project.timezone
+
+        start_date = data.get("start_date", self.instance.start_date if self.instance else None)
+        end_date = data.get("end_date", self.instance.end_date if self.instance else None)
+        if start_date is not None and end_date is not None and start_date > end_date:
+            raise serializers.ValidationError("Start date cannot exceed end date")
 
         if not data.get("owned_by"):
             data["owned_by"] = self.context["request"].user

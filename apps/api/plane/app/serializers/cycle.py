@@ -8,39 +8,43 @@ from rest_framework import serializers
 # Module imports
 from .base import BaseSerializer
 from .issue import IssueStateSerializer
-from plane.db.models import Cycle, CycleIssue, CycleUserProperties
+from plane.db.models import Cycle, CycleIssue, CycleUserProperties, Project
 from plane.utils.timezone_converter import convert_to_utc
 
 
 class CycleWriteSerializer(BaseSerializer):
     def validate(self, data):
-        if (
-            data.get("start_date", None) is not None
-            and data.get("end_date", None) is not None
-            and data.get("start_date", None) > data.get("end_date", None)
-        ):
+        project_id = (
+            self.context.get("project_id", None)
+            or (self.instance and self.instance.project_id)
+            or self.initial_data.get("project_id", None)
+        )
+        date_fields = ("start_date", "end_date")
+        dates_changed = any(field in data for field in date_fields)
+
+        if self.instance is None or dates_changed:
+            project = Project.objects.only("timezone").get(id=project_id)
+            for field, is_start_date in (("start_date", True), ("end_date", False)):
+                if field in data and data[field] is not None:
+                    data[field] = convert_to_utc(
+                        date=str(data[field].date()),
+                        project_id=project_id,
+                        is_start_date=is_start_date,
+                        project_timezone=project.timezone,
+                    )
+            data["timezone"] = project.timezone
+
+        start_date = data.get("start_date", self.instance.start_date if self.instance else None)
+        end_date = data.get("end_date", self.instance.end_date if self.instance else None)
+        if start_date is not None and end_date is not None and start_date > end_date:
             raise serializers.ValidationError("Start date cannot exceed end date")
-        if data.get("start_date", None) is not None and data.get("end_date", None) is not None:
-            project_id = (
-                self.initial_data.get("project_id", None)
-                or (self.instance and self.instance.project_id)
-                or self.context.get("project_id", None)
-            )
-            data["start_date"] = convert_to_utc(
-                date=str(data.get("start_date").date()),
-                project_id=project_id,
-                is_start_date=True,
-            )
-            data["end_date"] = convert_to_utc(
-                date=str(data.get("end_date", None).date()),
-                project_id=project_id,
-            )
+
         return data
 
     class Meta:
         model = Cycle
         fields = "__all__"
-        read_only_fields = ["workspace", "project", "owned_by", "archived_at"]
+        read_only_fields = ["workspace", "project", "owned_by", "archived_at", "timezone"]
 
 
 class CycleSerializer(BaseSerializer):
@@ -69,6 +73,7 @@ class CycleSerializer(BaseSerializer):
             "description",
             "start_date",
             "end_date",
+            "timezone",
             "owned_by_id",
             "view_props",
             "sort_order",
