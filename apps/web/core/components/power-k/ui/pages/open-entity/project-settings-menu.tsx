@@ -13,6 +13,8 @@ import type { TPowerKContext } from "@/components/power-k/core/types";
 import { PowerKSettingsMenu } from "@/components/power-k/menus/settings";
 import { PROJECT_SETTINGS_ICONS } from "@/components/settings/project/sidebar/item-icon";
 // hooks
+import { useGoogleCalendarWorkspaceStatus } from "@/hooks/use-google-calendar-workspace-status";
+import { useInstance } from "@/hooks/store/use-instance";
 import { useUserPermissions } from "@/hooks/store/user";
 
 type Props = {
@@ -25,21 +27,38 @@ export const PowerKOpenProjectSettingsMenu = observer(function PowerKOpenProject
   // plane hooks
   const { t } = useTranslation();
   // store hooks
+  const { config } = useInstance();
   const { allowPermissions } = useUserPermissions();
   // derived values
+  const workspaceSlug = context.params.workspaceSlug?.toString();
+  const projectId = context.params.projectId?.toString();
+  const canAccessGoogleCalendar = Boolean(
+    workspaceSlug &&
+    projectId &&
+    allowPermissions(
+      PROJECT_SETTINGS.features_google_calendar.access,
+      EUserPermissionsLevel.PROJECT,
+      workspaceSlug,
+      projectId
+    )
+  );
+  const { data: googleCalendarStatus } = useGoogleCalendarWorkspaceStatus(
+    workspaceSlug,
+    Boolean(config?.is_google_calendar_available && canAccessGoogleCalendar)
+  );
   const settingsList = Object.values(PROJECT_SETTINGS).filter(
     (setting) =>
-      context.params.workspaceSlug &&
-      context.params.projectId &&
-      allowPermissions(
-        setting.access,
-        EUserPermissionsLevel.PROJECT,
-        context.params.workspaceSlug?.toString(),
-        context.params.projectId?.toString()
-      )
+      workspaceSlug &&
+      projectId &&
+      (setting.key !== "features_google_calendar" || googleCalendarStatus?.policy.enabled) &&
+      allowPermissions(setting.access, EUserPermissionsLevel.PROJECT, workspaceSlug, projectId)
   );
   const settingsListWithIcons = settingsList.map((setting) => ({
-    ...setting,
+    key: setting.key,
+    i18n_label: setting.i18n_label,
+    href: setting.href,
+    access: setting.access,
+    highlight: setting.highlight,
     label: t(setting.i18n_label),
     icon: PROJECT_SETTINGS_ICONS[setting.key],
   }));

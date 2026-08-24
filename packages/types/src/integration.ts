@@ -79,6 +79,10 @@ export interface IGoogleCalendarFilterOptions {
   }[];
 }
 
+export interface IGoogleCalendarProjectSync {
+  google_calendar_sync_enabled: boolean;
+}
+
 export interface IGoogleCalendarConnectionRosterItem {
   member: IUserLite;
   connection: IGoogleCalendarConnectionStatus & {

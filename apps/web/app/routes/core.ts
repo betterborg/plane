@@ -331,6 +331,10 @@ export const coreRoutes: RouteConfigEntry[] = [
               ":workspaceSlug/settings/projects/:projectId/features/intake",
               "./(all)/[workspaceSlug]/(settings)/settings/projects/[projectId]/features/intake/page.tsx"
             ),
+            route(
+              ":workspaceSlug/settings/projects/:projectId/features/google-calendar",
+              "./(all)/[workspaceSlug]/(settings)/settings/projects/[projectId]/features/google-calendar/page.tsx"
+            ),
             // Project States
             route(
               ":workspaceSlug/settings/projects/:projectId/states",

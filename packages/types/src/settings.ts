@@ -33,6 +33,7 @@ export type TProjectSettingsTabs =
   | "features_views"
   | "features_pages"
   | "features_intake"
+  | "features_google_calendar"
   | "states"
   | "labels"
   | "estimates"

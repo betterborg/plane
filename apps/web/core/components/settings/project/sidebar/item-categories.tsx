@@ -11,6 +11,7 @@ import { useParams } from "react-router";
 import {
   EUserPermissionsLevel,
   GROUPED_PROJECT_SETTINGS,
+  PROJECT_SETTINGS,
   PROJECT_SETTINGS_CATEGORIES,
   PROJECT_SETTINGS_CATEGORY_LABELS,
 } from "@plane/constants";
@@ -18,6 +19,8 @@ import { useTranslation } from "@plane/i18n";
 // components
 import { SettingsSidebarItem } from "@/components/settings/sidebar/item";
 // hooks
+import { useGoogleCalendarWorkspaceStatus } from "@/hooks/use-google-calendar-workspace-status";
+import { useInstance } from "@/hooks/store/use-instance";
 import { useUserPermissions } from "@/hooks/store/user";
 // local imports
 import { PROJECT_SETTINGS_ICONS } from "./item-icon";
@@ -34,7 +37,19 @@ export const ProjectSettingsSidebarItemCategories = observer(function ProjectSet
   const { workspaceSlug } = useParams();
   const pathname = usePathname();
   // store hooks
+  const { config } = useInstance();
   const { allowPermissions } = useUserPermissions();
+  // derived values
+  const canAccessGoogleCalendar = allowPermissions(
+    PROJECT_SETTINGS.features_google_calendar.access,
+    EUserPermissionsLevel.PROJECT,
+    workspaceSlug,
+    projectId
+  );
+  const { data: googleCalendarStatus } = useGoogleCalendarWorkspaceStatus(
+    workspaceSlug,
+    Boolean(config?.is_google_calendar_available && canAccessGoogleCalendar)
+  );
   // translation
   const { t } = useTranslation();
 
@@ -42,8 +57,10 @@ export const ProjectSettingsSidebarItemCategories = observer(function ProjectSet
     <div className="mt-3 flex flex-col divide-y divide-subtle px-3">
       {PROJECT_SETTINGS_CATEGORIES.map((category) => {
         const categoryItems = GROUPED_PROJECT_SETTINGS[category];
-        const accessibleItems = categoryItems.filter((item) =>
-          allowPermissions(item.access, EUserPermissionsLevel.PROJECT, workspaceSlug, projectId)
+        const accessibleItems = categoryItems.filter(
+          (item) =>
+            (item.key !== "features_google_calendar" || googleCalendarStatus?.policy.enabled) &&
+            allowPermissions(item.access, EUserPermissionsLevel.PROJECT, workspaceSlug, projectId)
         );
 
         if (accessibleItems.length === 0) return null;
