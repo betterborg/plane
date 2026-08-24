@@ -37,6 +37,7 @@ from plane.db.models import (
     Workspace,
     FileAsset,
 )
+from plane.db.signals import dispatch_google_calendar_cycle_sync
 from .. import BaseViewSet
 from plane.bgtasks.issue_activities_task import issue_activity
 from plane.utils.issue_filters import issue_filters
@@ -245,6 +246,7 @@ class WorkspaceDraftIssueViewSet(BaseViewSet):
                     created_by_id=draft_issue.created_by_id,
                     updated_by_id=draft_issue.updated_by_id,
                 )
+                dispatch_google_calendar_cycle_sync(created_records.cycle_id)
                 # Capture Issue Activity
                 issue_activity.delay(
                     type="cycle.activity.created",
