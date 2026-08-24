@@ -71,6 +71,7 @@ from plane.integrations.google_calendar.lifecycle import (
     clear_google_calendar_oauth_attempt,
     complete_google_calendar_disconnect,
     has_usable_google_calendar_grant,
+    lock_google_calendar_cleanup_connection,
     lock_google_calendar_connection,
     mark_google_calendar_connection_active,
     mark_google_calendar_connection_error,
@@ -245,9 +246,40 @@ def _clear_expired_oauth_attempt(connection_id, attempt_generation, expires_at, 
     return True
 
 
+def _cleanup_recovery_candidates():
+    return (
+        GoogleCalendarConnection.all_objects.filter(
+            desired_state=GoogleCalendarConnection.DesiredState.DISCONNECTED,
+            status=GoogleCalendarConnection.Status.CLEANUP_PENDING,
+        )
+        .filter(Q(retain_grant_after_cleanup=False) | ~Q(calendar_id="") | Q(calendar_operation_id__isnull=False))
+        .order_by("id")
+        .values_list("id", flat=True)
+    )
+
+
+@transaction.atomic
+def _claim_cleanup_recovery(connection_id):
+    try:
+        connection = lock_google_calendar_cleanup_connection(connection_id)
+    except GoogleCalendarConnection.DoesNotExist:
+        return None
+    if (
+        connection.desired_state != GoogleCalendarConnection.DesiredState.DISCONNECTED
+        or connection.status != GoogleCalendarConnection.Status.CLEANUP_PENDING
+        or (
+            connection.retain_grant_after_cleanup
+            and not connection.calendar_id
+            and connection.calendar_operation_id is None
+        )
+    ):
+        return None
+    return connection.lifecycle_generation
+
+
 @shared_task
 def schedule_google_calendar_reconciliations():
-    """Reconcile healthy, present, and expired-attempt Calendar state."""
+    """Reconcile healthy, present, expired-attempt, and cleanup Calendar state."""
 
     at = timezone.now()
     due_connection_ids = (
@@ -304,6 +336,21 @@ def schedule_google_calendar_reconciliations():
     for page in _expired_oauth_attempt_pages(at):
         for candidate in page:
             _clear_expired_oauth_attempt(*candidate, at)
+
+    for connection_id in _cleanup_recovery_candidates().iterator():
+        generation = _claim_cleanup_recovery(connection_id)
+        if generation is None:
+            continue
+        lifecycle_task = current_app.signature(GOOGLE_CALENDAR_LIFECYCLE_TASK)
+        try:
+            publish_google_calendar_task(lifecycle_task, str(connection_id), generation)
+        except Exception:
+            logger.exception(
+                "Failed to publish Google Calendar cleanup recovery",
+                extra={"connection_id": str(connection_id), "generation": generation},
+            )
+            continue
+        published += 1
     return published
 
 
@@ -1947,7 +1994,7 @@ def _account_has_other_token_bearing_connection(connection):
     if not connection.provider_account_id:
         return False
     return (
-        GoogleCalendarConnection.objects.select_for_update()
+        GoogleCalendarConnection.all_objects.select_for_update()
         .filter(provider_account_id=connection.provider_account_id)
         .exclude(id=connection.id)
         .filter(Q(access_token__gt="") | Q(refresh_token__gt=""))
@@ -1963,12 +2010,25 @@ def _prepare_reconciliation(connection_id, generation):
     try:
         connection = lock_google_calendar_connection(connection_id)
     except GoogleCalendarConnection.DoesNotExist:
-        return "missing"
-    connection.workspace_integration = WorkspaceIntegration.objects.select_for_update().get(
-        id=connection.workspace_integration_id
-    )
+        try:
+            connection = lock_google_calendar_cleanup_connection(connection_id)
+        except GoogleCalendarConnection.DoesNotExist:
+            return "missing"
+        if (
+            connection.desired_state != GoogleCalendarConnection.DesiredState.DISCONNECTED
+            or connection.status != GoogleCalendarConnection.Status.CLEANUP_PENDING
+        ):
+            return "missing"
     if connection.lifecycle_generation != generation:
         return "stale"
+    integration_manager = (
+        WorkspaceIntegration.all_objects
+        if connection.desired_state == GoogleCalendarConnection.DesiredState.DISCONNECTED
+        else WorkspaceIntegration.objects
+    )
+    connection.workspace_integration = integration_manager.select_for_update().get(
+        id=connection.workspace_integration_id
+    )
     if (
         connection.desired_state == GoogleCalendarConnection.DesiredState.CONNECTED
         and connection.status == GoogleCalendarConnection.Status.PENDING
@@ -2097,7 +2157,7 @@ def _converge_present(connection, generation):
 
 @transaction.atomic
 def _delete_absent_calendar(connection, generation):
-    connection = lock_google_calendar_connection(connection.id)
+    connection = lock_google_calendar_cleanup_connection(connection.id)
     if not _owns_generation(
         connection,
         generation,
@@ -2106,7 +2166,7 @@ def _delete_absent_calendar(connection, generation):
     ):
         return "stale"
 
-    connection.workspace_integration = WorkspaceIntegration.objects.select_for_update().get(
+    connection.workspace_integration = WorkspaceIntegration.all_objects.select_for_update().get(
         id=connection.workspace_integration_id
     )
     client = _client_for(connection)
@@ -2154,7 +2214,7 @@ def _delete_absent_calendar(connection, generation):
 
 @transaction.atomic
 def _complete_absent(connection, generation):
-    connection = lock_google_calendar_connection(connection.id)
+    connection = lock_google_calendar_cleanup_connection(connection.id)
     if not _owns_generation(
         connection,
         generation,
@@ -2177,7 +2237,7 @@ def _complete_absent(connection, generation):
     except (GoogleCalendarClientError, GoogleCalendarOAuthConfigurationError) as exc:
         return _record_cleanup_error(connection, generation, exc)
 
-    GoogleCalendarEvent.objects.filter(connection=connection).delete(soft=False)
+    GoogleCalendarEvent.all_objects.filter(connection=connection).delete()
 
     retain_grant = connection.retain_grant_after_cleanup
     if not retain_grant and not _account_has_other_token_bearing_connection(connection):
@@ -2209,8 +2269,13 @@ def reconcile_google_calendar_connection(connection_id, generation):
     prepared_state = _prepare_reconciliation(connection_id, generation)
     if prepared_state in {"missing", "stale"}:
         return prepared_state
+    connection_manager = (
+        GoogleCalendarConnection.all_objects
+        if prepared_state == GoogleCalendarConnection.DesiredState.DISCONNECTED
+        else GoogleCalendarConnection.objects
+    )
     try:
-        connection = GoogleCalendarConnection.objects.get(id=connection_id)
+        connection = connection_manager.get(id=connection_id)
     except GoogleCalendarConnection.DoesNotExist:
         return "missing"
     if prepared_state == GoogleCalendarConnection.DesiredState.CONNECTED:

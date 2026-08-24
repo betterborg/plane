@@ -169,6 +169,14 @@ def lock_google_calendar_connection(connection_id):
     return GoogleCalendarConnection.objects.select_for_update().get(id=connection_id)
 
 
+def lock_google_calendar_cleanup_connection(connection_id):
+    """Lock a cleanup row even when its owning objects have been soft-deleted."""
+
+    _acquire_global_lock()
+    _acquire_connection_lock(connection_id)
+    return GoogleCalendarConnection.all_objects.select_for_update().get(id=connection_id)
+
+
 def lock_google_calendar_global_state():
     """Serialize an instance-wide Calendar policy operation with lifecycle work."""
 
@@ -532,7 +540,7 @@ def mark_google_calendar_connection_error(connection_id, expected_generation, er
 def record_google_calendar_cleanup_error(connection_id, expected_generation, error):
     """Keep unfinished cleanup nonterminal while recording its latest error."""
 
-    calendar_connection = lock_google_calendar_connection(connection_id)
+    calendar_connection = lock_google_calendar_cleanup_connection(connection_id)
     _assert_generation(calendar_connection, expected_generation)
     if (
         calendar_connection.desired_state != GoogleCalendarConnection.DesiredState.DISCONNECTED
@@ -548,7 +556,7 @@ def record_google_calendar_cleanup_error(connection_id, expected_generation, err
 def complete_google_calendar_disconnect(connection_id, expected_generation):
     """Finish provider cleanup according to the durable generation intent."""
 
-    calendar_connection = lock_google_calendar_connection(connection_id)
+    calendar_connection = lock_google_calendar_cleanup_connection(connection_id)
     retain_grant = calendar_connection.retain_grant_after_cleanup
     _transition(
         calendar_connection,
