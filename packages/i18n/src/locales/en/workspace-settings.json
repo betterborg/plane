@@ -236,6 +236,37 @@
                 "delete": "Delete calendar events"
               }
             },
+            "mode": {
+              "title": "Work item selection",
+              "description": "Choose whether each member sees assigned work items or work items matching a workspace filter.",
+              "options": {
+                "assignment": "Assigned work items",
+                "filter": "Filtered work items"
+              }
+            },
+            "priorities": {
+              "title": "Priorities",
+              "description": "A work item can match any selected priority.",
+              "placeholder": "Select priorities"
+            },
+            "labels": {
+              "title": "Labels",
+              "description": "Select the workspace labels used by this filter.",
+              "placeholder": "Select labels"
+            },
+            "label_match": {
+              "title": "Label matching",
+              "description": "Choose whether a work item must match any or all selected labels.",
+              "options": {
+                "any": "Match any label",
+                "all": "Match all labels"
+              }
+            },
+            "filter_composition": "When priorities and labels are both selected, a work item must match both categories.",
+            "filter_validation": "Select at least one priority or label before saving filter mode.",
+            "filter_options_error": "Filter options could not be loaded. Please try again.",
+            "retry": "Retry",
+            "save_filter": "Save work item selection",
             "disable": {
               "title": "Disable Google Calendar?",
               "description": "Members will no longer be able to connect. Plane will delete every dedicated calendar and clean up its connection. Cleanup can take time, and you cannot re-enable the integration until it finishes.",
