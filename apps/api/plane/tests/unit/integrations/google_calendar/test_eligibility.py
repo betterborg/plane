@@ -119,6 +119,11 @@ class TestGoogleCalendarIssueEligibility:
             is False
         )
 
+    def test_project_opt_out_makes_an_item_ineligible(self):
+        self.issue.project.google_calendar_sync_enabled = False
+
+        assert is_issue_assignment_eligible(self.issue, self.connection) is False
+
     @pytest.mark.parametrize(
         ("priorities", "issue_priority", "expected"),
         (

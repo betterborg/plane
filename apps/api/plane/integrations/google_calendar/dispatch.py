@@ -13,6 +13,7 @@ GOOGLE_CALENDAR_ISSUE_SYNC_TASK = "plane.bgtasks.google_calendar_task.synchroniz
 GOOGLE_CALENDAR_OPEN_BACKFILL_TASK = "plane.bgtasks.google_calendar_task.backfill_google_calendar_open_issues"
 GOOGLE_CALENDAR_STATE_ISSUE_RESYNC_TASK = "plane.bgtasks.google_calendar_task.resync_google_calendar_state_issues"
 GOOGLE_CALENDAR_LABEL_ISSUE_RESYNC_TASK = "plane.bgtasks.google_calendar_task.resync_google_calendar_label"
+GOOGLE_CALENDAR_PROJECT_ISSUE_RESYNC_TASK = "plane.bgtasks.google_calendar_task.resync_google_calendar_project_issues"
 GOOGLE_CALENDAR_WORKSPACE_ISSUE_RESYNC_TASK = (
     "plane.bgtasks.google_calendar_task.resync_google_calendar_workspace_issues"
 )

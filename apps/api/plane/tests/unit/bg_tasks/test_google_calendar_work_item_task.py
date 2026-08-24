@@ -20,6 +20,7 @@ from plane.bgtasks.google_calendar_task import (
     reconcile_google_calendar_workspace_issue_resyncs,
     reconcile_google_calendar_connection,
     resync_google_calendar_label,
+    resync_google_calendar_project_issues,
     resync_google_calendar_state_issues,
     resync_google_calendar_workspace_issues,
     synchronize_google_calendar_issue,
@@ -31,6 +32,7 @@ from plane.integrations.google_calendar.dispatch import (
     GOOGLE_CALENDAR_ISSUE_SYNC_TASK,
     GOOGLE_CALENDAR_LABEL_ISSUE_RESYNC_TASK,
     GOOGLE_CALENDAR_LIFECYCLE_TASK,
+    GOOGLE_CALENDAR_PROJECT_ISSUE_RESYNC_TASK,
     GOOGLE_CALENDAR_STATE_ISSUE_RESYNC_TASK,
     GOOGLE_CALENDAR_WORKSPACE_ISSUE_RESYNC_METADATA_KEY,
     GOOGLE_CALENDAR_WORKSPACE_ISSUE_RESYNC_RECONCILIATION_TASK,
@@ -445,6 +447,104 @@ class TestGoogleCalendarWorkItemTask:
         assert published == 1
         assert GoogleCalendarEvent.objects.filter(entity_id=self.issue.id).count() == 0
         client.delete_event.assert_called_once()
+
+    def test_project_resync_converges_committed_inclusion_and_archive_state(self):
+        client = _provider_client()
+
+        def synchronize_now(task, issue_id):
+            return synchronize_google_calendar_issue.run(issue_id)
+
+        with (
+            patch("plane.bgtasks.google_calendar_task.GoogleCalendarClient", return_value=client),
+            patch(
+                "plane.bgtasks.google_calendar_task.publish_google_calendar_task",
+                side_effect=synchronize_now,
+            ),
+        ):
+            self.issue.project.google_calendar_sync_enabled = False
+            self.issue.project.save(update_fields=["google_calendar_sync_enabled", "updated_at"])
+            assert resync_google_calendar_project_issues.run(str(self.issue.project_id)) == 1
+            assert GoogleCalendarEvent.objects.filter(entity_id=self.issue.id).count() == 0
+
+            self.issue.project.google_calendar_sync_enabled = True
+            self.issue.project.save(update_fields=["google_calendar_sync_enabled", "updated_at"])
+            assert resync_google_calendar_project_issues.run(str(self.issue.project_id)) == 1
+            assert GoogleCalendarEvent.objects.filter(entity_id=self.issue.id).count() == 1
+
+            self.issue.project.google_calendar_sync_enabled = False
+            self.issue.project.save(update_fields=["google_calendar_sync_enabled", "updated_at"])
+            assert resync_google_calendar_project_issues.run(str(self.issue.project_id)) == 1
+            assert GoogleCalendarEvent.objects.filter(entity_id=self.issue.id).count() == 0
+
+            self.issue.project.google_calendar_sync_enabled = True
+            self.issue.project.save(update_fields=["google_calendar_sync_enabled", "updated_at"])
+            assert resync_google_calendar_project_issues.run(str(self.issue.project_id)) == 1
+            assert GoogleCalendarEvent.objects.filter(entity_id=self.issue.id).count() == 1
+
+            self.issue.project.archived_at = timezone.now()
+            self.issue.project.save(update_fields=["archived_at", "updated_at"])
+            assert resync_google_calendar_project_issues.run(str(self.issue.project_id)) == 1
+            assert GoogleCalendarEvent.objects.filter(entity_id=self.issue.id).count() == 0
+
+            self.issue.project.archived_at = None
+            self.issue.project.save(update_fields=["archived_at", "updated_at"])
+            assert resync_google_calendar_project_issues.run(str(self.issue.project_id)) == 1
+
+        assert GoogleCalendarEvent.objects.filter(entity_id=self.issue.id).count() == 1
+        assert client.insert_event.call_count == 3
+        assert client.delete_event.call_count == 2
+
+    def test_project_resync_reuses_assignee_and_correlation_fanout(self):
+        second_connection = GoogleCalendarConnectionFactory(
+            workspace_integration=self.workspace_integration,
+            member=UserFactory(),
+            active=True,
+        )
+        IssueAssigneeFactory(issue=self.issue, assignee=second_connection.member, project=self.issue.project)
+        client = _provider_client()
+
+        def synchronize_now(task, issue_id):
+            return synchronize_google_calendar_issue.run(issue_id)
+
+        with (
+            patch("plane.bgtasks.google_calendar_task.GoogleCalendarClient", return_value=client),
+            patch(
+                "plane.bgtasks.google_calendar_task.publish_google_calendar_task",
+                side_effect=synchronize_now,
+            ),
+        ):
+            resync_google_calendar_project_issues.run(str(self.issue.project_id))
+            self.issue.issue_assignee.get(assignee=second_connection.member).delete()
+            resync_google_calendar_project_issues.run(str(self.issue.project_id))
+
+        assert GoogleCalendarEvent.objects.filter(entity_id=self.issue.id).count() == 1
+        assert GoogleCalendarEvent.objects.filter(connection=self.connection, entity_id=self.issue.id).exists()
+        assert client.insert_event.call_count == 2
+        client.delete_event.assert_called_once()
+
+    def test_project_resync_is_project_scoped_and_paces_pages(self):
+        second_issue = IssueFactory(project=self.issue.project)
+        third_issue = IssueFactory(project=self.issue.project)
+        foreign_issue = IssueFactory(project__workspace=self.workspace_integration.workspace)
+
+        with patch("plane.bgtasks.google_calendar_task.publish_google_calendar_task") as publish:
+            published = resync_google_calendar_project_issues.run(str(self.issue.project_id), batch_size=2)
+
+        assert published == 2
+        assert publish.call_count == 3
+        first_sync, second_sync, continuation = publish.call_args_list
+        assert {first_sync.args[1], second_sync.args[1]} < {
+            str(self.issue.id),
+            str(second_issue.id),
+            str(third_issue.id),
+        }
+        assert str(foreign_issue.id) not in {first_sync.args[1], second_sync.args[1]}
+        assert first_sync.args[0].options["countdown"] == 0
+        assert second_sync.args[0].options["countdown"] == 1
+        assert continuation.args[0].task == GOOGLE_CALENDAR_PROJECT_ISSUE_RESYNC_TASK
+        assert continuation.args[0].options["countdown"] == 2
+        assert continuation.args[1] == str(self.issue.project_id)
+        assert continuation.args[3] == 2
 
     def test_workspace_resync_includes_current_and_ledger_only_issue_ids_once(self):
         ledger_only_issue_id = uuid4()
