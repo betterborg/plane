@@ -141,9 +141,9 @@ export class WorkspaceNotificationStore implements IWorkspaceNotificationStore {
           }
         } else {
           if (this.filters.snoozed) {
-            return n.snoozed_till ? true : false;
+            return Boolean(n.snoozed_till);
           } else if (this.filters.archived) {
-            return n.archived_at ? true : false;
+            return Boolean(n.archived_at);
           } else {
             return true;
           }
@@ -163,11 +163,12 @@ export class WorkspaceNotificationStore implements IWorkspaceNotificationStore {
     const { workspaceSlug } = this.store.router;
     const notification = this.notifications[notificationId];
     if (!notification || !workspaceSlug) return {} as TNotificationLite;
+    const issueId = notification.data && "issue" in notification.data ? notification.data.issue?.id : undefined;
     return {
       workspace_slug: workspaceSlug,
-      project_id: notification.project,
+      project_id: notification.project ?? undefined,
       notification_id: notification.id,
-      issue_id: notification.data?.issue?.id,
+      issue_id: issueId,
       is_inbox_issue: notification.is_inbox_issue || false,
     };
   });

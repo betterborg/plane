@@ -160,10 +160,12 @@ export function NotificationContent({
   renderCommentBox?: boolean;
 }) {
   const { data, triggered_by_details: triggeredBy } = notification;
-  const notificationField = data?.issue_activity.field;
-  const newValue = data?.issue_activity.new_value;
-  const oldValue = data?.issue_activity.old_value;
-  const verb = data?.issue_activity.verb;
+  if (!data || !("issue_activity" in data) || !data.issue_activity) return null;
+
+  const notificationField = data.issue_activity.field;
+  const newValue = data.issue_activity.new_value;
+  const oldValue = data.issue_activity.old_value;
+  const verb = data.issue_activity.verb;
 
   const fieldData: TNotificationFieldData = {
     field: notificationField,
