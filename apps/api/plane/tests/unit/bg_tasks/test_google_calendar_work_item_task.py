@@ -27,6 +27,7 @@ from plane.db.models import GoogleCalendarEvent
 from plane.integrations.google_calendar.client import GoogleCalendarClient, GoogleCalendarClientConflict
 from plane.integrations.google_calendar.dispatch import (
     GOOGLE_CALENDAR_ISSUE_SYNC_TASK,
+    GOOGLE_CALENDAR_LIFECYCLE_TASK,
     GOOGLE_CALENDAR_WORKSPACE_ISSUE_RESYNC_METADATA_KEY,
     GOOGLE_CALENDAR_WORKSPACE_ISSUE_RESYNC_RECONCILIATION_TASK,
     GOOGLE_CALENDAR_WORKSPACE_ISSUE_RESYNC_TASK,
@@ -345,6 +346,27 @@ class TestGoogleCalendarWorkItemTask:
         assert task.task == GOOGLE_CALENDAR_WORKSPACE_ISSUE_RESYNC_TASK
         assert workspace_id == str(self.workspace_integration.workspace_id)
         assert publish.call_args.kwargs == {"policy_generation": generation}
+
+    def test_reconciliation_republishes_pending_lifecycle_before_workspace_resync(self):
+        generation = str(uuid4())
+        self.workspace_integration.metadata = {
+            GOOGLE_CALENDAR_WORKSPACE_ISSUE_RESYNC_METADATA_KEY: generation,
+        }
+        self.workspace_integration.save(update_fields=["metadata", "updated_at"])
+        self.connection.status = "pending"
+        self.connection.lifecycle_generation = 4
+        self.connection.save(update_fields=["status", "lifecycle_generation", "updated_at"])
+
+        with patch("plane.bgtasks.google_calendar_task.publish_google_calendar_task") as publish:
+            discovered = reconcile_google_calendar_workspace_issue_resyncs.run()
+
+        assert discovered == 1
+        lifecycle_call, resync_call = publish.call_args_list
+        assert lifecycle_call.args[0].task == GOOGLE_CALENDAR_LIFECYCLE_TASK
+        assert lifecycle_call.args[1:] == (str(self.connection.id), 4)
+        assert resync_call.args[0].task == GOOGLE_CALENDAR_WORKSPACE_ISSUE_RESYNC_TASK
+        assert resync_call.args[1] == str(self.workspace_integration.workspace_id)
+        assert resync_call.kwargs == {"policy_generation": generation}
 
     def test_workspace_resync_waits_for_policy_lifecycle_reconciliation(self):
         self.connection.status = "pending"

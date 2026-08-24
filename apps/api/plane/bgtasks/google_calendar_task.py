@@ -18,6 +18,7 @@ from plane.integrations.google_calendar.client import (
 )
 from plane.integrations.google_calendar.dispatch import (
     GOOGLE_CALENDAR_ISSUE_SYNC_TASK,
+    GOOGLE_CALENDAR_LIFECYCLE_TASK,
     GOOGLE_CALENDAR_OPEN_BACKFILL_TASK,
     GOOGLE_CALENDAR_WORKSPACE_ISSUE_RESYNC_METADATA_KEY,
     GOOGLE_CALENDAR_WORKSPACE_ISSUE_RESYNC_RECONCILIATION_TASK,
@@ -400,6 +401,22 @@ def reconcile_google_calendar_workspace_issue_resyncs(task, after_id=None, batch
     try:
         for workspace_integration in current_batch:
             policy_generation = workspace_integration.metadata[GOOGLE_CALENDAR_WORKSPACE_ISSUE_RESYNC_METADATA_KEY]
+            pending_lifecycle_generations = (
+                GoogleCalendarConnection.objects.filter(
+                    workspace_integration=workspace_integration,
+                    desired_state=GoogleCalendarConnection.DesiredState.CONNECTED,
+                    status=GoogleCalendarConnection.Status.PENDING,
+                )
+                .order_by("id")
+                .values_list("id", "lifecycle_generation")
+            )
+            for connection_id, lifecycle_generation in pending_lifecycle_generations:
+                lifecycle_task = current_app.signature(GOOGLE_CALENDAR_LIFECYCLE_TASK)
+                publish_google_calendar_task(
+                    lifecycle_task,
+                    str(connection_id),
+                    lifecycle_generation,
+                )
             resync_task = current_app.signature(GOOGLE_CALENDAR_WORKSPACE_ISSUE_RESYNC_TASK)
             publish_google_calendar_task(
                 resync_task,
