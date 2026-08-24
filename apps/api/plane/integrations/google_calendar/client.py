@@ -181,7 +181,7 @@ class GoogleCalendarClient:
 
     @staticmethod
     def _retry_after_seconds(response):
-        value = response.headers.get("Retry-After") if response.headers else None
+        value = response.headers.get("Retry-After") if response is not None and response.headers else None
         if not isinstance(value, str) or not value:
             return None
         try:
@@ -213,20 +213,35 @@ class GoogleCalendarClient:
             time.sleep(self._retry_delay(response, attempt))
         return response
 
-    def _calendar_request(self, method, path, **kwargs):
+    def _calendar_request(
+        self,
+        method,
+        path,
+        *,
+        retry_server_errors=True,
+        retry_status_codes=(),
+        max_retries=None,
+        **kwargs,
+    ):
         try:
             access_token, refreshed = self._ensure_access_token()
             unauthorized_retried = refreshed
-            for attempt in range(self._max_retries + 1):
+            retry_limit = self._max_retries if max_retries is None else max(0, int(max_retries))
+            for attempt in range(retry_limit + 1):
                 response = self._send_calendar_request(method, path, access_token, **kwargs)
                 if response.status_code == 401 and self._refresh_token and not unauthorized_retried:
                     self._refresh_access_token()
                     access_token = self._access_token
                     unauthorized_retried = True
                     response = self._send_calendar_request(method, path, access_token, **kwargs)
-                if response.status_code != 429 and response.status_code < 500:
+                should_retry = (
+                    response.status_code == 429
+                    or (retry_server_errors and response.status_code >= 500)
+                    or response.status_code in retry_status_codes
+                )
+                if not should_retry:
                     return response
-                if attempt >= self._max_retries:
+                if attempt >= retry_limit:
                     return response
                 time.sleep(self._retry_delay(response, attempt))
             return response
@@ -276,7 +291,38 @@ class GoogleCalendarClient:
         payload = {"summary": GOOGLE_CALENDAR_SUMMARY}
         if operation_id is not None:
             payload["description"] = self._operation_description(operation_id)
-        response = self._calendar_request("post", "/calendars", json=payload)
+        # Google does not accept a caller-defined calendar ID. Check the durable
+        # marker after every ambiguous attempt before another POST can run.
+        for attempt in range(self._max_retries + 1):
+            try:
+                response = self._calendar_request(
+                    "post",
+                    "/calendars",
+                    retry_server_errors=False,
+                    max_retries=0,
+                    json=payload,
+                )
+            except GoogleCalendarProviderError as exc:
+                if operation_id is not None:
+                    recovered_calendar_id = self.find_calendar(operation_id)
+                    if recovered_calendar_id is not None:
+                        return recovered_calendar_id
+                if operation_id is None or attempt >= self._max_retries:
+                    raise GoogleCalendarProviderError("Google Calendar creation failed") from exc
+                time.sleep(self._retry_delay(None, attempt))
+                continue
+
+            if response.status_code >= 500:
+                if operation_id is None:
+                    break
+                recovered_calendar_id = self.find_calendar(operation_id)
+                if recovered_calendar_id is not None:
+                    return recovered_calendar_id
+            if response.status_code != 429 and response.status_code < 500:
+                break
+            if attempt >= self._max_retries:
+                break
+            time.sleep(self._retry_delay(response, attempt))
         try:
             response.raise_for_status()
             payload = response.json()
@@ -340,7 +386,11 @@ class GoogleCalendarClient:
     def get_event(self, calendar_id, event_id):
         """Get one event, returning ``None`` when it is already absent."""
 
-        response = self._calendar_request("get", self._event_path(calendar_id, event_id))
+        response = self._calendar_request(
+            "get",
+            self._event_path(calendar_id, event_id),
+            retry_status_codes=(409,),
+        )
         if response.status_code in {404, 410}:
             return None
         if response.status_code == 409:

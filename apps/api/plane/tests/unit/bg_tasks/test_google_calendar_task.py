@@ -570,6 +570,55 @@ class TestGoogleCalendarConvergenceTask:
         client.find_calendar.assert_called_once()
         client.create_calendar.assert_called_once()
 
+    def test_missing_calendar_replacement_recovers_after_result_commit_failure(self):
+        connection = GoogleCalendarConnectionFactory(
+            provider_account_id="google-account",
+            refresh_token="refresh-token",
+            calendar_id="missing-plane-calendar",
+            calendar_generation=4,
+            desired_state=GoogleCalendarConnection.DesiredState.CONNECTED,
+            status=GoogleCalendarConnection.Status.PENDING,
+            lifecycle_generation=3,
+        )
+        first_client = _provider_client()
+        first_client.get_calendar.side_effect = GoogleCalendarCalendarAbsent("confirmed absent")
+        recovered_client = _provider_client()
+        recovered_client.find_calendar.return_value = "replacement-plane-calendar"
+
+        with (
+            patch("plane.integrations.google_calendar.lifecycle._acquire_advisory_xact_lock"),
+            patch("plane.bgtasks.google_calendar_task.GoogleCalendarClient", return_value=first_client),
+            patch(
+                "plane.bgtasks.google_calendar_task.mark_google_calendar_connection_active",
+                side_effect=RuntimeError("result commit failed"),
+            ),
+            pytest.raises(RuntimeError, match="result commit failed"),
+        ):
+            reconcile_google_calendar_connection(str(connection.id), 3)
+
+        connection.refresh_from_db()
+        operation_id = connection.calendar_operation_id
+        assert operation_id is not None
+        assert connection.calendar_id == "missing-plane-calendar"
+        assert connection.calendar_generation == 4
+
+        with (
+            patch("plane.integrations.google_calendar.lifecycle._acquire_advisory_xact_lock"),
+            patch("plane.bgtasks.google_calendar_task.GoogleCalendarClient", return_value=recovered_client),
+        ):
+            result = reconcile_google_calendar_connection(str(connection.id), 3)
+
+        connection.refresh_from_db()
+        assert result == "active"
+        first_client.find_calendar.assert_called_once_with(operation_id)
+        first_client.create_calendar.assert_called_once_with(operation_id)
+        recovered_client.get_calendar.assert_not_called()
+        recovered_client.find_calendar.assert_called_once_with(operation_id)
+        recovered_client.create_calendar.assert_not_called()
+        assert connection.calendar_id == "replacement-plane-calendar"
+        assert connection.calendar_operation_id is None
+        assert connection.calendar_generation == 5
+
     def test_missing_calendar_replacement_backfills_only_current_open_entities(self):
         workspace_integration = WorkspaceIntegrationFactory(
             integration__provider="google_calendar",

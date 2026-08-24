@@ -1658,7 +1658,7 @@ def _prepare_reconciliation(connection_id, generation):
 
 
 @transaction.atomic
-def _converge_present(connection, generation):
+def _converge_present_transaction(connection, generation):
     connection = lock_google_calendar_connection(connection.id)
     if not _owns_generation(
         connection,
@@ -1668,12 +1668,12 @@ def _converge_present(connection, generation):
     ):
         return "stale"
     client = _client_for(connection)
-    retained_inventory = bool(connection.calendar_id)
+    retained_inventory = bool(connection.calendar_id and connection.calendar_operation_id is None)
     try:
         client.validate_credentials()
         if not has_usable_google_calendar_grant(connection):
             return _record_present_error(connection, generation, "Google Calendar grant is not usable")
-        if not connection.calendar_id:
+        if connection.calendar_operation_id is not None:
             if not _owns_generation(
                 connection,
                 generation,
@@ -1681,8 +1681,6 @@ def _converge_present(connection, generation):
                 status=GoogleCalendarConnection.Status.PENDING,
             ):
                 return "stale"
-            if connection.calendar_operation_id is None:
-                return _record_present_error(connection, generation, "Google Calendar creation identity is missing")
             calendar_id = client.find_calendar(connection.calendar_operation_id)
             if calendar_id is None:
                 if not _owns_generation(
@@ -1727,42 +1725,15 @@ def _converge_present(connection, generation):
                 provider_payload_hash="",
                 provider_status="",
             )
-        else:
+        elif connection.calendar_id:
             try:
                 client.get_calendar(connection.calendar_id)
             except GoogleCalendarCalendarAbsent:
                 connection.calendar_operation_id = uuid4()
                 connection.save(update_fields=["calendar_operation_id", "updated_at"])
-                replacement_id = client.find_calendar(connection.calendar_operation_id)
-                if replacement_id is None:
-                    replacement_id = client.create_calendar(connection.calendar_operation_id)
-                connection.calendar_id = replacement_id
-                connection.calendar_generation += 1
-                connection.sync_token = ""
-                connection.page_token = ""
-                connection.reconciliation_phase = ""
-                connection.reconciliation_cursor = ""
-                connection.reconciliation_lease_expires_at = None
-                connection.reconciliation_completed_at = None
-                retained_inventory = False
-                connection.save(
-                    update_fields=[
-                        "calendar_id",
-                        "calendar_generation",
-                        "sync_token",
-                        "page_token",
-                        "reconciliation_phase",
-                        "reconciliation_cursor",
-                        "reconciliation_lease_expires_at",
-                        "reconciliation_completed_at",
-                        "updated_at",
-                    ]
-                )
-                GoogleCalendarEvent.objects.filter(connection=connection).update(
-                    provider_etag="",
-                    provider_payload_hash="",
-                    provider_status="",
-                )
+                return "replacement_prepared"
+        else:
+            return _record_present_error(connection, generation, "Google Calendar creation identity is missing")
     except GoogleCalendarCredentialMismatch:
         return _record_present_error(
             connection,
@@ -1792,6 +1763,13 @@ def _converge_present(connection, generation):
             force_local_scan=True,
         )
     return "active"
+
+
+def _converge_present(connection, generation):
+    result = _converge_present_transaction(connection, generation)
+    if result == "replacement_prepared":
+        return _converge_present_transaction(connection, generation)
+    return result
 
 
 @transaction.atomic

@@ -202,6 +202,7 @@ class TestGoogleCalendarClient:
         client = _client(
             access_token="access-token",
             token_expires_at=timezone.now() + timedelta(hours=1),
+            max_retries=0,
         )
 
         with (
@@ -263,6 +264,83 @@ class TestGoogleCalendarClient:
             "summary": "Plane",
             "description": "Plane calendar operation: 12345678-1234-5678-1234-567812345678",
         }
+
+    def test_ambiguous_calendar_creation_recovers_by_marker_without_replaying_post(self):
+        unavailable = Mock(status_code=503, headers={})
+        recovered = Mock(status_code=200)
+        recovered.json.return_value = {
+            "items": [
+                {
+                    "id": "recovered-calendar@example.com",
+                    "description": "Plane calendar operation: 12345678-1234-5678-1234-567812345678",
+                }
+            ]
+        }
+        client = _client(
+            access_token="access-token",
+            token_expires_at=timezone.now() + timedelta(hours=1),
+        )
+        operation_id = UUID("12345678-1234-5678-1234-567812345678")
+
+        with (
+            patch(
+                "plane.integrations.google_calendar.client.requests.request",
+                side_effect=[unavailable, recovered],
+            ) as request,
+            patch("plane.integrations.google_calendar.client.time.sleep") as sleep,
+        ):
+            calendar_id = client.create_calendar(operation_id)
+
+        assert calendar_id == "recovered-calendar@example.com"
+        assert [call.args[0] for call in request.call_args_list] == ["post", "get"]
+        sleep.assert_not_called()
+
+    def test_calendar_creation_checks_the_marker_before_retrying_an_ambiguous_post(self):
+        unavailable = Mock(status_code=503, headers={})
+        not_recovered = Mock(status_code=200)
+        not_recovered.json.return_value = {"items": []}
+        created = Mock(status_code=200)
+        created.json.return_value = {"id": "created-calendar@example.com"}
+        client = _client(
+            access_token="access-token",
+            token_expires_at=timezone.now() + timedelta(hours=1),
+        )
+        operation_id = UUID("12345678-1234-5678-1234-567812345678")
+
+        with (
+            patch(
+                "plane.integrations.google_calendar.client.requests.request",
+                side_effect=[unavailable, not_recovered, created],
+            ) as request,
+            patch("plane.integrations.google_calendar.client.random.uniform", return_value=0),
+            patch("plane.integrations.google_calendar.client.time.sleep") as sleep,
+        ):
+            calendar_id = client.create_calendar(operation_id)
+
+        assert calendar_id == "created-calendar@example.com"
+        assert [call.args[0] for call in request.call_args_list] == ["post", "get", "post"]
+        sleep.assert_called_once_with(1)
+
+    def test_unmarked_calendar_creation_does_not_replay_an_ambiguous_post(self):
+        unavailable = Mock(status_code=503, headers={})
+        unavailable.raise_for_status.side_effect = requests.HTTPError("provider unavailable")
+        client = _client(
+            access_token="access-token",
+            token_expires_at=timezone.now() + timedelta(hours=1),
+        )
+
+        with (
+            patch(
+                "plane.integrations.google_calendar.client.requests.request",
+                return_value=unavailable,
+            ) as request,
+            patch("plane.integrations.google_calendar.client.time.sleep") as sleep,
+            pytest.raises(GoogleCalendarProviderError, match="creation failed"),
+        ):
+            client.create_calendar()
+
+        request.assert_called_once()
+        sleep.assert_not_called()
 
     def test_find_calendar_paginates_to_recover_a_completed_creation(self):
         first_response = Mock(status_code=200)
@@ -362,6 +440,27 @@ class TestGoogleCalendarClient:
         assert jitter.call_args_list[0].args == (0, 1)
         assert jitter.call_args_list[1].args == (0, 2)
         assert [call.args[0] for call in sleep.call_args_list] == [1.25, 2.5]
+
+    def test_event_fetch_retries_a_conflict_then_observes_a_tombstone(self):
+        conflicted = Mock(status_code=409, headers={})
+        tombstone = Mock(status_code=410, headers={})
+        client = _client(
+            access_token="access-token",
+            token_expires_at=timezone.now() + timedelta(hours=1),
+        )
+
+        with (
+            patch(
+                "plane.integrations.google_calendar.client.requests.request",
+                side_effect=[conflicted, tombstone],
+            ) as request,
+            patch("plane.integrations.google_calendar.client.random.uniform", return_value=0),
+            patch("plane.integrations.google_calendar.client.time.sleep") as sleep,
+        ):
+            assert client.get_event("calendar", "event") is None
+
+        assert request.call_count == 2
+        sleep.assert_called_once_with(1)
 
     def test_retry_after_takes_precedence_over_jitter(self):
         throttled = Mock(status_code=429, headers={"Retry-After": "7"})
