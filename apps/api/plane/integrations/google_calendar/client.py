@@ -205,6 +205,7 @@ class GoogleCalendarClient:
 
     def _post_with_retry(self, url, **kwargs):
         for attempt in range(self._max_retries + 1):
+            self._validated_credentials()
             response = requests.post(url, timeout=GOOGLE_CALENDAR_OAUTH_TIMEOUT, **kwargs)
             if response.status_code != 429 and response.status_code < 500:
                 return response

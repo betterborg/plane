@@ -18,6 +18,7 @@ from plane.integrations.google_calendar.dispatch import (
     GOOGLE_CALENDAR_CYCLE_SYNC_TASK,
     GOOGLE_CALENDAR_ISSUE_SYNC_TASK,
 )
+from plane.tests.contract.app.google_calendar_helpers import targeted_task
 from plane.tests.factories import (
     CycleFactory,
     GoogleCalendarConnectionFactory,
@@ -43,19 +44,6 @@ def _run_callbacks(callbacks):
     assert all(robust is True for _, robust in callbacks)
     for callback, _ in callbacks:
         callback()
-
-
-def _targeted_task(side_effect=None):
-    task = Mock(options={})
-
-    def set_options(**options):
-        task.options.update(options)
-        return task
-
-    task.set.side_effect = set_options
-    if side_effect is not None:
-        task.delay.side_effect = side_effect
-    return task
 
 
 def _conversion_setup(workspace, create_user, *, project_sync_enabled=True, ended_cycle=False):
@@ -129,8 +117,8 @@ class TestGoogleCalendarDraftCycleDispatch:
             observed_cycle_ids.append(cycle_id)
             return synchronize_google_calendar_cycle.run(cycle_id, connection_id)
 
-        targeted_issue_task = _targeted_task()
-        targeted_cycle_task = _targeted_task(converge_from_final_state)
+        targeted_issue_task = targeted_task()
+        targeted_cycle_task = targeted_task(converge_from_final_state)
 
         def targeted_signature(task_name):
             if task_name == GOOGLE_CALENDAR_ISSUE_SYNC_TASK:
@@ -250,7 +238,7 @@ class TestGoogleCalendarDraftCycleDispatch:
             active=True,
         )
         callbacks = []
-        targeted_issue_task = _targeted_task()
+        targeted_issue_task = targeted_task()
 
         with (
             patch(

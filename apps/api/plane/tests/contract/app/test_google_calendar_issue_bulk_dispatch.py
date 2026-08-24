@@ -17,6 +17,7 @@ from plane.integrations.google_calendar.dispatch import (
     GOOGLE_CALENDAR_CYCLE_SYNC_TASK,
     GOOGLE_CALENDAR_ISSUE_SYNC_TASK,
 )
+from plane.tests.contract.app.google_calendar_helpers import targeted_task
 from plane.tests.factories import (
     CycleFactory,
     CycleIssueFactory,
@@ -42,18 +43,6 @@ def _issues(project, state_group="unstarted"):
     state = StateFactory(project=project, group=state_group)
     with suppress_google_calendar_issue_signal_dispatch():
         return [IssueFactory(project=project, state=state) for _ in range(2)]
-
-
-def _targeted_task(side_effect):
-    task = Mock(options={})
-
-    def set_options(**options):
-        task.options.update(options)
-        return task
-
-    task.set.side_effect = set_options
-    task.delay.side_effect = side_effect
-    return task
 
 
 @pytest.mark.contract
@@ -227,8 +216,8 @@ class TestGoogleCalendarIssueBulkDispatch:
             observed_cycle_ids.append(cycle_id)
             return synchronize_google_calendar_cycle.run(cycle_id, target_connection_id)
 
-        targeted_issue_task = _targeted_task(inspect_deleted_issue)
-        targeted_cycle_task = _targeted_task(converge_cycle_from_final_state)
+        targeted_issue_task = targeted_task(inspect_deleted_issue)
+        targeted_cycle_task = targeted_task(converge_cycle_from_final_state)
 
         def targeted_signature(task_name):
             if task_name == GOOGLE_CALENDAR_ISSUE_SYNC_TASK:

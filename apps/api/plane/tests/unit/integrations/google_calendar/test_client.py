@@ -287,6 +287,7 @@ class TestGoogleCalendarClient:
                 "plane.integrations.google_calendar.client.requests.request",
                 side_effect=[unavailable, recovered],
             ) as request,
+            patch("plane.integrations.google_calendar.client.random.uniform", return_value=0),
             patch("plane.integrations.google_calendar.client.time.sleep") as sleep,
         ):
             calendar_id = client.create_calendar(operation_id)
@@ -569,6 +570,40 @@ class TestGoogleCalendarClient:
             client.revoke_grant()
 
         assert "secret" not in str(error.value)
+
+    @pytest.mark.parametrize("operation", ["refresh", "revoke"])
+    def test_oauth_retries_revalidate_credentials_before_each_provider_request(self, operation):
+        unavailable = Mock(status_code=503, headers={})
+        stored_fingerprint = google_calendar_credential_fingerprint("original-id", "original-secret")
+        client = GoogleCalendarClient(
+            credential_fingerprint=stored_fingerprint,
+            refresh_token="private-refresh-token",
+        )
+        original_credentials = GoogleCalendarOAuthCredentials("original-id", "original-secret")
+        changed_credentials = GoogleCalendarOAuthCredentials("changed-id", "changed-secret")
+
+        def effective_credentials():
+            return original_credentials if post.call_count == 0 else changed_credentials
+
+        with (
+            patch(
+                "plane.integrations.google_calendar.client.get_google_calendar_oauth_credentials",
+                side_effect=effective_credentials,
+            ),
+            patch("plane.integrations.google_calendar.client.requests.post", return_value=unavailable) as post,
+            patch("plane.integrations.google_calendar.client.requests.request") as request,
+            patch("plane.integrations.google_calendar.client.random.uniform", return_value=0),
+            patch("plane.integrations.google_calendar.client.time.sleep") as sleep,
+            pytest.raises(GoogleCalendarCredentialMismatch),
+        ):
+            if operation == "refresh":
+                client.create_calendar()
+            else:
+                client.revoke_grant()
+
+        post.assert_called_once()
+        request.assert_not_called()
+        sleep.assert_called_once_with(1)
 
     def test_tokenless_revoke_still_validates_the_credential_binding(self):
         client = GoogleCalendarClient(

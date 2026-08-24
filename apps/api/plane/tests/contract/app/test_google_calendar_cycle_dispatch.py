@@ -16,6 +16,7 @@ from plane.bgtasks.google_calendar_task import (
 from plane.db.models import Cycle, GoogleCalendarEvent, IssueAssignee
 from plane.db.signals import suppress_google_calendar_issue_signal_dispatch
 from plane.integrations.google_calendar.dispatch import GOOGLE_CALENDAR_CYCLE_SYNC_TASK
+from plane.tests.contract.app.google_calendar_helpers import targeted_task
 from plane.tests.factories import (
     CycleFactory,
     CycleIssueFactory,
@@ -35,18 +36,6 @@ def _provider_client():
     client.get_event.return_value = {"id": "existing-event"}
     client.list_events.return_value = []
     return client
-
-
-def _targeted_task(side_effect):
-    task = Mock(options={})
-
-    def set_options(**options):
-        task.options.update(options)
-        return task
-
-    task.set.side_effect = set_options
-    task.delay.side_effect = side_effect
-    return task
 
 
 @pytest.mark.contract
@@ -103,7 +92,7 @@ class TestGoogleCalendarCycleDispatch:
                 <= 1
             )
 
-        targeted_cycle_task = _targeted_task(synchronize_persisted_cycle)
+        targeted_cycle_task = targeted_task(synchronize_persisted_cycle)
 
         with (
             patch("plane.bgtasks.google_calendar_task.GoogleCalendarClient", return_value=client),
