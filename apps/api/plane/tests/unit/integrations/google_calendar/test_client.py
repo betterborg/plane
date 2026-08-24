@@ -14,12 +14,36 @@ from plane.integrations.google_calendar.client import (
     GoogleCalendarClient,
     GoogleCalendarClientConflict,
     GoogleCalendarClientError,
+    GoogleCalendarCredentialMismatch,
+    GoogleCalendarProviderError,
 )
 from plane.integrations.google_calendar.oauth import GoogleCalendarOAuthCredentials
+from plane.license.utils.google_calendar_credentials import google_calendar_credential_fingerprint
+
+
+OAUTH_CREDENTIALS = GoogleCalendarOAuthCredentials("client-id", "client-secret")
+
+
+def _client(**kwargs):
+    return GoogleCalendarClient(
+        credential_fingerprint=google_calendar_credential_fingerprint(
+            OAUTH_CREDENTIALS.client_id,
+            OAUTH_CREDENTIALS.client_secret,
+        ),
+        **kwargs,
+    )
 
 
 @pytest.mark.unit
 class TestGoogleCalendarClient:
+    @pytest.fixture(autouse=True)
+    def _configured_oauth_client(self):
+        with patch(
+            "plane.integrations.google_calendar.client.get_google_calendar_oauth_credentials",
+            return_value=OAUTH_CREDENTIALS,
+        ):
+            yield
+
     def test_event_crud_uses_encoded_paths_and_full_update(self):
         get_response = Mock(status_code=200)
         get_response.json.return_value = {"id": "event/id"}
@@ -28,7 +52,7 @@ class TestGoogleCalendarClient:
         update_response = Mock(status_code=200)
         update_response.json.return_value = {"id": "event/id", "summary": "Updated"}
         delete_response = Mock(status_code=204)
-        client = GoogleCalendarClient(
+        client = _client(
             access_token="access-token",
             token_expires_at=timezone.now() + timedelta(hours=1),
         )
@@ -57,7 +81,7 @@ class TestGoogleCalendarClient:
         first_response.json.return_value = {"items": [{"id": "first"}], "nextPageToken": "next"}
         second_response = Mock(status_code=200)
         second_response.json.return_value = {"items": [{"id": "second"}]}
-        client = GoogleCalendarClient(
+        client = _client(
             access_token="access-token",
             token_expires_at=timezone.now() + timedelta(hours=1),
         )
@@ -78,7 +102,7 @@ class TestGoogleCalendarClient:
 
     def test_event_insert_surfaces_a_conflict_without_provider_content(self):
         response = Mock(status_code=409)
-        client = GoogleCalendarClient(
+        client = _client(
             access_token="access-token",
             token_expires_at=timezone.now() + timedelta(hours=1),
         )
@@ -92,7 +116,7 @@ class TestGoogleCalendarClient:
     @pytest.mark.parametrize("status_code", [404, 410])
     def test_event_delete_treats_provider_absence_as_converged(self, status_code):
         response = Mock(status_code=status_code)
-        client = GoogleCalendarClient(
+        client = _client(
             access_token="access-token",
             token_expires_at=timezone.now() + timedelta(hours=1),
         )
@@ -105,7 +129,7 @@ class TestGoogleCalendarClient:
     def test_create_uses_the_dedicated_calendar_endpoint(self):
         response = Mock(status_code=200)
         response.json.return_value = {"id": "plane-calendar@example.com"}
-        client = GoogleCalendarClient(
+        client = _client(
             access_token="access-token",
             refresh_token="refresh-token",
             token_expires_at=timezone.now() + timedelta(hours=1),
@@ -126,7 +150,7 @@ class TestGoogleCalendarClient:
     def test_create_records_the_durable_operation_marker(self):
         response = Mock(status_code=200)
         response.json.return_value = {"id": "plane-calendar@example.com"}
-        client = GoogleCalendarClient(
+        client = _client(
             access_token="access-token",
             token_expires_at=timezone.now() + timedelta(hours=1),
         )
@@ -152,7 +176,7 @@ class TestGoogleCalendarClient:
                 }
             ]
         }
-        client = GoogleCalendarClient(
+        client = _client(
             access_token="access-token",
             token_expires_at=timezone.now() + timedelta(hours=1),
         )
@@ -174,7 +198,7 @@ class TestGoogleCalendarClient:
 
     def test_delete_targets_only_the_recorded_encoded_calendar_id(self):
         response = Mock(status_code=204)
-        client = GoogleCalendarClient(
+        client = _client(
             access_token="access-token",
             token_expires_at=timezone.now() + timedelta(hours=1),
         )
@@ -191,7 +215,7 @@ class TestGoogleCalendarClient:
 
     def test_delete_treats_an_already_absent_calendar_as_converged(self):
         response = Mock(status_code=404)
-        client = GoogleCalendarClient(
+        client = _client(
             access_token="access-token",
             token_expires_at=timezone.now() + timedelta(hours=1),
         )
@@ -204,7 +228,7 @@ class TestGoogleCalendarClient:
     def test_revoke_treats_only_invalid_token_as_already_converged(self):
         response = Mock(status_code=400)
         response.json.return_value = {"error": "invalid_token"}
-        client = GoogleCalendarClient(refresh_token="refresh-token")
+        client = _client(refresh_token="refresh-token")
 
         with patch("plane.integrations.google_calendar.client.requests.post", return_value=response) as post:
             client.revoke_grant()
@@ -220,7 +244,7 @@ class TestGoogleCalendarClient:
         response = Mock(status_code=400)
         response.json.return_value = {"error": "invalid_request"}
         response.raise_for_status.side_effect = requests.HTTPError("provider response secret")
-        client = GoogleCalendarClient(refresh_token="refresh-token")
+        client = _client(refresh_token="refresh-token")
 
         with (
             patch("plane.integrations.google_calendar.client.requests.post", return_value=response),
@@ -235,7 +259,7 @@ class TestGoogleCalendarClient:
         refresh_response.json.return_value = {"access_token": "fresh-access-token", "expires_in": 3600}
         create_response = Mock(status_code=200)
         create_response.json.return_value = {"id": "plane-calendar"}
-        client = GoogleCalendarClient(
+        client = _client(
             access_token="expired-access-token",
             refresh_token="refresh-token",
             token_expires_at=timezone.now() - timedelta(minutes=1),
@@ -269,7 +293,7 @@ class TestGoogleCalendarClient:
     def test_provider_error_does_not_expose_response_content(self):
         response = Mock(status_code=500)
         response.raise_for_status.side_effect = requests.HTTPError("provider response secret")
-        client = GoogleCalendarClient(
+        client = _client(
             access_token="access-token",
             token_expires_at=timezone.now() + timedelta(hours=1),
         )
@@ -281,3 +305,145 @@ class TestGoogleCalendarClient:
             client.create_calendar()
 
         assert "secret" not in str(error.value)
+
+    @pytest.mark.parametrize(
+        "operation",
+        [
+            lambda client: client.create_calendar(),
+            lambda client: client.get_calendar("calendar-id"),
+            lambda client: client.delete_calendar("calendar-id"),
+            lambda client: client.find_calendar(UUID("12345678-1234-5678-1234-567812345678")),
+            lambda client: client.get_event("calendar-id", "event-id"),
+            lambda client: client.list_events("calendar-id"),
+            lambda client: client.insert_event("calendar-id", "event-id", {}),
+            lambda client: client.update_event("calendar-id", "event-id", {}),
+            lambda client: client.delete_event("calendar-id", "event-id"),
+            lambda client: client.revoke_grant(),
+        ],
+    )
+    def test_credential_mismatch_precedes_every_provider_operation(self, operation, caplog):
+        stored_fingerprint = google_calendar_credential_fingerprint("original-id", "original-secret")
+        client = GoogleCalendarClient(
+            credential_fingerprint=stored_fingerprint,
+            access_token="private-access-token",
+            refresh_token="private-refresh-token",
+            token_expires_at=timezone.now() + timedelta(hours=1),
+        )
+
+        with (
+            patch(
+                "plane.integrations.google_calendar.client.get_google_calendar_oauth_credentials",
+                return_value=GoogleCalendarOAuthCredentials("changed-id", "changed-secret"),
+            ),
+            patch("plane.integrations.google_calendar.client.requests.post") as post,
+            patch("plane.integrations.google_calendar.client.requests.request") as request,
+            pytest.raises(GoogleCalendarCredentialMismatch) as error,
+        ):
+            operation(client)
+
+        assert error.value.classification == "oauth_credentials_changed"
+        post.assert_not_called()
+        request.assert_not_called()
+        assert "original-id" not in caplog.text
+        assert "original-secret" not in caplog.text
+        assert "changed-id" not in caplog.text
+        assert "changed-secret" not in caplog.text
+        assert stored_fingerprint not in caplog.text
+
+    def test_credential_mismatch_precedes_access_token_refresh(self):
+        client = GoogleCalendarClient(
+            credential_fingerprint=google_calendar_credential_fingerprint("original-id", "original-secret"),
+            refresh_token="private-refresh-token",
+        )
+
+        with (
+            patch(
+                "plane.integrations.google_calendar.client.get_google_calendar_oauth_credentials",
+                return_value=GoogleCalendarOAuthCredentials("changed-id", "changed-secret"),
+            ),
+            patch("plane.integrations.google_calendar.client.requests.post") as post,
+            patch("plane.integrations.google_calendar.client.requests.request") as request,
+            pytest.raises(GoogleCalendarCredentialMismatch),
+        ):
+            client.create_calendar()
+
+        post.assert_not_called()
+        request.assert_not_called()
+
+    def test_restoring_exact_credentials_allows_cleanup_to_resume(self):
+        delete_response = Mock(status_code=204)
+        stored_fingerprint = google_calendar_credential_fingerprint("original-id", "original-secret")
+        client = GoogleCalendarClient(
+            credential_fingerprint=stored_fingerprint,
+            access_token="access-token",
+            token_expires_at=timezone.now() + timedelta(hours=1),
+        )
+
+        with (
+            patch(
+                "plane.integrations.google_calendar.client.get_google_calendar_oauth_credentials",
+                return_value=GoogleCalendarOAuthCredentials("changed-id", "changed-secret"),
+            ),
+            patch("plane.integrations.google_calendar.client.requests.request") as request,
+            pytest.raises(GoogleCalendarCredentialMismatch),
+        ):
+            client.delete_calendar("calendar-id")
+        request.assert_not_called()
+
+        with (
+            patch(
+                "plane.integrations.google_calendar.client.get_google_calendar_oauth_credentials",
+                return_value=GoogleCalendarOAuthCredentials("original-id", "original-secret"),
+            ),
+            patch(
+                "plane.integrations.google_calendar.client.requests.request",
+                return_value=delete_response,
+            ) as request,
+        ):
+            client.delete_calendar("calendar-id")
+
+        request.assert_called_once()
+
+    def test_unauthorized_request_refreshes_once_and_persists_before_retry(self):
+        unauthorized_response = Mock(status_code=401)
+        success_response = Mock(status_code=200)
+        success_response.json.return_value = {"id": "calendar-id"}
+        refresh_response = Mock(status_code=200)
+        refresh_response.json.return_value = {"access_token": "fresh-token", "expires_in": 3600}
+        persist_access_token = Mock()
+        client = _client(
+            access_token="old-token",
+            refresh_token="refresh-token",
+            token_expires_at=timezone.now() + timedelta(hours=1),
+            persist_access_token=persist_access_token,
+        )
+
+        with (
+            patch("plane.integrations.google_calendar.client.requests.post", return_value=refresh_response) as post,
+            patch(
+                "plane.integrations.google_calendar.client.requests.request",
+                side_effect=[unauthorized_response, success_response],
+            ) as request,
+        ):
+            assert client.get_calendar("calendar-id") == {"id": "calendar-id"}
+
+        post.assert_called_once()
+        assert request.call_count == 2
+        persist_access_token.assert_called_once()
+        assert persist_access_token.call_args.args[0].value == "fresh-token"
+
+    def test_provider_failures_have_a_stable_classification(self):
+        response = Mock(status_code=500)
+        response.raise_for_status.side_effect = requests.HTTPError("private provider response")
+        client = _client(
+            access_token="access-token",
+            token_expires_at=timezone.now() + timedelta(hours=1),
+        )
+
+        with (
+            patch("plane.integrations.google_calendar.client.requests.request", return_value=response),
+            pytest.raises(GoogleCalendarProviderError) as error,
+        ):
+            client.get_calendar("calendar-id")
+
+        assert error.value.classification == "provider_error"

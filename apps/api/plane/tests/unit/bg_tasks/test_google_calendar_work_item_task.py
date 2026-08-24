@@ -43,6 +43,8 @@ from plane.integrations.google_calendar.lifecycle import (
     request_google_calendar_workspace_policy_disable,
     request_google_calendar_workspace_policy_enable,
 )
+from plane.integrations.google_calendar.oauth import GoogleCalendarOAuthCredentials
+from plane.license.utils.google_calendar_credentials import google_calendar_credential_fingerprint
 from plane.tests.factories import (
     GoogleCalendarConnectionFactory,
     IssueAssigneeFactory,
@@ -184,11 +186,16 @@ class TestGoogleCalendarWorkItemTask:
 
         gone_response = Mock(status_code=410)
         retry_client = GoogleCalendarClient(
+            credential_fingerprint=google_calendar_credential_fingerprint("client-id", "client-secret"),
             access_token="access-token",
             token_expires_at=timezone.now() + timedelta(hours=1),
         )
         with (
             patch("plane.bgtasks.google_calendar_task.GoogleCalendarClient", return_value=retry_client),
+            patch(
+                "plane.integrations.google_calendar.client.get_google_calendar_oauth_credentials",
+                return_value=GoogleCalendarOAuthCredentials("client-id", "client-secret"),
+            ),
             patch(
                 "plane.integrations.google_calendar.client.requests.request",
                 return_value=gone_response,

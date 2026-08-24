@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # See the LICENSE file for details.
 
+import hmac
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from urllib.parse import quote
@@ -13,8 +14,10 @@ from plane.integrations.google_calendar.oauth import (
     GOOGLE_CALENDAR_OAUTH_TIMEOUT,
     GOOGLE_CALENDAR_REVOCATION_URL,
     GOOGLE_CALENDAR_TOKEN_URL,
+    GoogleCalendarOAuthConfigurationError,
     get_google_calendar_oauth_credentials,
 )
+from plane.license.utils.google_calendar_credentials import google_calendar_credential_fingerprint
 
 
 GOOGLE_CALENDAR_API_URL = "https://www.googleapis.com/calendar/v3"
@@ -27,7 +30,19 @@ class GoogleCalendarClientError(Exception):
     """Raised when a generation-scoped Google Calendar provider operation fails."""
 
 
-class GoogleCalendarClientConflict(GoogleCalendarClientError):
+class GoogleCalendarCredentialMismatch(GoogleCalendarClientError):
+    """Raised before provider HTTP when the durable credential binding no longer matches."""
+
+    classification = "oauth_credentials_changed"
+
+
+class GoogleCalendarProviderError(GoogleCalendarClientError):
+    """Raised when Google rejects a request or returns an unusable response."""
+
+    classification = "provider_error"
+
+
+class GoogleCalendarClientConflict(GoogleCalendarProviderError):
     """Raised when a deterministic provider event already exists."""
 
 
@@ -42,10 +57,20 @@ class GoogleCalendarAccessToken:
 class GoogleCalendarClient:
     """Small client for Plane's recorded app-created Google calendar."""
 
-    def __init__(self, *, access_token="", refresh_token="", token_expires_at=None):
+    def __init__(
+        self,
+        *,
+        credential_fingerprint,
+        access_token="",
+        refresh_token="",
+        token_expires_at=None,
+        persist_access_token=None,
+    ):
+        self._credential_fingerprint = credential_fingerprint
         self._access_token = access_token
         self._refresh_token = refresh_token
         self._token_expires_at = token_expires_at
+        self._persist_access_token = persist_access_token
 
     @property
     def access_token(self):
@@ -53,11 +78,27 @@ class GoogleCalendarClient:
             return None
         return GoogleCalendarAccessToken(self._access_token, self._token_expires_at)
 
+    def _validated_credentials(self):
+        try:
+            credentials = get_google_calendar_oauth_credentials()
+        except GoogleCalendarOAuthConfigurationError as exc:
+            raise GoogleCalendarCredentialMismatch("Google Calendar OAuth credentials changed") from exc
+        effective_fingerprint = google_calendar_credential_fingerprint(
+            credentials.client_id,
+            credentials.client_secret,
+        )
+        if not self._credential_fingerprint or not hmac.compare_digest(
+            self._credential_fingerprint,
+            effective_fingerprint,
+        ):
+            raise GoogleCalendarCredentialMismatch("Google Calendar OAuth credentials changed")
+        return credentials
+
     def _refresh_access_token(self):
         if not self._refresh_token:
             raise GoogleCalendarClientError("Google Calendar grant cannot refresh an access token")
 
-        credentials = get_google_calendar_oauth_credentials()
+        credentials = self._validated_credentials()
         try:
             response = requests.post(
                 GOOGLE_CALENDAR_TOKEN_URL,
@@ -78,43 +119,44 @@ class GoogleCalendarClient:
             if not access_token or expires_in <= 0:
                 raise ValueError("Token response omitted a usable access token")
         except (requests.RequestException, TypeError, ValueError) as exc:
-            raise GoogleCalendarClientError("Google Calendar access-token refresh failed") from exc
+            raise GoogleCalendarProviderError("Google Calendar access-token refresh failed") from exc
 
         self._access_token = access_token
         self._token_expires_at = timezone.now() + timedelta(seconds=expires_in)
+        if self._persist_access_token is not None:
+            self._persist_access_token(GoogleCalendarAccessToken(self._access_token, self._token_expires_at))
 
-    def _ensure_access_token(self, *, force_refresh=False):
+    def _ensure_access_token(self):
         access_token_is_current = bool(
             self._access_token
             and self._token_expires_at
             and self._token_expires_at > timezone.now() + GOOGLE_CALENDAR_TOKEN_EXPIRY_SKEW
         )
-        if force_refresh or not access_token_is_current:
+        refreshed = not access_token_is_current
+        if refreshed:
             self._refresh_access_token()
-        return self._access_token
+        return self._access_token, refreshed
+
+    def _send_calendar_request(self, method, path, access_token, **kwargs):
+        self._validated_credentials()
+        return requests.request(
+            method,
+            f"{GOOGLE_CALENDAR_API_URL}{path}",
+            headers={"Authorization": f"Bearer {access_token}"},
+            timeout=GOOGLE_CALENDAR_OAUTH_TIMEOUT,
+            **kwargs,
+        )
 
     def _calendar_request(self, method, path, **kwargs):
-        access_token = self._ensure_access_token()
         try:
-            response = requests.request(
-                method,
-                f"{GOOGLE_CALENDAR_API_URL}{path}",
-                headers={"Authorization": f"Bearer {access_token}"},
-                timeout=GOOGLE_CALENDAR_OAUTH_TIMEOUT,
-                **kwargs,
-            )
-            if response.status_code == 401 and self._refresh_token:
-                access_token = self._ensure_access_token(force_refresh=True)
-                response = requests.request(
-                    method,
-                    f"{GOOGLE_CALENDAR_API_URL}{path}",
-                    headers={"Authorization": f"Bearer {access_token}"},
-                    timeout=GOOGLE_CALENDAR_OAUTH_TIMEOUT,
-                    **kwargs,
-                )
+            access_token, refreshed = self._ensure_access_token()
+            response = self._send_calendar_request(method, path, access_token, **kwargs)
+            if response.status_code == 401 and self._refresh_token and not refreshed:
+                self._refresh_access_token()
+                response = self._send_calendar_request(method, path, self._access_token, **kwargs)
             return response
         except requests.RequestException as exc:
-            raise GoogleCalendarClientError("Google Calendar provider request failed") from exc
+            raise GoogleCalendarProviderError("Google Calendar provider request failed") from exc
 
     @staticmethod
     def _operation_description(operation_id):
@@ -151,7 +193,7 @@ class GoogleCalendarClient:
                 if not isinstance(page_token, str) or not page_token:
                     raise ValueError("Calendar list response contained an invalid page token")
             except (requests.RequestException, TypeError, ValueError) as exc:
-                raise GoogleCalendarClientError("Google Calendar recovery lookup failed") from exc
+                raise GoogleCalendarProviderError("Google Calendar recovery lookup failed") from exc
 
     def create_calendar(self, operation_id=None):
         """Create one dedicated app-owned calendar and return its provider ID."""
@@ -169,8 +211,23 @@ class GoogleCalendarClient:
             if not calendar_id or not isinstance(calendar_id, str) or len(calendar_id) > 255:
                 raise ValueError("Calendar response omitted a valid ID")
         except (requests.RequestException, TypeError, ValueError) as exc:
-            raise GoogleCalendarClientError("Google Calendar creation failed") from exc
+            raise GoogleCalendarProviderError("Google Calendar creation failed") from exc
         return calendar_id
+
+    def get_calendar(self, calendar_id):
+        """Validate that the recorded dedicated calendar remains provider-readable."""
+
+        if not calendar_id:
+            raise GoogleCalendarClientError("Google Calendar lookup requires a recorded calendar ID")
+        response = self._calendar_request("get", f"/calendars/{quote(calendar_id, safe='')}")
+        try:
+            response.raise_for_status()
+            payload = response.json()
+            if not isinstance(payload, dict) or payload.get("id") != calendar_id:
+                raise ValueError("Calendar response did not match the recorded calendar")
+            return payload
+        except (requests.RequestException, TypeError, ValueError) as exc:
+            raise GoogleCalendarProviderError("Google Calendar lookup failed") from exc
 
     def delete_calendar(self, calendar_id):
         """Delete only the durable calendar ID supplied by the caller."""
@@ -183,7 +240,7 @@ class GoogleCalendarClient:
         try:
             response.raise_for_status()
         except requests.RequestException as exc:
-            raise GoogleCalendarClientError("Google Calendar deletion failed") from exc
+            raise GoogleCalendarProviderError("Google Calendar deletion failed") from exc
 
     @staticmethod
     def _event_path(calendar_id, event_id=""):
@@ -201,7 +258,7 @@ class GoogleCalendarClient:
                 raise ValueError("Calendar event response is not an object")
             return payload
         except (requests.RequestException, TypeError, ValueError) as exc:
-            raise GoogleCalendarClientError(error_message) from exc
+            raise GoogleCalendarProviderError(error_message) from exc
 
     def get_event(self, calendar_id, event_id):
         """Get one event, returning ``None`` when it is already absent."""
@@ -226,13 +283,13 @@ class GoogleCalendarClient:
             payload = self._event_payload(response, "Google Calendar event list failed")
             items = payload.get("items", [])
             if not isinstance(items, list) or not all(isinstance(item, dict) for item in items):
-                raise GoogleCalendarClientError("Google Calendar event list failed")
+                raise GoogleCalendarProviderError("Google Calendar event list failed")
             events.extend(items)
             page_token = payload.get("nextPageToken")
             if page_token is None:
                 return events
             if not isinstance(page_token, str) or not page_token:
-                raise GoogleCalendarClientError("Google Calendar event list failed")
+                raise GoogleCalendarProviderError("Google Calendar event list failed")
 
     def insert_event(self, calendar_id, event_id, payload):
         """Insert an event with Plane's deterministic provider ID."""
@@ -258,7 +315,7 @@ class GoogleCalendarClient:
         try:
             response.raise_for_status()
         except requests.RequestException as exc:
-            raise GoogleCalendarClientError("Google Calendar event deletion failed") from exc
+            raise GoogleCalendarProviderError("Google Calendar event deletion failed") from exc
 
     def revoke_grant(self):
         """Revoke this connection's refresh grant, treating an absent grant as converged."""
@@ -266,6 +323,7 @@ class GoogleCalendarClient:
         token = self._refresh_token or self._access_token
         if not token:
             return
+        self._validated_credentials()
         try:
             response = requests.post(
                 GOOGLE_CALENDAR_REVOCATION_URL,
@@ -281,4 +339,4 @@ class GoogleCalendarClient:
                     return
             response.raise_for_status()
         except requests.RequestException as exc:
-            raise GoogleCalendarClientError("Google Calendar grant revocation failed") from exc
+            raise GoogleCalendarProviderError("Google Calendar grant revocation failed") from exc
