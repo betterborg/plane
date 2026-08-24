@@ -29,6 +29,7 @@ from plane.integrations.google_calendar.lifecycle import (
     apply_google_calendar_oauth_success,
     clear_google_calendar_oauth_attempt,
     lock_google_calendar_connection,
+    lock_google_calendar_global_state,
     lock_google_calendar_workspace_connections,
 )
 from plane.integrations.google_calendar.oauth import (
@@ -45,6 +46,7 @@ from plane.integrations.google_calendar.oauth import (
     revoke_rejected_google_calendar_grant,
     validate_google_calendar_grant_scopes,
 )
+from plane.license.utils.google_calendar_credentials import google_calendar_credential_fingerprint
 from plane.utils.host import base_host
 
 
@@ -168,7 +170,7 @@ def _dispose_callback_grant(connection_id, grant, *, account_id=""):
 
 
 @transaction.atomic
-def _complete_callback(request, payload, grant, identity):
+def _complete_callback(request, payload, grant, identity, credential_fingerprint):
     connection = lock_google_calendar_connection(payload["connection_id"])
     connection.workspace_integration = WorkspaceIntegration.objects.select_for_update().get(
         id=connection.workspace_integration_id
@@ -191,6 +193,7 @@ def _complete_callback(request, payload, grant, identity):
         refresh_token=refresh_token,
         token_expires_at=grant.token_expires_at,
         scopes=grant.scopes,
+        credential_fingerprint=credential_fingerprint,
     )
     lifecycle_task = current_app.signature(GOOGLE_CALENDAR_LIFECYCLE_TASK)
     enqueue_google_calendar_task_on_commit(
@@ -215,6 +218,10 @@ class GoogleCalendarOAuthStartEndpoint(BaseAPIView):
     def get(self, request, slug):
         if not settings.GOOGLE_CALENDAR_RELEASED:
             return Response({"error": "Not found"}, status=status.HTTP_404_NOT_FOUND)
+        # Credential replacement shares this lock. Acquire it before reading
+        # the client so an attempt can only be created for the configuration
+        # generation that remains installed when this transaction commits.
+        lock_google_calendar_global_state()
         try:
             credentials = get_google_calendar_oauth_credentials()
         except GoogleCalendarOAuthConfigurationError:
@@ -390,7 +397,11 @@ class GoogleCalendarOAuthCallbackEndpoint(BaseAPIView):
             )
 
         try:
-            command = _complete_callback(request, payload, grant, identity)
+            credential_fingerprint = google_calendar_credential_fingerprint(
+                credentials.client_id,
+                credentials.client_secret,
+            )
+            command = _complete_callback(request, payload, grant, identity, credential_fingerprint)
         except (GoogleCalendarLifecycleError, GoogleCalendarOAuthError, GoogleCalendarConnection.DoesNotExist):
             _dispose_callback_grant(payload["connection_id"], grant, account_id=identity.account_id)
             _consume_session_attempt(request, payload)

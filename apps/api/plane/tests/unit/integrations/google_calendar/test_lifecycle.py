@@ -156,6 +156,7 @@ class TestGoogleCalendarLifecycleTransitions:
                 provider_email="member@example.com",
                 refresh_token="validated-refresh-token",
                 scopes=["calendar.events"],
+                credential_fingerprint="a" * 64,
             )
 
             with pytest.raises(StaleGoogleCalendarGeneration):
@@ -181,6 +182,7 @@ class TestGoogleCalendarLifecycleTransitions:
                     0,
                     provider_account_id="google-account",
                     provider_email="member@example.com",
+                    credential_fingerprint="a" * 64,
                 )
 
         attempt.refresh_from_db()
@@ -193,6 +195,9 @@ class TestGoogleCalendarLifecycleTransitions:
         active = GoogleCalendarConnectionFactory(
             provider_account_id="google-account",
             provider_email="member@example.com",
+            sync_token="provider-sync-token",
+            page_token="provider-page-token",
+            credential_fingerprint="a" * 64,
             access_token="access-token",
             refresh_token="refresh-token",
             token_expires_at=timezone.now() + timedelta(hours=1),
@@ -225,8 +230,11 @@ class TestGoogleCalendarLifecycleTransitions:
         assert tombstone.provider_email == ""
         assert tombstone.access_token == ""
         assert tombstone.refresh_token == ""
+        assert tombstone.sync_token == ""
+        assert tombstone.page_token == ""
         assert tombstone.token_expires_at is None
         assert tombstone.scopes == []
+        assert tombstone.credential_fingerprint == ""
         assert tombstone.last_error == ""
 
     def test_terminal_cleanup_is_illegal_before_disconnect(self):

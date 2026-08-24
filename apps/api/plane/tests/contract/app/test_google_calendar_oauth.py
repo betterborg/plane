@@ -37,6 +37,7 @@ from plane.integrations.google_calendar.oauth import (
     GoogleCalendarOAuthIdentity,
     GoogleCalendarOAuthIdentityError,
 )
+from plane.license.utils.google_calendar_credentials import google_calendar_credential_fingerprint
 from plane.tests.factories import (
     GoogleCalendarConnectionFactory,
     IntegrationFactory,
@@ -337,6 +338,10 @@ class TestGoogleCalendarOAuth:
         assert connection.provider_email == "member@example.com"
         assert connection.access_token == complete_grant.access_token
         assert connection.refresh_token == complete_grant.refresh_token
+        assert connection.credential_fingerprint == google_calendar_credential_fingerprint(
+            oauth_credentials.client_id,
+            oauth_credentials.client_secret,
+        )
         assert connection.desired_state == GoogleCalendarConnection.DesiredState.CONNECTED
         assert connection.status == GoogleCalendarConnection.Status.PENDING
         assert connection.lifecycle_generation == 1
@@ -443,7 +448,16 @@ class TestGoogleCalendarOAuth:
                 revoke_locked.wait(timeout=5)
                 callback_started.set()
                 request = SimpleNamespace(user=create_user)
-                return _complete_callback(request, payload, complete_grant, identity)
+                return _complete_callback(
+                    request,
+                    payload,
+                    complete_grant,
+                    identity,
+                    google_calendar_credential_fingerprint(
+                        oauth_credentials.client_id,
+                        oauth_credentials.client_secret,
+                    ),
+                )
             finally:
                 close_old_connections()
 
