@@ -9,7 +9,7 @@ from uuid import UUID, uuid4
 
 from celery import current_app, shared_task
 from django.db import transaction
-from django.db.models import Q
+from django.db.models import Exists, OuterRef, Q
 from django.utils import timezone
 
 from plane.db.models import (
@@ -21,6 +21,7 @@ from plane.db.models import (
     IssueLabel,
     Project,
     WorkspaceIntegration,
+    WorkspaceMember,
 )
 from plane.db.models.state import StateGroup
 from plane.integrations.google_calendar.client import (
@@ -150,9 +151,55 @@ def _release_scheduler_lease(connection_id, lease_expires_at):
     ).update(reconciliation_lease_expires_at=None)
 
 
+def _present_recovery_candidates():
+    active_membership = WorkspaceMember.objects.filter(
+        workspace_id=OuterRef("workspace_integration__workspace_id"),
+        member_id=OuterRef("member_id"),
+        is_active=True,
+        deleted_at__isnull=True,
+    )
+    candidates = (
+        GoogleCalendarConnection.objects.select_related("workspace_integration")
+        .filter(
+            workspace_integration__config__enabled=True,
+            workspace_integration__integration__provider="google_calendar",
+            desired_state=GoogleCalendarConnection.DesiredState.CONNECTED,
+            status=GoogleCalendarConnection.Status.PENDING,
+        )
+        .annotate(has_active_membership=Exists(active_membership))
+        .filter(has_active_membership=True)
+        .order_by("id")
+    )
+    return (connection for connection in candidates.iterator() if has_usable_google_calendar_grant(connection))
+
+
+@transaction.atomic
+def _claim_present_recovery(connection_id):
+    try:
+        connection = lock_google_calendar_connection(connection_id)
+    except GoogleCalendarConnection.DoesNotExist:
+        return None
+    workspace_integration = connection.workspace_integration
+    if (
+        workspace_integration.integration.provider != "google_calendar"
+        or not (workspace_integration.config or {}).get("enabled", False)
+        or connection.desired_state != GoogleCalendarConnection.DesiredState.CONNECTED
+        or connection.status != GoogleCalendarConnection.Status.PENDING
+        or not WorkspaceMember.objects.filter(
+            workspace_id=workspace_integration.workspace_id,
+            member_id=connection.member_id,
+            is_active=True,
+            deleted_at__isnull=True,
+        ).exists()
+        or not has_usable_google_calendar_grant(connection)
+    ):
+        return None
+    return connection.lifecycle_generation
+
+
 @shared_task
 def schedule_google_calendar_reconciliations():
-    """Publish due healthy Calendar inventory work with bounded staggering."""
+    """Publish due healthy inventory and recover unfinished present generations."""
 
     at = timezone.now()
     due_connection_ids = (
@@ -187,6 +234,21 @@ def schedule_google_calendar_reconciliations():
             logger.exception(
                 "Failed to publish scheduled Google Calendar reconciliation",
                 extra={"connection_id": str(connection.id)},
+            )
+            continue
+        published += 1
+
+    for candidate in _present_recovery_candidates():
+        generation = _claim_present_recovery(candidate.id)
+        if generation is None:
+            continue
+        lifecycle_task = current_app.signature(GOOGLE_CALENDAR_LIFECYCLE_TASK)
+        try:
+            publish_google_calendar_task(lifecycle_task, str(candidate.id), generation)
+        except Exception:
+            logger.exception(
+                "Failed to publish Google Calendar present recovery",
+                extra={"connection_id": str(candidate.id), "generation": generation},
             )
             continue
         published += 1

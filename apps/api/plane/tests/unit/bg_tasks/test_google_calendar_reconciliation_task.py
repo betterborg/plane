@@ -15,18 +15,24 @@ from plane.bgtasks.google_calendar_task import (
     GOOGLE_CALENDAR_RECONCILIATION_MAX_STAGGER_SECONDS,
     _release_reconciliation_lease,
     _start_or_resume_inventory,
+    reconcile_google_calendar_connection,
     reconcile_google_calendar_inventory,
     schedule_google_calendar_reconciliations,
     synchronize_google_calendar_issue,
 )
 from plane.db.models import GoogleCalendarConnection, GoogleCalendarEvent
 from plane.integrations.google_calendar.client import GoogleCalendarEventPage, GoogleCalendarSyncTokenExpired
-from plane.integrations.google_calendar.dispatch import GOOGLE_CALENDAR_INVENTORY_TASK, GOOGLE_CALENDAR_ISSUE_SYNC_TASK
+from plane.integrations.google_calendar.dispatch import (
+    GOOGLE_CALENDAR_INVENTORY_TASK,
+    GOOGLE_CALENDAR_ISSUE_SYNC_TASK,
+    GOOGLE_CALENDAR_LIFECYCLE_TASK,
+)
 from plane.tests.factories import (
     GoogleCalendarConnectionFactory,
     GoogleCalendarEventFactory,
     IssueAssigneeFactory,
     IssueFactory,
+    WorkspaceMemberFactory,
     WorkspaceIntegrationFactory,
 )
 
@@ -164,6 +170,171 @@ class TestScheduleGoogleCalendarReconciliations:
         assert connections[0].reconciliation_lease_expires_at is None
         assert connections[1].reconciliation_lease_expires_at == at + timedelta(hours=2)
         assert connections[2].reconciliation_lease_expires_at == at + timedelta(hours=2)
+
+    @freeze_time("2026-08-24 12:00:00")
+    def test_recovers_dropped_present_publications_for_the_exact_generations(self):
+        workspace_integration = _enabled_calendar_integration()
+        callback_connection = GoogleCalendarConnectionFactory(
+            workspace_integration=workspace_integration,
+            provider_account_id="callback-account",
+            refresh_token="callback-refresh-token",
+            desired_state=GoogleCalendarConnection.DesiredState.CONNECTED,
+            status=GoogleCalendarConnection.Status.PENDING,
+            lifecycle_generation=7,
+        )
+        reenabled_connection = GoogleCalendarConnectionFactory(
+            workspace_integration=workspace_integration,
+            provider_account_id="reenabled-account",
+            refresh_token="reenabled-refresh-token",
+            calendar_id="recorded-calendar",
+            calendar_generation=4,
+            desired_state=GoogleCalendarConnection.DesiredState.CONNECTED,
+            status=GoogleCalendarConnection.Status.PENDING,
+            lifecycle_generation=11,
+        )
+        for connection in (callback_connection, reenabled_connection):
+            WorkspaceMemberFactory(
+                workspace=workspace_integration.workspace,
+                member=connection.member,
+            )
+
+        with (
+            patch("plane.integrations.google_calendar.lifecycle._acquire_advisory_xact_lock"),
+            patch("plane.bgtasks.google_calendar_task.publish_google_calendar_task") as publish,
+        ):
+            assert schedule_google_calendar_reconciliations.run() == 2
+
+        published = {call.args[1]: (call.args[0].task, call.args[2]) for call in publish.call_args_list}
+        assert published == {
+            str(callback_connection.id): (GOOGLE_CALENDAR_LIFECYCLE_TASK, 7),
+            str(reenabled_connection.id): (GOOGLE_CALENDAR_LIFECYCLE_TASK, 11),
+        }
+
+        provision_client = Mock(access_token=None)
+        provision_client.find_calendar.return_value = None
+        provision_client.create_calendar.return_value = "provisioned-calendar"
+        resume_client = Mock(access_token=None)
+        with (
+            patch("plane.integrations.google_calendar.lifecycle._acquire_advisory_xact_lock"),
+            patch(
+                "plane.bgtasks.google_calendar_task.GoogleCalendarClient",
+                side_effect=[provision_client, resume_client],
+            ),
+            patch("plane.bgtasks.google_calendar_task.enqueue_google_calendar_task_on_commit") as enqueue,
+        ):
+            assert reconcile_google_calendar_connection.run(str(callback_connection.id), 7) == "active"
+            assert reconcile_google_calendar_connection.run(str(reenabled_connection.id), 11) == "active"
+
+        callback_connection.refresh_from_db()
+        reenabled_connection.refresh_from_db()
+        assert callback_connection.calendar_id == "provisioned-calendar"
+        assert callback_connection.status == GoogleCalendarConnection.Status.ACTIVE
+        assert reenabled_connection.calendar_id == "recorded-calendar"
+        assert reenabled_connection.calendar_generation == 4
+        assert reenabled_connection.status == GoogleCalendarConnection.Status.ACTIVE
+        provision_client.create_calendar.assert_called_once()
+        resume_client.get_calendar.assert_called_once_with("recorded-calendar")
+        resume_client.create_calendar.assert_not_called()
+        assert any(
+            call.args[0] == reconcile_google_calendar_inventory
+            and call.args[1] == str(reenabled_connection.id)
+            and call.kwargs == {"force_local_scan": True}
+            for call in enqueue.call_args_list
+        )
+
+    @freeze_time("2026-08-24 12:00:00")
+    def test_present_recovery_excludes_ineligible_or_unusable_rows(self):
+        enabled_integration = _enabled_calendar_integration()
+
+        def pending_connection(*, workspace_integration=enabled_integration, active_member=True, **kwargs):
+            connection = GoogleCalendarConnectionFactory(
+                workspace_integration=workspace_integration,
+                provider_account_id="google-account",
+                refresh_token="refresh-token",
+                desired_state=GoogleCalendarConnection.DesiredState.CONNECTED,
+                status=GoogleCalendarConnection.Status.PENDING,
+                lifecycle_generation=3,
+                **kwargs,
+            )
+            WorkspaceMemberFactory(
+                workspace=workspace_integration.workspace,
+                member=connection.member,
+                is_active=active_member,
+            )
+            return connection
+
+        eligible = pending_connection()
+        tokenless = pending_connection(refresh_token="", access_token="", token_expires_at=None)
+        disabled = pending_connection(
+            workspace_integration=WorkspaceIntegrationFactory(
+                integration__provider="google_calendar",
+                config={"enabled": False},
+            )
+        )
+        inactive_member = pending_connection(active_member=False)
+        terminal_tombstone = GoogleCalendarConnectionFactory(
+            workspace_integration=enabled_integration,
+            provider_account_id="retained-account",
+            refresh_token="retained-token",
+            tombstone=True,
+        )
+        WorkspaceMemberFactory(
+            workspace=enabled_integration.workspace,
+            member=terminal_tombstone.member,
+        )
+        soft_deleted = pending_connection()
+        soft_deleted.deleted_at = timezone.now()
+        soft_deleted.save(update_fields=["deleted_at", "updated_at"])
+
+        with (
+            patch("plane.integrations.google_calendar.lifecycle._acquire_advisory_xact_lock"),
+            patch("plane.bgtasks.google_calendar_task.publish_google_calendar_task") as publish,
+            patch("plane.bgtasks.google_calendar_task.GoogleCalendarClient") as client_class,
+        ):
+            assert schedule_google_calendar_reconciliations.run() == 1
+
+        publish.assert_called_once()
+        assert publish.call_args.args[0].task == GOOGLE_CALENDAR_LIFECYCLE_TASK
+        assert publish.call_args.args[1:] == (str(eligible.id), 3)
+        client_class.assert_not_called()
+        excluded_ids = {
+            str(tokenless.id),
+            str(disabled.id),
+            str(inactive_member.id),
+            str(terminal_tombstone.id),
+            str(soft_deleted.id),
+        }
+        assert not excluded_ids.intersection(call.args[1] for call in publish.call_args_list)
+
+    def test_present_recovery_rechecks_the_grant_under_the_connection_lock(self):
+        with freeze_time("2026-08-24 12:00:00") as frozen_time:
+            workspace_integration = _enabled_calendar_integration()
+            connection = GoogleCalendarConnectionFactory(
+                workspace_integration=workspace_integration,
+                provider_account_id="google-account",
+                refresh_token="",
+                access_token="access-token",
+                token_expires_at=timezone.now() + timedelta(minutes=1),
+                desired_state=GoogleCalendarConnection.DesiredState.CONNECTED,
+                status=GoogleCalendarConnection.Status.PENDING,
+                lifecycle_generation=5,
+            )
+            WorkspaceMemberFactory(
+                workspace=workspace_integration.workspace,
+                member=connection.member,
+            )
+
+            with (
+                patch(
+                    "plane.integrations.google_calendar.lifecycle._acquire_advisory_xact_lock",
+                    side_effect=lambda _lock_key: frozen_time.tick(delta=timedelta(minutes=2)),
+                ) as acquire_lock,
+                patch("plane.bgtasks.google_calendar_task.publish_google_calendar_task") as publish,
+            ):
+                assert schedule_google_calendar_reconciliations.run() == 0
+
+        assert acquire_lock.call_count == 2
+        publish.assert_not_called()
 
 
 @pytest.mark.unit
