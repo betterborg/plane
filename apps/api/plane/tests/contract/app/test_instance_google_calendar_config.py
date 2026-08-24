@@ -188,6 +188,7 @@ class TestGoogleCalendarInstanceConfiguration:
             ("page_token", "page-token"),
             ("token_expires_at", timezone.now()),
             ("scopes", ["calendar-scope"]),
+            ("credential_fingerprint", "old-credential-fingerprint"),
         ],
     )
     @pytest.mark.parametrize("soft_deleted", [False, True], ids=["live", "soft-deleted"])

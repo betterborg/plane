@@ -29,6 +29,7 @@ _GOOGLE_CALENDAR_PROVIDER_STATE_FIELDS = (
     "page_token",
     "token_expires_at",
     "scopes",
+    "credential_fingerprint",
 )
 
 _GOOGLE_CALENDAR_OAUTH_ATTEMPT_DEFAULTS = {
