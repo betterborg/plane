@@ -34,7 +34,7 @@ def _draft_conversion_url(workspace, draft):
 
 
 def _capture_on_commit(callbacks):
-    def capture(callback, robust=False):
+    def capture(callback, using=None, robust=False):
         callbacks.append((callback, robust))
 
     return capture
@@ -150,7 +150,7 @@ class TestGoogleCalendarDraftCycleDispatch:
 
             assert response.status_code == status.HTTP_201_CREATED, response.data
             assert observed_cycle_ids == []
-            assert len(callbacks) == 2
+            assert len(callbacks) == 3
             _run_callbacks(callbacks)
 
         assert {call.args[0] for call in signature.call_args_list} == {
@@ -201,7 +201,7 @@ class TestGoogleCalendarDraftCycleDispatch:
             )
 
             assert response.status_code == status.HTTP_201_CREATED, response.data
-            assert len(callbacks) == 1
+            assert len(callbacks) == 2
             _run_callbacks(callbacks)
 
         issue_dispatch.assert_called_once_with(str(response.data["id"]))
@@ -265,7 +265,7 @@ class TestGoogleCalendarDraftCycleDispatch:
             )
 
             assert response.status_code == status.HTTP_201_CREATED, response.data
-            assert len(callbacks) == 2
+            assert len(callbacks) == 3
             _run_callbacks(callbacks)
 
         signature.assert_called_once_with(GOOGLE_CALENDAR_ISSUE_SYNC_TASK)

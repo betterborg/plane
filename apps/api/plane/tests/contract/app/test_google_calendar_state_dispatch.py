@@ -35,7 +35,7 @@ class TestGoogleCalendarStateDispatch:
         callbacks = []
         observed = []
 
-        def capture_on_commit(callback, robust=False):
+        def capture_on_commit(callback, using=None, robust=False):
             callbacks.append((callback, robust))
 
         def inspect_saved_states(issue_ids):

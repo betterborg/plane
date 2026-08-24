@@ -8,6 +8,13 @@ from .common import *  # noqa
 
 DEBUG = True
 
+# Exercise transaction-aware code against a non-default connection while using
+# the same physical test database.
+DATABASES["soft_delete_test"] = {  # noqa: F405
+    **DATABASES["default"],  # noqa: F405
+    "TEST": {"MIRROR": "default"},
+}
+
 # Send it in a dummy outbox
 EMAIL_BACKEND = "django.core.mail.backends.locmem.EmailBackend"
 

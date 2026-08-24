@@ -38,7 +38,7 @@ class TestGoogleCalendarLabelDispatch:
         recursive_deletions = []
         observed = []
 
-        def capture_on_commit(callback, robust=False):
+        def capture_on_commit(callback, using=None, robust=False):
             callbacks.append((callback, robust))
 
         def inspect_saved_labels(issue_ids):
@@ -76,17 +76,24 @@ class TestGoogleCalendarLabelDispatch:
 
             assert response.status_code == expected_status, response.data
             assert observed == []
-            assert len(callbacks) == 1
+            assert len(callbacks) == (2 if method == "delete" else 1)
+            assert all(robust is True for _, robust in callbacks)
 
             if method == "delete":
+                assert recursive_deletions == []
+                soft_delete_callback = next(
+                    callback for callback, _ in callbacks if callback.__name__ == "_publish_soft_delete_related_objects"
+                )
+                soft_delete_callback()
                 assert len(recursive_deletions) == 1
                 with suppress_google_calendar_issue_signal_dispatch():
                     deletion_args, deletion_kwargs = recursive_deletions[0]
                     soft_delete_related_objects.run(*deletion_args, **deletion_kwargs)
 
-            callback, robust = callbacks[0]
-            assert robust is True
-            callback()
+            calendar_callback = next(
+                callback for callback, _ in callbacks if callback.__name__ == "_enqueue_google_calendar_task"
+            )
+            calendar_callback()
 
         label.refresh_from_db()
         if method == "patch":

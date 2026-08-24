@@ -60,7 +60,7 @@ class TestGoogleCalendarCycleDispatch:
         callbacks = []
         observed_states = []
 
-        def capture_on_commit(callback, robust=False):
+        def capture_on_commit(callback, using=None, robust=False):
             callbacks.append((callback, robust))
 
         def synchronize_persisted_cycle(cycle_id, connection_id):
@@ -131,10 +131,11 @@ class TestGoogleCalendarCycleDispatch:
             save_and_converge(["archived_at"])
 
             cycle.delete()
-            assert len(callbacks) == 1
-            callback, robust = callbacks.pop()
-            assert robust is True
-            callback()
+            assert len(callbacks) == 2
+            assert all(robust is True for _, robust in callbacks)
+            for callback, _ in callbacks:
+                callback()
+            callbacks.clear()
             assert not GoogleCalendarEvent.objects.filter(entity_id=cycle.id).exists()
 
             cycle.deleted_at = None
@@ -185,7 +186,7 @@ class TestGoogleCalendarCycleDispatch:
         callbacks = []
         observed_assignees = []
 
-        def capture_on_commit(callback, robust=False):
+        def capture_on_commit(callback, using=None, robust=False):
             callbacks.append((callback, robust))
 
         def inspect_final_assignees(cycle_id):
