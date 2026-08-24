@@ -9,6 +9,7 @@ import logging
 import secrets
 
 # Django imports
+from django.db import transaction
 from django.db.models import Case, Count, IntegerField, Q, When
 from django.contrib.auth import logout
 from django.utils import timezone
@@ -19,6 +20,7 @@ from django.core.validators import validate_email
 from django.core.cache import cache
 
 # Third party imports
+from celery import current_app
 from rest_framework import status
 from rest_framework.response import Response
 from rest_framework.permissions import AllowAny
@@ -35,6 +37,7 @@ from plane.app.serializers import (
 from plane.app.views.base import BaseAPIView, BaseViewSet
 from plane.db.models import (
     Account,
+    GoogleCalendarConnection,
     IssueActivity,
     Profile,
     ProjectMember,
@@ -51,6 +54,11 @@ from plane.bgtasks.user_deactivation_email_task import user_deactivation_email
 from plane.utils.host import base_host
 from plane.bgtasks.user_email_update_task import send_email_update_magic_code, send_email_update_confirmation
 from plane.authentication.rate_limit import EmailVerificationThrottle
+from plane.integrations.google_calendar.dispatch import (
+    GOOGLE_CALENDAR_LIFECYCLE_TASK,
+    enqueue_google_calendar_task_on_commit,
+)
+from plane.integrations.google_calendar.lifecycle import request_google_calendar_disconnect
 
 
 logger = logging.getLogger("plane")
@@ -249,6 +257,7 @@ class UserEndpoint(BaseViewSet):
         serialized_data = UserMeSerializer(user).data
         return Response(serialized_data, status=status.HTTP_200_OK)
 
+    @transaction.atomic
     def deactivate(self, request):
         # Check all workspace user is active
         user = self.get_object()
@@ -305,9 +314,31 @@ class UserEndpoint(BaseViewSet):
                     status=status.HTTP_400_BAD_REQUEST,
                 )
 
+        workspace_ids = [workspace.workspace_id for workspace in workspaces_to_deactivate]
+        calendar_connections = list(
+            GoogleCalendarConnection.objects.filter(
+                member=user,
+                workspace_integration__workspace_id__in=workspace_ids,
+                workspace_integration__integration__provider="google_calendar",
+            )
+            .order_by("id")
+            .values_list("id", "lifecycle_generation")
+        )
+
         ProjectMember.objects.bulk_update(projects_to_deactivate, ["is_active"], batch_size=100)
 
         WorkspaceMember.objects.bulk_update(workspaces_to_deactivate, ["is_active"], batch_size=100)
+
+        for connection_id, lifecycle_generation in calendar_connections:
+            command = request_google_calendar_disconnect(connection_id, lifecycle_generation)
+            if command is None:
+                continue
+            lifecycle_task = current_app.signature(GOOGLE_CALENDAR_LIFECYCLE_TASK)
+            enqueue_google_calendar_task_on_commit(
+                lifecycle_task,
+                str(command.connection_id),
+                command.generation,
+            )
 
         # Delete all workspace invites
         WorkspaceMemberInvite.objects.filter(email=user.email).delete()
