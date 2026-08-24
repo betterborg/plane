@@ -49,8 +49,9 @@ export interface IGoogleCalendarWorkspacePolicy {
   mode: "assignment" | "filter";
   update_on_completion: boolean;
   recipients: "cycle_members";
-  label_id: string | null;
-  priority: TIssuePriorities | null;
+  label_ids: string[];
+  priorities: TIssuePriorities[];
+  label_match: "any" | "all";
 }
 
 export interface IGoogleCalendarConnectionStatus {
