@@ -3,12 +3,19 @@
 # See the LICENSE file for details.
 
 import json
+from datetime import timedelta
 from unittest.mock import Mock, patch
 from uuid import uuid4
 
 import pytest
+from django.utils import timezone
 
-from plane.bgtasks.google_calendar_task import reconcile_google_calendar_inventory, synchronize_google_calendar_issue
+from plane.bgtasks.google_calendar_task import (
+    _release_reconciliation_lease,
+    _start_or_resume_inventory,
+    reconcile_google_calendar_inventory,
+    synchronize_google_calendar_issue,
+)
 from plane.db.models import GoogleCalendarEvent
 from plane.integrations.google_calendar.client import GoogleCalendarEventPage, GoogleCalendarSyncTokenExpired
 from plane.integrations.google_calendar.dispatch import GOOGLE_CALENDAR_INVENTORY_TASK, GOOGLE_CALENDAR_ISSUE_SYNC_TASK
@@ -262,3 +269,44 @@ class TestGoogleCalendarReconciliationTask:
         assert result == "stale"
         client.list_event_page.assert_not_called()
         publish.assert_not_called()
+
+    def test_expired_lease_holder_cannot_advance_or_release_takeover_lease(self):
+        connection = GoogleCalendarConnectionFactory(active=True, sync_token="current-sync-token")
+        page = GoogleCalendarEventPage((), None, "stale-worker-sync-token")
+        takeover = {}
+
+        def take_over_during_provider_request(*args, **kwargs):
+            connection.refresh_from_db()
+            original_state = json.loads(connection.reconciliation_cursor)
+            takeover["run_id"] = original_state["run_id"]
+            takeover["expired_lease_token"] = original_state["lease_token"]
+            connection.reconciliation_lease_expires_at = timezone.now() - timedelta(seconds=1)
+            connection.save(update_fields=["reconciliation_lease_expires_at", "updated_at"])
+
+            claimed_connection = _start_or_resume_inventory(connection.id, original_state["run_id"], False)
+            takeover["lease_token"] = json.loads(claimed_connection.reconciliation_cursor)["lease_token"]
+            return page
+
+        client = _provider_client()
+        client.list_event_page.side_effect = take_over_during_provider_request
+
+        with (
+            patch("plane.bgtasks.google_calendar_task.GoogleCalendarClient", return_value=client),
+            patch("plane.bgtasks.google_calendar_task.publish_google_calendar_task") as publish,
+        ):
+            result = reconcile_google_calendar_inventory.run(str(connection.id))
+
+        assert result == "stale"
+        assert takeover["lease_token"] != takeover["expired_lease_token"]
+        assert not _release_reconciliation_lease(
+            connection.id,
+            takeover["run_id"],
+            takeover["expired_lease_token"],
+        )
+        publish.assert_not_called()
+
+        connection.refresh_from_db()
+        current_state = json.loads(connection.reconciliation_cursor)
+        assert current_state["lease_token"] == takeover["lease_token"]
+        assert connection.reconciliation_lease_expires_at > timezone.now()
+        assert connection.sync_token == "current-sync-token"

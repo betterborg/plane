@@ -1136,6 +1136,23 @@ def _save_reconciliation_state(connection, state, *, phase=None, page_token=None
     connection.save(update_fields=update_fields)
 
 
+def _owns_reconciliation_lease(connection, state, run_id, lease_token, *, phase=None):
+    return (
+        state is not None
+        and state["run_id"] == str(run_id)
+        and bool(lease_token)
+        and state.get("lease_token") == str(lease_token)
+        and (phase is None or connection.reconciliation_phase == phase)
+        and state.get("calendar_generation") == connection.calendar_generation
+        and state.get("lifecycle_generation") == connection.lifecycle_generation
+    )
+
+
+def _claim_reconciliation_lease(connection, state):
+    state["lease_token"] = str(uuid4())
+    _save_reconciliation_state(connection, state)
+
+
 @transaction.atomic
 def _start_or_resume_inventory(connection_id, run_id, force_local_scan):
     try:
@@ -1164,8 +1181,7 @@ def _start_or_resume_inventory(connection_id, run_id, force_local_scan):
             return "stale"
         if connection.reconciliation_lease_expires_at and connection.reconciliation_lease_expires_at > timezone.now():
             return "leased"
-        connection.reconciliation_lease_expires_at = timezone.now() + GOOGLE_CALENDAR_RECONCILIATION_LEASE
-        connection.save(update_fields=["reconciliation_lease_expires_at", "updated_at"])
+        _claim_reconciliation_lease(connection, state)
         return connection
 
     if (
@@ -1180,13 +1196,13 @@ def _start_or_resume_inventory(connection_id, run_id, force_local_scan):
         and state.get("calendar_generation") == connection.calendar_generation
         and state.get("lifecycle_generation") == connection.lifecycle_generation
     ):
-        connection.reconciliation_lease_expires_at = timezone.now() + GOOGLE_CALENDAR_RECONCILIATION_LEASE
-        connection.save(update_fields=["reconciliation_lease_expires_at", "updated_at"])
+        _claim_reconciliation_lease(connection, state)
         return connection
 
     full_inventory = not bool(connection.sync_token)
     state = {
         "run_id": str(uuid4()),
+        "lease_token": str(uuid4()),
         "calendar_generation": connection.calendar_generation,
         "lifecycle_generation": connection.lifecycle_generation,
         "after_id": "",
@@ -1235,15 +1251,15 @@ def _provider_marker(event):
 
 
 @transaction.atomic
-def _record_inventory_page(connection_id, run_id, page):
+def _record_inventory_page(connection_id, run_id, lease_token, page):
     connection = GoogleCalendarConnection.objects.select_for_update().get(id=connection_id)
     state = _reconciliation_state(connection)
-    if (
-        state is None
-        or state["run_id"] != str(run_id)
-        or connection.reconciliation_phase != GOOGLE_CALENDAR_RECONCILIATION_PROVIDER_PHASE
-        or state.get("calendar_generation") != connection.calendar_generation
-        or state.get("lifecycle_generation") != connection.lifecycle_generation
+    if not _owns_reconciliation_lease(
+        connection,
+        state,
+        run_id,
+        lease_token,
+        phase=GOOGLE_CALENDAR_RECONCILIATION_PROVIDER_PHASE,
     ):
         return "stale"
 
@@ -1332,15 +1348,15 @@ def _record_inventory_page(connection_id, run_id, page):
 
 
 @transaction.atomic
-def _expire_inventory_sync_token(connection_id, run_id):
+def _expire_inventory_sync_token(connection_id, run_id, lease_token):
     connection = GoogleCalendarConnection.objects.select_for_update().get(id=connection_id)
     state = _reconciliation_state(connection)
-    if (
-        state is None
-        or state["run_id"] != str(run_id)
-        or connection.reconciliation_phase != GOOGLE_CALENDAR_RECONCILIATION_PROVIDER_PHASE
-        or state.get("calendar_generation") != connection.calendar_generation
-        or state.get("lifecycle_generation") != connection.lifecycle_generation
+    if not _owns_reconciliation_lease(
+        connection,
+        state,
+        run_id,
+        lease_token,
+        phase=GOOGLE_CALENDAR_RECONCILIATION_PROVIDER_PHASE,
     ):
         return False
     connection.sync_token = ""
@@ -1363,26 +1379,28 @@ def _publish_reconciliation_continuation(connection_id, run_id, countdown=None):
 
 
 @transaction.atomic
-def _release_reconciliation_lease(connection_id, run_id):
+def _release_reconciliation_lease(connection_id, run_id, lease_token):
     connection = GoogleCalendarConnection.objects.select_for_update().get(id=connection_id)
     state = _reconciliation_state(connection)
-    if state is None or state["run_id"] != str(run_id):
+    if not _owns_reconciliation_lease(connection, state, run_id, lease_token):
         return False
+    state["lease_token"] = ""
+    connection.reconciliation_cursor = json.dumps(state, separators=(",", ":"), sort_keys=True)
     connection.reconciliation_lease_expires_at = None
-    connection.save(update_fields=["reconciliation_lease_expires_at", "updated_at"])
+    connection.save(update_fields=["reconciliation_cursor", "reconciliation_lease_expires_at", "updated_at"])
     return True
 
 
 @transaction.atomic
-def _request_calendar_replacement(connection_id, run_id):
+def _request_calendar_replacement(connection_id, run_id, lease_token):
     connection = GoogleCalendarConnection.objects.select_for_update().get(id=connection_id)
     state = _reconciliation_state(connection)
-    if (
-        state is None
-        or state["run_id"] != str(run_id)
-        or connection.reconciliation_phase != GOOGLE_CALENDAR_RECONCILIATION_PROVIDER_PHASE
-        or state.get("calendar_generation") != connection.calendar_generation
-        or state.get("lifecycle_generation") != connection.lifecycle_generation
+    if not _owns_reconciliation_lease(
+        connection,
+        state,
+        run_id,
+        lease_token,
+        phase=GOOGLE_CALENDAR_RECONCILIATION_PROVIDER_PHASE,
     ):
         return "stale"
     connection.status = GoogleCalendarConnection.Status.PENDING
@@ -1407,6 +1425,22 @@ def _request_calendar_replacement(connection_id, run_id):
     return "replacement_pending"
 
 
+@transaction.atomic
+def _record_reconciliation_credential_mismatch(connection_id, run_id, lease_token):
+    connection = GoogleCalendarConnection.objects.select_for_update().get(id=connection_id)
+    state = _reconciliation_state(connection)
+    if not _owns_reconciliation_lease(
+        connection,
+        state,
+        run_id,
+        lease_token,
+        phase=GOOGLE_CALENDAR_RECONCILIATION_PROVIDER_PHASE,
+    ):
+        return False
+    _mark_credential_mismatch(connection)
+    return True
+
+
 def _publish_correlation_sync(correlation, countdown):
     if correlation.entity_type == GoogleCalendarEvent.EntityType.WORK_ITEM:
         task_name = GOOGLE_CALENDAR_ISSUE_SYNC_TASK
@@ -1417,15 +1451,15 @@ def _publish_correlation_sync(correlation, countdown):
 
 
 @transaction.atomic
-def _advance_local_scan(connection_id, run_id):
+def _advance_local_scan(connection_id, run_id, lease_token):
     connection = GoogleCalendarConnection.objects.select_for_update().get(id=connection_id)
     state = _reconciliation_state(connection)
-    if (
-        state is None
-        or state["run_id"] != str(run_id)
-        or connection.reconciliation_phase != GOOGLE_CALENDAR_RECONCILIATION_LOCAL_PHASE
-        or state.get("calendar_generation") != connection.calendar_generation
-        or state.get("lifecycle_generation") != connection.lifecycle_generation
+    if not _owns_reconciliation_lease(
+        connection,
+        state,
+        run_id,
+        lease_token,
+        phase=GOOGLE_CALENDAR_RECONCILIATION_LOCAL_PHASE,
     ):
         return "stale", []
     queryset = GoogleCalendarEvent.objects.filter(
@@ -1446,15 +1480,15 @@ def _advance_local_scan(connection_id, run_id):
 
 
 @transaction.atomic
-def _persist_local_scan_cursor(connection_id, run_id, after_id):
+def _persist_local_scan_cursor(connection_id, run_id, lease_token, after_id):
     connection = GoogleCalendarConnection.objects.select_for_update().get(id=connection_id)
     state = _reconciliation_state(connection)
-    if (
-        state is None
-        or state["run_id"] != str(run_id)
-        or connection.reconciliation_phase != GOOGLE_CALENDAR_RECONCILIATION_LOCAL_PHASE
-        or state.get("calendar_generation") != connection.calendar_generation
-        or state.get("lifecycle_generation") != connection.lifecycle_generation
+    if not _owns_reconciliation_lease(
+        connection,
+        state,
+        run_id,
+        lease_token,
+        phase=GOOGLE_CALENDAR_RECONCILIATION_LOCAL_PHASE,
     ):
         return False
     state["after_id"] = str(after_id)
@@ -1480,15 +1514,15 @@ def _complete_reconciliation_run(connection, state):
 
 
 @transaction.atomic
-def _finish_reconciliation(connection_id, run_id):
+def _finish_reconciliation(connection_id, run_id, lease_token):
     connection = GoogleCalendarConnection.objects.select_for_update().get(id=connection_id)
     state = _reconciliation_state(connection)
-    if (
-        state is None
-        or state["run_id"] != str(run_id)
-        or connection.reconciliation_phase != GOOGLE_CALENDAR_RECONCILIATION_LOCAL_PHASE
-        or state.get("calendar_generation") != connection.calendar_generation
-        or state.get("lifecycle_generation") != connection.lifecycle_generation
+    if not _owns_reconciliation_lease(
+        connection,
+        state,
+        run_id,
+        lease_token,
+        phase=GOOGLE_CALENDAR_RECONCILIATION_LOCAL_PHASE,
     ):
         return "stale"
     return _complete_reconciliation_run(connection, state)
@@ -1503,13 +1537,14 @@ def reconcile_google_calendar_inventory(connection_id, run_id=None, force_local_
         return connection
     state = _reconciliation_state(connection)
     run_id = state["run_id"]
+    lease_token = state["lease_token"]
 
     if connection.reconciliation_phase == GOOGLE_CALENDAR_RECONCILIATION_PROVIDER_PHASE:
         client = _client_for(connection)
         for _ in range(GOOGLE_CALENDAR_RECONCILIATION_PROVIDER_PAGE_LIMIT):
             connection.refresh_from_db()
             state = _reconciliation_state(connection)
-            if state is None or state["run_id"] != run_id:
+            if not _owns_reconciliation_lease(connection, state, run_id, lease_token):
                 return "stale"
             try:
                 page = client.list_event_page(
@@ -1518,16 +1553,17 @@ def reconcile_google_calendar_inventory(connection_id, run_id=None, force_local_
                     sync_token=connection.sync_token or None,
                 )
             except GoogleCalendarSyncTokenExpired:
-                if not _expire_inventory_sync_token(connection.id, run_id):
+                if not _expire_inventory_sync_token(connection.id, run_id, lease_token):
                     return "stale"
                 connection.refresh_from_db()
                 continue
             except GoogleCalendarCalendarAbsent:
-                return _request_calendar_replacement(connection.id, run_id)
+                return _request_calendar_replacement(connection.id, run_id, lease_token)
             except GoogleCalendarCredentialMismatch:
-                _mark_credential_mismatch(connection)
+                if not _record_reconciliation_credential_mismatch(connection.id, run_id, lease_token):
+                    return "stale"
                 return "credential_mismatch"
-            result = _record_inventory_page(connection.id, run_id, page)
+            result = _record_inventory_page(connection.id, run_id, lease_token, page)
             if result == "stale":
                 return result
             if result == "more":
@@ -1535,29 +1571,29 @@ def reconcile_google_calendar_inventory(connection_id, run_id=None, force_local_
             _persist_refreshed_access_token(connection, client)
             if result == "complete":
                 return result
-            if not _release_reconciliation_lease(connection.id, run_id):
+            if not _release_reconciliation_lease(connection.id, run_id, lease_token):
                 return "stale"
             _publish_reconciliation_continuation(connection.id, run_id)
             return "continued"
         _persist_refreshed_access_token(connection, client)
-        if not _release_reconciliation_lease(connection.id, run_id):
+        if not _release_reconciliation_lease(connection.id, run_id, lease_token):
             return "stale"
         _publish_reconciliation_continuation(connection.id, run_id)
         return "continued"
 
-    result, correlations = _advance_local_scan(connection.id, run_id)
+    result, correlations = _advance_local_scan(connection.id, run_id, lease_token)
     if result == "stale":
         return result
     for index, correlation in enumerate(correlations):
         _publish_correlation_sync(correlation, index)
     if result == "more":
-        if not _persist_local_scan_cursor(connection.id, run_id, correlations[-1].id):
+        if not _persist_local_scan_cursor(connection.id, run_id, lease_token, correlations[-1].id):
             return "stale"
-        if not _release_reconciliation_lease(connection.id, run_id):
+        if not _release_reconciliation_lease(connection.id, run_id, lease_token):
             return "stale"
         _publish_reconciliation_continuation(connection.id, run_id, countdown=len(correlations))
         return "continued"
-    return _finish_reconciliation(connection.id, run_id)
+    return _finish_reconciliation(connection.id, run_id, lease_token)
 
 
 def _record_present_error(connection, generation, error):
