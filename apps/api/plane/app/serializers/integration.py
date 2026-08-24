@@ -17,6 +17,14 @@ GOOGLE_CALENDAR_PUBLIC_STATUSES = {
 }
 
 
+class GoogleCalendarFilterOptionLabelSerializer(serializers.ModelSerializer):
+    """Expose only label metadata needed to configure Calendar filters."""
+
+    class Meta:
+        model = Label
+        fields = ("id", "name", "color", "project_id")
+
+
 class GoogleCalendarWorkspacePolicySerializer(serializers.Serializer):
     """Validate the complete workspace-level Google Calendar policy."""
 
