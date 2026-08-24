@@ -11,6 +11,7 @@ from django.urls import reverse
 from rest_framework import status
 
 from plane.bgtasks.google_calendar_task import (
+    backfill_google_calendar_cycles,
     backfill_google_calendar_open_issues,
     reconcile_google_calendar_connection,
     reconcile_google_calendar_workspace_issue_resyncs,
@@ -26,6 +27,7 @@ from plane.db.models import (
 )
 from plane.db.signals import suppress_google_calendar_issue_signal_dispatch
 from plane.integrations.google_calendar.dispatch import (
+    GOOGLE_CALENDAR_CYCLE_BACKFILL_TASK,
     GOOGLE_CALENDAR_ISSUE_SYNC_TASK,
     GOOGLE_CALENDAR_LIFECYCLE_TASK,
     GOOGLE_CALENDAR_OPEN_BACKFILL_TASK,
@@ -605,6 +607,8 @@ class TestGoogleCalendarWorkspacePolicy:
                 return reconcile_google_calendar_connection.run(*args, **kwargs)
             if task.task == GOOGLE_CALENDAR_OPEN_BACKFILL_TASK:
                 return backfill_google_calendar_open_issues.run(*args, **kwargs)
+            if task.task == GOOGLE_CALENDAR_CYCLE_BACKFILL_TASK:
+                return backfill_google_calendar_cycles.run(*args, **kwargs)
             if task.task == GOOGLE_CALENDAR_WORKSPACE_ISSUE_RESYNC_TASK:
                 return resync_google_calendar_workspace_issues.run(*args, **kwargs)
             if task.task == GOOGLE_CALENDAR_ISSUE_SYNC_TASK:

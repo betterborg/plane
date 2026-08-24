@@ -9,6 +9,8 @@ import factory
 from django.utils import timezone
 
 from plane.db.models import (
+    Cycle,
+    CycleIssue,
     GoogleCalendarConnection,
     GoogleCalendarEvent,
     Integration,
@@ -236,6 +238,31 @@ class IssueLabelFactory(factory.django.DjangoModelFactory):
         project=factory.SelfAttribute("..issue.project"),
     )
     project = factory.SelfAttribute("issue.project")
+
+
+class CycleFactory(factory.django.DjangoModelFactory):
+    """Factory for timezone-snapshotted cycles synchronized with Calendar."""
+
+    class Meta:
+        model = Cycle
+
+    project = factory.SubFactory(ProjectFactory)
+    owned_by = factory.SelfAttribute("project.workspace.owner")
+    name = factory.Sequence(lambda n: f"Cycle {n}")
+    timezone = factory.SelfAttribute("project.timezone")
+    start_date = factory.LazyFunction(lambda: timezone.now() - timedelta(days=1))
+    end_date = factory.LazyFunction(lambda: timezone.now() + timedelta(days=7))
+
+
+class CycleIssueFactory(factory.django.DjangoModelFactory):
+    """Factory for work-item membership in a Calendar cycle."""
+
+    class Meta:
+        model = CycleIssue
+
+    cycle = factory.SubFactory(CycleFactory)
+    issue = factory.SubFactory(IssueFactory, project=factory.SelfAttribute("..cycle.project"))
+    project = factory.SelfAttribute("cycle.project")
 
 
 class GoogleCalendarEventFactory(factory.django.DjangoModelFactory):

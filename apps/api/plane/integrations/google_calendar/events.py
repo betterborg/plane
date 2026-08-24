@@ -5,6 +5,7 @@
 import hashlib
 import json
 from datetime import timedelta
+from zoneinfo import ZoneInfo
 
 from django.conf import settings
 from django.core.exceptions import ImproperlyConfigured
@@ -93,3 +94,24 @@ def build_google_calendar_work_item_event(issue):
     if terminal:
         payload["colorId"] = GOOGLE_CALENDAR_TERMINAL_COLOR_ID
     return payload
+
+
+def build_google_calendar_cycle_event(cycle):
+    """Construct a deterministic all-day event from the cycle timezone snapshot."""
+
+    cycle_timezone = ZoneInfo(cycle.timezone)
+    start_date = cycle.start_date.astimezone(cycle_timezone).date()
+    end_date = cycle.end_date.astimezone(cycle_timezone).date()
+    return {
+        "summary": f"Cycle: {cycle.name} — {cycle.project.name}",
+        "start": {"date": start_date.isoformat()},
+        "end": {"date": (end_date + timedelta(days=1)).isoformat()},
+        "status": "confirmed",
+        "reminders": {"useDefault": False},
+        "extendedProperties": {
+            "private": {
+                "plane_entity_type": GoogleCalendarEvent.EntityType.CYCLE,
+                "plane_entity_id": str(cycle.id),
+            }
+        },
+    }
