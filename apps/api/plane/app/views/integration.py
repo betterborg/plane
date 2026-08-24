@@ -17,10 +17,11 @@ from plane.app.serializers import (
 )
 from plane.app.serializers.integration import (
     GOOGLE_CALENDAR_PUBLIC_STATUSES,
+    GoogleCalendarFilterOptionLabelSerializer,
     serialize_google_calendar_connection_status,
 )
 from plane.app.views.base import BaseAPIView
-from plane.db.models import GoogleCalendarConnection, Integration, Workspace, WorkspaceIntegration
+from plane.db.models import GoogleCalendarConnection, Integration, Issue, Label, Workspace, WorkspaceIntegration
 from plane.integrations.google_calendar.dispatch import (
     GOOGLE_CALENDAR_LIFECYCLE_TASK,
     enqueue_google_calendar_task_on_commit,
@@ -124,6 +125,34 @@ class GoogleCalendarConnectionRosterEndpoint(BaseAPIView):
         )
         return Response(
             GoogleCalendarConnectionRosterSerializer(connections, many=True).data,
+            status=status.HTTP_200_OK,
+        )
+
+
+class GoogleCalendarFilterOptionsEndpoint(BaseAPIView):
+    """Return workspace label and priority choices for Calendar filters."""
+
+    permission_classes = [WorkspaceOwnerPermission]
+
+    def get_permissions(self):
+        if not settings.GOOGLE_CALENDAR_RELEASED:
+            return [IsAuthenticated()]
+        return super().get_permissions()
+
+    def get(self, request, slug):
+        if not settings.GOOGLE_CALENDAR_RELEASED:
+            return Response({"error": "Not found"}, status=status.HTTP_404_NOT_FOUND)
+
+        labels = Label.objects.filter(
+            workspace__slug=slug,
+            project__archived_at__isnull=True,
+        ).order_by("name", "id")
+        priorities = [{"key": key, "title": title} for key, title in Issue.PRIORITY_CHOICES]
+        return Response(
+            {
+                "labels": GoogleCalendarFilterOptionLabelSerializer(labels, many=True).data,
+                "priorities": priorities,
+            },
             status=status.HTTP_200_OK,
         )
 

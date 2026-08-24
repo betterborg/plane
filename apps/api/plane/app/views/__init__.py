@@ -36,6 +36,7 @@ from .base import BaseAPIView, BaseViewSet
 from .integration import (
     GoogleCalendarConnectionEndpoint,
     GoogleCalendarConnectionRosterEndpoint,
+    GoogleCalendarFilterOptionsEndpoint,
     GoogleCalendarWorkspacePolicyEndpoint,
     GoogleCalendarWorkspaceStatusEndpoint,
 )
