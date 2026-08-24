@@ -53,6 +53,10 @@ app.conf.beat_schedule = {
         "task": "plane.bgtasks.google_calendar_task.reconcile_google_calendar_workspace_issue_resyncs",
         "schedule": crontab(minute="*/5"),
     },
+    "schedule-google-calendar-reconciliations": {
+        "task": "plane.bgtasks.google_calendar_task.schedule_google_calendar_reconciliations",
+        "schedule": crontab(minute=0),
+    },
     "push-instance-metrics": {
         "task": "plane.license.bgtasks.telemetry_metrics.push_instance_metrics",
         "schedule": schedule(run_every=timedelta(minutes=METRICS_PUSH_INTERVAL_MINUTES)),
