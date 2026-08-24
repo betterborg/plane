@@ -58,7 +58,10 @@ from plane.integrations.google_calendar.dispatch import (
     GOOGLE_CALENDAR_LIFECYCLE_TASK,
     enqueue_google_calendar_task_on_commit,
 )
-from plane.integrations.google_calendar.lifecycle import request_google_calendar_disconnect
+from plane.integrations.google_calendar.lifecycle import (
+    lock_google_calendar_global_state,
+    request_google_calendar_disconnect,
+)
 
 
 logger = logging.getLogger("plane")
@@ -315,6 +318,7 @@ class UserEndpoint(BaseViewSet):
                 )
 
         workspace_ids = [workspace.workspace_id for workspace in workspaces_to_deactivate]
+        lock_google_calendar_global_state()
         calendar_connections = list(
             GoogleCalendarConnection.objects.filter(
                 member=user,
@@ -371,8 +375,13 @@ class UserEndpoint(BaseViewSet):
         user.last_logout_time = timezone.now()
         user.save()
 
-        # Send an email to the user
-        user_deactivation_email.delay(base_host(request=request, is_app=True), user.id)
+        # Send an email to the user after durable deactivation commits. Broker
+        # failure must not roll back the account and Calendar transitions.
+        current_site = base_host(request=request, is_app=True)
+        transaction.on_commit(
+            lambda: user_deactivation_email.delay(current_site, user.id),
+            robust=True,
+        )
 
         # Logout the user
         logout(request)

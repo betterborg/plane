@@ -151,16 +151,18 @@ class TestGoogleCalendarUserDeactivation:
             raise RuntimeError("lifecycle broker unavailable")
 
         failed_task.delay.side_effect = fail_publication
+        failed_email = Mock(side_effect=RuntimeError("email broker unavailable"))
         with (
             patch("plane.integrations.google_calendar.lifecycle._acquire_advisory_xact_lock"),
             patch("plane.app.views.user.base.current_app.signature", return_value=failed_task),
-            patch("plane.app.views.user.base.user_deactivation_email.delay"),
+            patch("plane.app.views.user.base.user_deactivation_email.delay", failed_email),
         ):
             response = session_client.delete("/api/users/me/")
 
         assert response.status_code == status.HTTP_204_NO_CONTENT
         create_user.refresh_from_db()
         assert create_user.is_active is False
+        failed_email.assert_called_once()
         assert failed_generations == [
             (
                 str(connection.id),
@@ -208,3 +210,44 @@ class TestGoogleCalendarUserDeactivation:
         assert persisted_attempt.oauth_state == ""
         assert persisted_attempt.provider_account_id == ""
         assert persisted_attempt.calendar_id == ""
+
+    def test_global_lock_precedes_connection_discovery(self, session_client, create_user):
+        Profile.objects.create(user=create_user)
+        workspace_integration = WorkspaceIntegrationFactory(
+            integration__title="Google Calendar",
+            integration__provider="google_calendar",
+            config={"enabled": True},
+        )
+        WorkspaceMemberFactory(
+            workspace=workspace_integration.workspace,
+            member=create_user,
+            role=15,
+        )
+        discovered_connection = None
+
+        def create_connection_at_lock_boundary():
+            nonlocal discovered_connection
+            discovered_connection = GoogleCalendarConnectionFactory(
+                workspace_integration=workspace_integration,
+                member=create_user,
+                attempt_only=True,
+                lifecycle_generation=5,
+            )
+
+        with (
+            patch(
+                "plane.app.views.user.base.lock_google_calendar_global_state",
+                side_effect=create_connection_at_lock_boundary,
+            ) as global_lock,
+            patch("plane.integrations.google_calendar.lifecycle._acquire_advisory_xact_lock"),
+            patch("plane.app.views.user.base.user_deactivation_email.delay"),
+        ):
+            response = session_client.delete("/api/users/me/")
+
+        assert response.status_code == status.HTTP_204_NO_CONTENT
+        global_lock.assert_called_once_with()
+        assert discovered_connection is not None
+        discovered_connection.refresh_from_db()
+        assert discovered_connection.status == GoogleCalendarConnection.Status.DISCONNECTED
+        assert discovered_connection.lifecycle_generation == 5
+        assert discovered_connection.oauth_state == ""
