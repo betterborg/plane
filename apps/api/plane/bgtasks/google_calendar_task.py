@@ -3,6 +3,7 @@
 # See the LICENSE file for details.
 
 import json
+import logging
 from datetime import timedelta
 from uuid import UUID, uuid4
 
@@ -81,6 +82,12 @@ GOOGLE_CALENDAR_RECONCILIATION_PROVIDER_PAGE_LIMIT = 5
 GOOGLE_CALENDAR_RECONCILIATION_LOCAL_PAGE_SIZE = 1000
 GOOGLE_CALENDAR_RECONCILIATION_PROVIDER_PHASE = "provider_inventory"
 GOOGLE_CALENDAR_RECONCILIATION_LOCAL_PHASE = "local_scan"
+GOOGLE_CALENDAR_HEALTHY_RECONCILIATION_INTERVAL = timedelta(hours=6)
+GOOGLE_CALENDAR_HEALTHY_RECONCILIATION_OVERDUE = timedelta(hours=18)
+GOOGLE_CALENDAR_SCHEDULER_LEASE = timedelta(hours=2)
+GOOGLE_CALENDAR_RECONCILIATION_MAX_STAGGER_SECONDS = 30 * 60
+
+logger = logging.getLogger("plane.worker")
 
 
 def _owns_generation(connection, generation, *, desired_state, status):
@@ -99,6 +106,91 @@ def _client_for(connection):
         token_expires_at=connection.token_expires_at,
         persist_access_token=lambda access_token: _persist_access_token(connection, access_token),
     )
+
+
+def _healthy_reconciliation_countdown(connection_id):
+    return connection_id.int % (GOOGLE_CALENDAR_RECONCILIATION_MAX_STAGGER_SECONDS + 1)
+
+
+def _healthy_reconciliation_due_filter(at):
+    return Q(reconciliation_completed_at__isnull=True) | Q(
+        reconciliation_completed_at__lte=at - GOOGLE_CALENDAR_HEALTHY_RECONCILIATION_INTERVAL
+    )
+
+
+@transaction.atomic
+def _claim_healthy_reconciliation(connection_id, at):
+    connection = (
+        GoogleCalendarConnection.objects.select_for_update()
+        .filter(
+            id=connection_id,
+            workspace_integration__config__enabled=True,
+            workspace_integration__integration__provider="google_calendar",
+            desired_state=GoogleCalendarConnection.DesiredState.CONNECTED,
+            status=GoogleCalendarConnection.Status.ACTIVE,
+        )
+        .exclude(calendar_id="")
+        .filter(_healthy_reconciliation_due_filter(at))
+        .filter(Q(reconciliation_lease_expires_at__isnull=True) | Q(reconciliation_lease_expires_at__lte=at))
+        .first()
+    )
+    if connection is None:
+        return None
+    lease_expires_at = at + GOOGLE_CALENDAR_SCHEDULER_LEASE
+    connection.reconciliation_lease_expires_at = lease_expires_at
+    connection.save(update_fields=["reconciliation_lease_expires_at", "updated_at"])
+    return connection, lease_expires_at
+
+
+def _release_scheduler_lease(connection_id, lease_expires_at):
+    GoogleCalendarConnection.objects.filter(
+        id=connection_id,
+        reconciliation_lease_expires_at=lease_expires_at,
+        reconciliation_phase="",
+    ).update(reconciliation_lease_expires_at=None)
+
+
+@shared_task
+def schedule_google_calendar_reconciliations():
+    """Publish due healthy Calendar inventory work with bounded staggering."""
+
+    at = timezone.now()
+    due_connection_ids = (
+        GoogleCalendarConnection.objects.filter(
+            workspace_integration__config__enabled=True,
+            workspace_integration__integration__provider="google_calendar",
+            desired_state=GoogleCalendarConnection.DesiredState.CONNECTED,
+            status=GoogleCalendarConnection.Status.ACTIVE,
+        )
+        .exclude(calendar_id="")
+        .filter(_healthy_reconciliation_due_filter(at))
+        .filter(Q(reconciliation_lease_expires_at__isnull=True) | Q(reconciliation_lease_expires_at__lte=at))
+        .order_by("id")
+        .values_list("id", flat=True)
+    )
+    published = 0
+    for connection_id in due_connection_ids.iterator():
+        claim = _claim_healthy_reconciliation(connection_id, at)
+        if claim is None:
+            continue
+        connection, lease_expires_at = claim
+        overdue = (
+            connection.reconciliation_completed_at is None
+            or connection.reconciliation_completed_at <= at - GOOGLE_CALENDAR_HEALTHY_RECONCILIATION_OVERDUE
+        )
+        countdown = 0 if overdue else _healthy_reconciliation_countdown(connection.id)
+        inventory_task = current_app.signature(GOOGLE_CALENDAR_INVENTORY_TASK).set(countdown=countdown)
+        try:
+            publish_google_calendar_task(inventory_task, str(connection.id))
+        except Exception:
+            _release_scheduler_lease(connection.id, lease_expires_at)
+            logger.exception(
+                "Failed to publish scheduled Google Calendar reconciliation",
+                extra={"connection_id": str(connection.id)},
+            )
+            continue
+        published += 1
+    return published
 
 
 def _persist_access_token(connection, access_token):

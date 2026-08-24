@@ -5,15 +5,18 @@
 import json
 from datetime import timedelta
 from unittest.mock import Mock, patch
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from django.utils import timezone
+from freezegun import freeze_time
 
 from plane.bgtasks.google_calendar_task import (
+    GOOGLE_CALENDAR_RECONCILIATION_MAX_STAGGER_SECONDS,
     _release_reconciliation_lease,
     _start_or_resume_inventory,
     reconcile_google_calendar_inventory,
+    schedule_google_calendar_reconciliations,
     synchronize_google_calendar_issue,
 )
 from plane.db.models import GoogleCalendarConnection, GoogleCalendarEvent
@@ -33,6 +36,134 @@ def _provider_client(*pages):
     client.access_token = None
     client.list_event_page.side_effect = pages
     return client
+
+
+def _enabled_calendar_integration():
+    return WorkspaceIntegrationFactory(
+        integration__provider="google_calendar",
+        config={"enabled": True, "mode": "assignment"},
+    )
+
+
+@pytest.mark.unit
+@pytest.mark.django_db
+class TestScheduleGoogleCalendarReconciliations:
+    def test_hourly_scheduler_entry_is_registered(self):
+        from plane.celery import app
+
+        entry = app.conf.beat_schedule["schedule-google-calendar-reconciliations"]
+        assert entry["task"] == "plane.bgtasks.google_calendar_task.schedule_google_calendar_reconciliations"
+        assert entry["schedule"].minute == {0}
+
+    @freeze_time("2026-08-24 12:00:00")
+    def test_selects_six_hour_due_connections_and_skips_active_two_hour_leases(self):
+        at = timezone.now()
+        workspace_integration = _enabled_calendar_integration()
+        due = GoogleCalendarConnectionFactory(
+            workspace_integration=workspace_integration,
+            active=True,
+            reconciliation_completed_at=at - timedelta(hours=6),
+        )
+        recent = GoogleCalendarConnectionFactory(
+            workspace_integration=workspace_integration,
+            active=True,
+            reconciliation_completed_at=at - timedelta(hours=6) + timedelta(seconds=1),
+        )
+        leased = GoogleCalendarConnectionFactory(
+            workspace_integration=workspace_integration,
+            active=True,
+            reconciliation_completed_at=at - timedelta(hours=7),
+            reconciliation_lease_expires_at=at + timedelta(hours=2),
+        )
+        expired_lease = GoogleCalendarConnectionFactory(
+            workspace_integration=workspace_integration,
+            active=True,
+            reconciliation_completed_at=at - timedelta(hours=7),
+            reconciliation_lease_expires_at=at,
+        )
+        disabled = GoogleCalendarConnectionFactory(
+            active=True,
+            workspace_integration__config={"enabled": False},
+            reconciliation_completed_at=at - timedelta(hours=7),
+        )
+        unhealthy = GoogleCalendarConnectionFactory(
+            workspace_integration=workspace_integration,
+            bound_broken=True,
+            reconciliation_completed_at=at - timedelta(hours=7),
+        )
+
+        with patch("plane.bgtasks.google_calendar_task.publish_google_calendar_task") as publish:
+            assert schedule_google_calendar_reconciliations.run() == 2
+
+        published_ids = {call.args[1] for call in publish.call_args_list}
+        assert published_ids == {str(due.id), str(expired_lease.id)}
+        assert str(recent.id) not in published_ids
+        assert str(leased.id) not in published_ids
+        assert str(disabled.id) not in published_ids
+        assert str(unhealthy.id) not in published_ids
+
+    @freeze_time("2026-08-24 12:00:00")
+    def test_stagger_is_deterministic_capped_and_overdue_work_is_immediate(self):
+        at = timezone.now()
+        workspace_integration = _enabled_calendar_integration()
+        staggered = GoogleCalendarConnectionFactory(
+            id=UUID(int=GOOGLE_CALENDAR_RECONCILIATION_MAX_STAGGER_SECONDS),
+            workspace_integration=workspace_integration,
+            active=True,
+            reconciliation_completed_at=at - timedelta(hours=6),
+        )
+        overdue = GoogleCalendarConnectionFactory(
+            id=UUID(int=GOOGLE_CALENDAR_RECONCILIATION_MAX_STAGGER_SECONDS * 2 + 1),
+            workspace_integration=workspace_integration,
+            active=True,
+            reconciliation_completed_at=at - timedelta(hours=18),
+        )
+        never_completed = GoogleCalendarConnectionFactory(
+            id=UUID(int=GOOGLE_CALENDAR_RECONCILIATION_MAX_STAGGER_SECONDS * 3 + 2),
+            workspace_integration=workspace_integration,
+            active=True,
+            reconciliation_completed_at=None,
+        )
+
+        with patch("plane.bgtasks.google_calendar_task.publish_google_calendar_task") as publish:
+            assert schedule_google_calendar_reconciliations.run() == 3
+
+        countdowns = {call.args[1]: call.args[0].options["countdown"] for call in publish.call_args_list}
+        assert countdowns[str(staggered.id)] == GOOGLE_CALENDAR_RECONCILIATION_MAX_STAGGER_SECONDS
+        assert countdowns[str(overdue.id)] == 0
+        assert countdowns[str(never_completed.id)] == 0
+
+    @freeze_time("2026-08-24 12:00:00")
+    def test_publication_failure_is_isolated_and_failed_connection_remains_due(self):
+        at = timezone.now()
+        workspace_integration = _enabled_calendar_integration()
+        connections = [
+            GoogleCalendarConnectionFactory(
+                id=UUID(int=index),
+                workspace_integration=workspace_integration,
+                active=True,
+                reconciliation_completed_at=at - timedelta(hours=7),
+            )
+            for index in range(1, 4)
+        ]
+
+        def publish_or_fail(task, connection_id):
+            if connection_id == str(connections[0].id):
+                raise RuntimeError("broker unavailable")
+
+        with patch(
+            "plane.bgtasks.google_calendar_task.publish_google_calendar_task",
+            side_effect=publish_or_fail,
+        ) as publish:
+            assert schedule_google_calendar_reconciliations.run() == 2
+
+        assert [call.args[1] for call in publish.call_args_list] == [str(connection.id) for connection in connections]
+        for connection in connections:
+            connection.refresh_from_db()
+        assert connections[0].reconciliation_completed_at == at - timedelta(hours=7)
+        assert connections[0].reconciliation_lease_expires_at is None
+        assert connections[1].reconciliation_lease_expires_at == at + timedelta(hours=2)
+        assert connections[2].reconciliation_lease_expires_at == at + timedelta(hours=2)
 
 
 @pytest.mark.unit
