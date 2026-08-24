@@ -24,25 +24,25 @@ class GoogleCalendarWorkspacePolicySerializer(serializers.Serializer):
     mode = serializers.ChoiceField(choices=("assignment", "filter"), default="assignment")
     update_on_completion = serializers.BooleanField(default=True)
     recipients = serializers.ChoiceField(choices=("cycle_members",), default="cycle_members")
-    label_id = serializers.UUIDField(required=False, allow_null=True, default=None)
-    priority = serializers.ChoiceField(
-        choices=Issue.PRIORITY_CHOICES,
-        required=False,
-        allow_null=True,
-        default=None,
+    label_ids = serializers.ListField(
+        child=serializers.UUIDField(),
+        default=list,
     )
+    priorities = serializers.ListField(
+        child=serializers.ChoiceField(choices=Issue.PRIORITY_CHOICES),
+        default=list,
+    )
+    label_match = serializers.ChoiceField(choices=("any", "all"), default="any")
 
-    def validate_label_id(self, value):
-        if value is None:
-            return value
-
+    def validate_label_ids(self, value):
         workspace = self.context["workspace"]
-        if not Label.objects.filter(id=value, workspace=workspace).exists():
-            raise serializers.ValidationError("Label does not belong to this workspace")
+        workspace_label_ids = set(Label.objects.filter(id__in=value, workspace=workspace).values_list("id", flat=True))
+        if any(label_id not in workspace_label_ids for label_id in value):
+            raise serializers.ValidationError("One or more labels do not belong to this workspace")
         return value
 
     def validate(self, attrs):
-        if attrs["mode"] == "filter" and not (attrs.get("label_id") or attrs.get("priority")):
+        if attrs["mode"] == "filter" and not (attrs["label_ids"] or attrs["priorities"]):
             raise serializers.ValidationError("Filter mode requires a label or priority")
         return attrs
 
@@ -51,6 +51,17 @@ class GoogleCalendarWorkspacePolicyReadSerializer(GoogleCalendarWorkspacePolicyS
     """Serialize only public policy fields, including defaults before first setup."""
 
     enabled = serializers.BooleanField(default=False)
+
+    def to_representation(self, instance):
+        policy = dict(instance)
+        if "label_ids" not in policy:
+            label_id = policy.get("label_id")
+            policy["label_ids"] = [] if label_id is None else [label_id]
+        if "priorities" not in policy:
+            priority = policy.get("priority")
+            policy["priorities"] = [] if priority is None else [priority]
+        policy.setdefault("label_match", "any")
+        return super().to_representation(policy)
 
 
 class GoogleCalendarConnectionStatusSerializer(serializers.ModelSerializer):

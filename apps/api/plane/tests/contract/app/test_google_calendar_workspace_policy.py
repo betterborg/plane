@@ -114,7 +114,12 @@ class TestGoogleCalendarWorkspacePolicy:
         with override_settings(GOOGLE_CALENDAR_RELEASED=True):
             response = session_client.patch(
                 _policy_url(workspace),
-                {"enabled": False, "mode": "filter"},
+                {
+                    "enabled": False,
+                    "mode": "filter",
+                    "label_ids": [],
+                    "priorities": [],
+                },
                 format="json",
             )
 
@@ -125,7 +130,8 @@ class TestGoogleCalendarWorkspacePolicy:
     @pytest.mark.parametrize(
         ("field", "value"),
         (
-            ("priority", "critical"),
+            ("priorities", ["critical"]),
+            ("label_match", "none"),
             ("recipients", "workspace_members"),
         ),
     )
@@ -152,7 +158,7 @@ class TestGoogleCalendarWorkspacePolicy:
         ).exists()
 
     @pytest.mark.django_db
-    @pytest.mark.parametrize("label_workspace", ("missing", "foreign"))
+    @pytest.mark.parametrize("label_workspace", ("missing", "foreign", "mixed"))
     def test_policy_rejects_label_outside_workspace(
         self,
         session_client,
@@ -160,20 +166,24 @@ class TestGoogleCalendarWorkspacePolicy:
         calendar_integration,
         label_workspace,
     ):
-        label_id = uuid4()
-        if label_workspace == "foreign":
+        label_ids = [uuid4()]
+        if label_workspace in {"foreign", "mixed"}:
             foreign_workspace = WorkspaceFactory()
-            label_id = Label.objects.create(name="Foreign Calendar Label", workspace=foreign_workspace).id
+            foreign_label_id = Label.objects.create(name="Foreign Calendar Label", workspace=foreign_workspace).id
+            label_ids = [foreign_label_id]
+        if label_workspace == "mixed":
+            workspace_label_id = Label.objects.create(name="Workspace Calendar Label", workspace=workspace).id
+            label_ids.insert(0, workspace_label_id)
 
         with override_settings(GOOGLE_CALENDAR_RELEASED=True):
             response = session_client.patch(
                 _policy_url(workspace),
-                {"enabled": False, "mode": "filter", "label_id": label_id},
+                {"enabled": False, "mode": "filter", "label_ids": label_ids},
                 format="json",
             )
 
         assert response.status_code == status.HTTP_400_BAD_REQUEST
-        assert response.data == {"label_id": ["Label does not belong to this workspace"]}
+        assert response.data == {"label_ids": ["One or more labels do not belong to this workspace"]}
         assert not WorkspaceIntegration.objects.filter(
             workspace=workspace,
             integration=calendar_integration,
@@ -194,15 +204,91 @@ class TestGoogleCalendarWorkspacePolicy:
                 {
                     "enabled": False,
                     "mode": "filter",
-                    "label_id": label.id,
-                    "priority": "urgent",
+                    "label_ids": [label.id],
+                    "priorities": ["urgent", "high"],
+                    "label_match": "all",
                 },
                 format="json",
             )
 
         assert response.status_code == status.HTTP_200_OK
-        assert response.data["label_id"] == str(label.id)
-        assert response.data["priority"] == "urgent"
+        assert response.data["label_ids"] == [str(label.id)]
+        assert response.data["priorities"] == ["urgent", "high"]
+        assert response.data["label_match"] == "all"
+
+    @pytest.mark.django_db(transaction=True)
+    def test_completion_and_filter_changes_share_one_after_commit_resync_path(
+        self,
+        session_client,
+        workspace,
+        calendar_integration,
+    ):
+        base_policy = {
+            "enabled": True,
+            "mode": "assignment",
+            "update_on_completion": True,
+            "recipients": "cycle_members",
+            "label_ids": [],
+            "priorities": [],
+            "label_match": "any",
+        }
+        workspace_integration = WorkspaceIntegrationFactory(
+            workspace=workspace,
+            integration=calendar_integration,
+            config=base_policy,
+        )
+        label = Label.objects.create(name="Calendar Label", workspace=workspace)
+        policies = (
+            {**base_policy, "update_on_completion": False},
+            {
+                **base_policy,
+                "mode": "filter",
+                "update_on_completion": False,
+                "priorities": ["urgent"],
+            },
+            {
+                **base_policy,
+                "mode": "filter",
+                "update_on_completion": False,
+                "label_ids": [str(label.id)],
+                "priorities": ["high"],
+            },
+            {
+                **base_policy,
+                "mode": "filter",
+                "update_on_completion": False,
+                "label_ids": [str(label.id)],
+                "priorities": ["high"],
+                "label_match": "all",
+            },
+        )
+        workspace_resync_task = Mock()
+        committed_policies = []
+
+        def record_policy_after_commit(workspace_id, *, policy_generation):
+            workspace_integration.refresh_from_db()
+            committed_policies.append((workspace_id, policy_generation, workspace_integration.config))
+
+        workspace_resync_task.delay.side_effect = record_policy_after_commit
+        with (
+            override_settings(GOOGLE_CALENDAR_RELEASED=True),
+            patch("plane.app.views.integration._has_complete_google_calendar_credentials", return_value=True),
+            patch("plane.app.views.integration.request_google_calendar_workspace_reconciliation", return_value=[]),
+            patch(
+                "plane.integrations.google_calendar.dispatch.current_app.signature",
+                return_value=workspace_resync_task,
+            ),
+        ):
+            for call_count, policy in enumerate(policies, start=1):
+                response = session_client.patch(_policy_url(workspace), policy, format="json")
+
+                assert response.status_code == status.HTTP_200_OK
+                assert response.data == policy
+                assert workspace_resync_task.delay.call_count == call_count
+                assert committed_policies[-1][2] == policy
+
+        assert {published[0] for published in committed_policies} == {str(workspace.id)}
+        assert len({published[1] for published in committed_policies}) == len(policies)
 
     @pytest.mark.django_db
     def test_reenable_conflict_preserves_policy_and_generation(
@@ -219,8 +305,9 @@ class TestGoogleCalendarWorkspacePolicy:
                 "mode": "assignment",
                 "update_on_completion": True,
                 "recipients": "cycle_members",
-                "label_id": None,
-                "priority": None,
+                "label_ids": [],
+                "priorities": [],
+                "label_match": "any",
             },
         )
         connection = GoogleCalendarConnectionFactory(
@@ -285,8 +372,9 @@ class TestGoogleCalendarWorkspacePolicy:
             "mode": "assignment",
             "update_on_completion": True,
             "recipients": "cycle_members",
-            "label_id": None,
-            "priority": None,
+            "label_ids": [],
+            "priorities": [],
+            "label_match": "any",
         }
         workspace_integration.refresh_from_db()
         connection.refresh_from_db()

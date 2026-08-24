@@ -190,6 +190,7 @@ class GoogleCalendarWorkspacePolicyEndpoint(BaseAPIView):
         serializer = GoogleCalendarWorkspacePolicySerializer(data=request.data, context={"workspace": workspace})
         serializer.is_valid(raise_exception=True)
         policy = dict(serializer.validated_data)
+        serialized_policy = dict(serializer.data)
         if policy["enabled"] and not _has_complete_google_calendar_credentials():
             return Response(
                 {"error": "google_calendar_credentials_incomplete"},
@@ -224,7 +225,7 @@ class GoogleCalendarWorkspacePolicyEndpoint(BaseAPIView):
                 status=status.HTTP_409_CONFLICT,
             )
 
-        workspace_integration.config = serializer.data
+        workspace_integration.config = serialized_policy
         workspace_integration.save(update_fields=["config", "updated_at"])
         for command in commands:
             lifecycle_task = current_app.signature(GOOGLE_CALENDAR_LIFECYCLE_TASK)
@@ -236,6 +237,6 @@ class GoogleCalendarWorkspacePolicyEndpoint(BaseAPIView):
         enqueue_google_calendar_workspace_policy_resyncs_on_commit(
             workspace_integration,
             previous_policy,
-            policy,
+            serialized_policy,
         )
-        return Response(serializer.data, status=status.HTTP_200_OK)
+        return Response(serialized_policy, status=status.HTTP_200_OK)

@@ -119,8 +119,9 @@ class TestGoogleCalendarWorkspaceStatus:
                 "mode": "filter",
                 "update_on_completion": False,
                 "recipients": "cycle_members",
-                "label_id": None,
-                "priority": "urgent",
+                "label_ids": [],
+                "priorities": ["urgent"],
+                "label_match": "any",
             },
             "connection": {"status": "healthy"},
         }
@@ -200,8 +201,9 @@ class TestGoogleCalendarWorkspaceStatus:
             "mode": "assignment",
             "update_on_completion": True,
             "recipients": "cycle_members",
-            "label_id": None,
-            "priority": None,
+            "label_ids": [],
+            "priorities": [],
+            "label_match": "any",
         }
         assert response.data["connection"] is None
 
