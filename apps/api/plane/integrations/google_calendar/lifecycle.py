@@ -198,6 +198,21 @@ def lock_google_calendar_workspace_connections(workspace_id):
     return list(connections)
 
 
+def lock_google_calendar_workspace_cleanup_connections(workspace_id):
+    """Lock live and soft-deleted workspace connections for terminal cleanup."""
+
+    _acquire_global_lock()
+    connection_ids = list(
+        GoogleCalendarConnection.all_objects.filter(workspace_integration__workspace_id=workspace_id)
+        .order_by("id")
+        .values_list("id", flat=True)
+    )
+    for connection_id in connection_ids:
+        _acquire_connection_lock(connection_id)
+    connections = GoogleCalendarConnection.all_objects.select_for_update().filter(id__in=connection_ids).order_by("id")
+    return list(connections)
+
+
 def lock_all_google_calendar_connections():
     """Lock live and soft-deleted Calendar rows in the global lifecycle order."""
 
@@ -265,6 +280,68 @@ def _clear_provider_grant(connection):
     connection.token_expires_at = None
     connection.scopes = []
     connection.credential_fingerprint = ""
+
+
+def _has_google_calendar_provider_state(connection):
+    return any(
+        (
+            connection.provider_account_id,
+            connection.provider_email,
+            connection.calendar_id,
+            connection.calendar_operation_id,
+            connection.access_token,
+            connection.refresh_token,
+            connection.sync_token,
+            connection.page_token,
+            connection.token_expires_at,
+            connection.scopes,
+            connection.credential_fingerprint,
+        )
+    )
+
+
+def _request_google_calendar_disconnect_locked(calendar_connection, expected_generation):
+    _assert_generation(calendar_connection, expected_generation)
+    if (
+        calendar_connection.desired_state == GoogleCalendarConnection.DesiredState.DISCONNECTED
+        and calendar_connection.status == GoogleCalendarConnection.Status.DISCONNECTED
+        and not _has_google_calendar_provider_state(calendar_connection)
+    ):
+        clear_google_calendar_oauth_attempt(calendar_connection)
+        calendar_connection.retain_grant_after_cleanup = False
+        calendar_connection.last_error = ""
+        calendar_connection.save(
+            update_fields=[
+                "retain_grant_after_cleanup",
+                *_OAUTH_ATTEMPT_FIELDS,
+                "last_error",
+                "updated_at",
+            ]
+        )
+        return None
+    if calendar_connection.status == GoogleCalendarConnection.Status.CLEANUP_PENDING:
+        calendar_connection.lifecycle_generation = expected_generation + 1
+        calendar_connection.save(update_fields=["lifecycle_generation", "updated_at"])
+    else:
+        _transition(
+            calendar_connection,
+            expected_generation,
+            GoogleCalendarConnection.DesiredState.DISCONNECTED,
+            GoogleCalendarConnection.Status.CLEANUP_PENDING,
+            advance_generation=True,
+        )
+    calendar_connection.retain_grant_after_cleanup = False
+    clear_google_calendar_oauth_attempt(calendar_connection)
+    calendar_connection.last_error = ""
+    calendar_connection.save(
+        update_fields=[
+            "retain_grant_after_cleanup",
+            *_OAUTH_ATTEMPT_FIELDS,
+            "last_error",
+            "updated_at",
+        ]
+    )
+    return GoogleCalendarLifecycleCommand(calendar_connection.id, calendar_connection.lifecycle_generation)
 
 
 @transaction.atomic
@@ -446,61 +523,27 @@ def request_google_calendar_disconnect(connection_id, expected_generation):
     """Make a member grant cleanup-pending without performing provider HTTP."""
 
     calendar_connection = lock_google_calendar_connection(connection_id)
-    _assert_generation(calendar_connection, expected_generation)
-    if (
-        calendar_connection.desired_state == GoogleCalendarConnection.DesiredState.DISCONNECTED
-        and calendar_connection.status == GoogleCalendarConnection.Status.DISCONNECTED
-        and not any(
-            (
-                calendar_connection.provider_account_id,
-                calendar_connection.provider_email,
-                calendar_connection.calendar_id,
-                calendar_connection.calendar_operation_id,
-                calendar_connection.access_token,
-                calendar_connection.refresh_token,
-                calendar_connection.sync_token,
-                calendar_connection.page_token,
-                calendar_connection.token_expires_at,
-                calendar_connection.scopes,
-                calendar_connection.credential_fingerprint,
+    return _request_google_calendar_disconnect_locked(calendar_connection, expected_generation)
+
+
+@transaction.atomic
+def request_google_calendar_workspace_teardown(workspace_id):
+    """Invalidate workspace attempts and make provider state terminal-cleanup pending."""
+
+    commands = []
+    for calendar_connection in lock_google_calendar_workspace_cleanup_connections(workspace_id):
+        if _has_google_calendar_provider_state(calendar_connection):
+            command = _request_google_calendar_disconnect_locked(
+                calendar_connection,
+                calendar_connection.lifecycle_generation,
             )
-        )
-    ):
+            if command is not None:
+                commands.append(command)
+            continue
+
         clear_google_calendar_oauth_attempt(calendar_connection)
-        calendar_connection.retain_grant_after_cleanup = False
-        calendar_connection.last_error = ""
-        calendar_connection.save(
-            update_fields=[
-                "retain_grant_after_cleanup",
-                *_OAUTH_ATTEMPT_FIELDS,
-                "last_error",
-                "updated_at",
-            ]
-        )
-        return None
-    if calendar_connection.status == GoogleCalendarConnection.Status.CLEANUP_PENDING:
-        calendar_connection.lifecycle_generation = expected_generation + 1
-        calendar_connection.save(update_fields=["lifecycle_generation", "updated_at"])
-    else:
-        _transition(
-            calendar_connection,
-            expected_generation,
-            GoogleCalendarConnection.DesiredState.DISCONNECTED,
-            GoogleCalendarConnection.Status.CLEANUP_PENDING,
-            advance_generation=True,
-        )
-    calendar_connection.retain_grant_after_cleanup = False
-    clear_google_calendar_oauth_attempt(calendar_connection)
-    calendar_connection.last_error = ""
-    calendar_connection.save(
-        update_fields=[
-            "retain_grant_after_cleanup",
-            *_OAUTH_ATTEMPT_FIELDS,
-            "last_error",
-            "updated_at",
-        ]
-    )
-    return GoogleCalendarLifecycleCommand(calendar_connection.id, calendar_connection.lifecycle_generation)
+        calendar_connection.save(update_fields=[*_OAUTH_ATTEMPT_FIELDS, "updated_at"])
+    return commands
 
 
 @transaction.atomic
