@@ -953,11 +953,11 @@ def _converge_present(connection, generation):
         status=GoogleCalendarConnection.Status.PENDING,
     ):
         return "stale"
-    if not has_usable_google_calendar_grant(connection):
-        return _record_present_error(connection, generation, "Google Calendar grant is not usable")
-
     client = _client_for(connection)
     try:
+        client.validate_credentials()
+        if not has_usable_google_calendar_grant(connection):
+            return _record_present_error(connection, generation, "Google Calendar grant is not usable")
         if not connection.calendar_id:
             if not _owns_generation(
                 connection,

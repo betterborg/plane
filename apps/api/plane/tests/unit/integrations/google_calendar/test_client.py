@@ -370,6 +370,27 @@ class TestGoogleCalendarClient:
         post.assert_not_called()
         request.assert_not_called()
 
+    def test_access_token_only_refresh_path_validates_credentials_before_token_usability(self):
+        client = GoogleCalendarClient(
+            credential_fingerprint=google_calendar_credential_fingerprint("original-id", "original-secret"),
+            access_token="private-access-token",
+            token_expires_at=timezone.now() + timedelta(seconds=30),
+        )
+
+        with (
+            patch(
+                "plane.integrations.google_calendar.client.get_google_calendar_oauth_credentials",
+                return_value=GoogleCalendarOAuthCredentials("changed-id", "changed-secret"),
+            ),
+            patch("plane.integrations.google_calendar.client.requests.post") as post,
+            patch("plane.integrations.google_calendar.client.requests.request") as request,
+            pytest.raises(GoogleCalendarCredentialMismatch),
+        ):
+            client.create_calendar()
+
+        post.assert_not_called()
+        request.assert_not_called()
+
     def test_restoring_exact_credentials_allows_cleanup_to_resume(self):
         delete_response = Mock(status_code=204)
         stored_fingerprint = google_calendar_credential_fingerprint("original-id", "original-secret")

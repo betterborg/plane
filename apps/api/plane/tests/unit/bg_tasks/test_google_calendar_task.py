@@ -56,13 +56,18 @@ class TestGoogleCalendarConvergenceTask:
         assert result == "stale"
         client_class.assert_not_called()
 
-    def test_readiness_mismatch_marks_connection_broken_before_provider_http(self, caplog):
+    @pytest.mark.parametrize(
+        "token_expires_in",
+        [timedelta(hours=1), -timedelta(minutes=1)],
+        ids=["unexpired-access-token", "expired-access-token"],
+    )
+    def test_readiness_mismatch_marks_connection_broken_before_provider_http(self, caplog, token_expires_in):
         credential_fingerprint = google_calendar_credential_fingerprint("original-id", "original-secret")
         connection = GoogleCalendarConnectionFactory(
             provider_account_id="google-account",
             calendar_id="recorded-plane-calendar",
             access_token="private-access-token",
-            token_expires_at=timezone.now() + timedelta(hours=1),
+            token_expires_at=timezone.now() + token_expires_in,
             credential_fingerprint=credential_fingerprint,
             desired_state=GoogleCalendarConnection.DesiredState.CONNECTED,
             status=GoogleCalendarConnection.Status.PENDING,
@@ -161,7 +166,7 @@ class TestGoogleCalendarConvergenceTask:
             provider_account_id="google-account",
             calendar_id="recorded-plane-calendar",
             access_token="access-token",
-            token_expires_at=timezone.now() + timedelta(hours=1),
+            token_expires_at=timezone.now() + timedelta(seconds=30),
             credential_fingerprint=google_calendar_credential_fingerprint("original-id", "original-secret"),
             desired_state=GoogleCalendarConnection.DesiredState.CONNECTED,
             status=GoogleCalendarConnection.Status.ACTIVE,

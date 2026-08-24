@@ -94,11 +94,16 @@ class GoogleCalendarClient:
             raise GoogleCalendarCredentialMismatch("Google Calendar OAuth credentials changed")
         return credentials
 
+    def validate_credentials(self):
+        """Validate the durable credential binding without performing provider HTTP."""
+
+        self._validated_credentials()
+
     def _refresh_access_token(self):
+        credentials = self._validated_credentials()
         if not self._refresh_token:
             raise GoogleCalendarClientError("Google Calendar grant cannot refresh an access token")
 
-        credentials = self._validated_credentials()
         try:
             response = requests.post(
                 GOOGLE_CALENDAR_TOKEN_URL,
