@@ -25,6 +25,12 @@ class GoogleCalendarFilterOptionLabelSerializer(serializers.ModelSerializer):
         fields = ("id", "name", "color", "project_id")
 
 
+class GoogleCalendarProjectSyncSerializer(serializers.Serializer):
+    """Validate and expose one project's Calendar inclusion setting."""
+
+    google_calendar_sync_enabled = serializers.BooleanField()
+
+
 class GoogleCalendarWorkspacePolicySerializer(serializers.Serializer):
     """Validate the complete workspace-level Google Calendar policy."""
 

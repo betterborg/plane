@@ -67,6 +67,13 @@ def enqueue_google_calendar_task_on_commit(task, *args, **kwargs):
     transaction.on_commit(_enqueue_google_calendar_task, robust=True)
 
 
+def enqueue_google_calendar_project_resync_on_commit(project_id):
+    """Request project work-item convergence after the current transaction commits."""
+
+    project_issue_resync_task = current_app.signature(GOOGLE_CALENDAR_PROJECT_ISSUE_RESYNC_TASK)
+    enqueue_google_calendar_task_on_commit(project_issue_resync_task, str(project_id))
+
+
 def enqueue_google_calendar_workspace_policy_resyncs_on_commit(
     workspace_integration,
     previous_policy,

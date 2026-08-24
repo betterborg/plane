@@ -8,6 +8,7 @@ import json
 
 # Django imports
 from django.core.serializers.json import DjangoJSONEncoder
+from django.db import transaction
 from django.db.models import Exists, F, OuterRef, Prefetch, Q, Subquery, Count
 from django.utils import timezone
 
@@ -40,6 +41,7 @@ from plane.db.models import (
     WorkspaceMember,
 )
 from plane.db.models.intake import IntakeIssueStatus
+from plane.integrations.google_calendar.dispatch import enqueue_google_calendar_project_resync_on_commit
 from plane.utils.host import base_host
 from plane.utils.order_queryset import PROJECT_ORDER_BY_ALLOWLIST, sanitize_order_by
 
@@ -425,19 +427,23 @@ class ProjectViewSet(BaseViewSet):
 
 
 class ProjectArchiveUnarchiveEndpoint(BaseAPIView):
+    @transaction.atomic
     @allow_permission([ROLE.ADMIN, ROLE.MEMBER])
     def post(self, request, slug, project_id):
         project = Project.objects.get(pk=project_id, workspace__slug=slug)
         project.archived_at = timezone.now()
-        project.save()
+        project.save(update_fields=["archived_at", "updated_at"])
         UserFavorite.objects.filter(workspace__slug=slug, project=project_id).delete()
+        enqueue_google_calendar_project_resync_on_commit(project.id)
         return Response({"archived_at": str(project.archived_at)}, status=status.HTTP_200_OK)
 
+    @transaction.atomic
     @allow_permission([ROLE.ADMIN, ROLE.MEMBER])
     def delete(self, request, slug, project_id):
         project = Project.objects.get(pk=project_id, workspace__slug=slug)
         project.archived_at = None
-        project.save()
+        project.save(update_fields=["archived_at", "updated_at"])
+        enqueue_google_calendar_project_resync_on_commit(project.id)
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 
