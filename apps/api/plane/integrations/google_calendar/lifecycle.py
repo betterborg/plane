@@ -450,8 +450,11 @@ def request_google_calendar_disconnect(connection_id, expected_generation):
                 calendar_connection.calendar_operation_id,
                 calendar_connection.access_token,
                 calendar_connection.refresh_token,
+                calendar_connection.sync_token,
+                calendar_connection.page_token,
                 calendar_connection.token_expires_at,
                 calendar_connection.scopes,
+                calendar_connection.credential_fingerprint,
             )
         )
     ):
