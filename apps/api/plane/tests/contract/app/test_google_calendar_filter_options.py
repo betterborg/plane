@@ -120,7 +120,7 @@ class TestGoogleCalendarFilterOptions:
         if membership == "outsider":
             WorkspaceMember.objects.filter(workspace=workspace, member=create_user).delete()
         else:
-            role = 15 if membership in {"role_15", "inactive"} else 5
+            role = {"role_15": 15, "role_5": 5, "inactive": 20}[membership]
             WorkspaceMember.objects.filter(workspace=workspace, member=create_user).update(
                 role=role,
                 is_active=membership != "inactive",
