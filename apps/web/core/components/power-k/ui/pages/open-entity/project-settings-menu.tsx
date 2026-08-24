@@ -6,7 +6,7 @@
 
 import { observer } from "mobx-react";
 // plane imports
-import { EUserPermissionsLevel, PROJECT_SETTINGS } from "@plane/constants";
+import { EUserPermissions, EUserPermissionsLevel, PROJECT_SETTINGS } from "@plane/constants";
 import { useTranslation } from "@plane/i18n";
 // components
 import type { TPowerKContext } from "@/components/power-k/core/types";
@@ -28,19 +28,14 @@ export const PowerKOpenProjectSettingsMenu = observer(function PowerKOpenProject
   const { t } = useTranslation();
   // store hooks
   const { config } = useInstance();
-  const { allowPermissions } = useUserPermissions();
+  const { allowPermissions, getProjectMembershipRoleByWorkspaceSlugAndProjectId } = useUserPermissions();
   // derived values
   const workspaceSlug = context.params.workspaceSlug?.toString();
   const projectId = context.params.projectId?.toString();
   const canAccessGoogleCalendar = Boolean(
     workspaceSlug &&
     projectId &&
-    allowPermissions(
-      PROJECT_SETTINGS.features_google_calendar.access,
-      EUserPermissionsLevel.PROJECT,
-      workspaceSlug,
-      projectId
-    )
+    getProjectMembershipRoleByWorkspaceSlugAndProjectId(workspaceSlug, projectId) === EUserPermissions.ADMIN
   );
   const { data: googleCalendarStatus } = useGoogleCalendarWorkspaceStatus(
     workspaceSlug,
@@ -50,7 +45,8 @@ export const PowerKOpenProjectSettingsMenu = observer(function PowerKOpenProject
     (setting) =>
       workspaceSlug &&
       projectId &&
-      (setting.key !== "features_google_calendar" || googleCalendarStatus?.policy.enabled) &&
+      (setting.key !== "features_google_calendar" ||
+        (canAccessGoogleCalendar && googleCalendarStatus?.policy.enabled)) &&
       allowPermissions(setting.access, EUserPermissionsLevel.PROJECT, workspaceSlug, projectId)
   );
   const settingsListWithIcons = settingsList.map((setting) => ({

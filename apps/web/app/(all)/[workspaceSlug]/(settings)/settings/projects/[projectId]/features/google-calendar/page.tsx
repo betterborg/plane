@@ -8,7 +8,7 @@ import { useState } from "react";
 import { observer } from "mobx-react";
 import useSWR from "swr";
 // plane imports
-import { EUserPermissions, EUserPermissionsLevel, GOOGLE_CALENDAR_PROJECT_SYNC } from "@plane/constants";
+import { EUserPermissions, GOOGLE_CALENDAR_PROJECT_SYNC } from "@plane/constants";
 import { useTranslation } from "@plane/i18n";
 import { setPromiseToast } from "@plane/propel/toast";
 import type { IGoogleCalendarProjectSync } from "@plane/types";
@@ -39,17 +39,13 @@ function FeaturesGoogleCalendarSettingsPage({ params }: Route.ComponentProps) {
   // store hooks
   const { config } = useInstance();
   const { currentProjectDetails } = useProject();
-  const { allowPermissions, workspaceUserInfo } = useUserPermissions();
+  const { getProjectMembershipRoleByWorkspaceSlugAndProjectId } = useUserPermissions();
   // translation
   const { t } = useTranslation();
   // derived values
   const isGoogleCalendarAvailable = config?.is_google_calendar_available ?? false;
-  const isProjectAdmin = allowPermissions(
-    [EUserPermissions.ADMIN],
-    EUserPermissionsLevel.PROJECT,
-    workspaceSlug,
-    projectId
-  );
+  const isProjectAdmin =
+    getProjectMembershipRoleByWorkspaceSlugAndProjectId(workspaceSlug, projectId) === EUserPermissions.ADMIN;
   const pageTitle = currentProjectDetails?.name
     ? `${currentProjectDetails.name} settings - ${t("project_settings.features.google_calendar.short_title")}`
     : undefined;
@@ -98,7 +94,7 @@ function FeaturesGoogleCalendarSettingsPage({ params }: Route.ComponentProps) {
 
   if (
     !isGoogleCalendarAvailable ||
-    (workspaceUserInfo && !isProjectAdmin) ||
+    !isProjectAdmin ||
     workspaceStatusError ||
     (workspaceStatus && !workspaceStatus.policy.enabled)
   ) {

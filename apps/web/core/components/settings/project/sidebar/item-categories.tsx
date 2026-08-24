@@ -9,9 +9,9 @@ import { usePathname } from "next/navigation";
 import { useParams } from "react-router";
 // plane imports
 import {
+  EUserPermissions,
   EUserPermissionsLevel,
   GROUPED_PROJECT_SETTINGS,
-  PROJECT_SETTINGS,
   PROJECT_SETTINGS_CATEGORIES,
   PROJECT_SETTINGS_CATEGORY_LABELS,
 } from "@plane/constants";
@@ -38,14 +38,11 @@ export const ProjectSettingsSidebarItemCategories = observer(function ProjectSet
   const pathname = usePathname();
   // store hooks
   const { config } = useInstance();
-  const { allowPermissions } = useUserPermissions();
+  const { allowPermissions, getProjectMembershipRoleByWorkspaceSlugAndProjectId } = useUserPermissions();
   // derived values
-  const canAccessGoogleCalendar = allowPermissions(
-    PROJECT_SETTINGS.features_google_calendar.access,
-    EUserPermissionsLevel.PROJECT,
-    workspaceSlug,
-    projectId
-  );
+  const canAccessGoogleCalendar =
+    workspaceSlug !== undefined &&
+    getProjectMembershipRoleByWorkspaceSlugAndProjectId(workspaceSlug, projectId) === EUserPermissions.ADMIN;
   const { data: googleCalendarStatus } = useGoogleCalendarWorkspaceStatus(
     workspaceSlug,
     Boolean(config?.is_google_calendar_available && canAccessGoogleCalendar)
@@ -59,7 +56,8 @@ export const ProjectSettingsSidebarItemCategories = observer(function ProjectSet
         const categoryItems = GROUPED_PROJECT_SETTINGS[category];
         const accessibleItems = categoryItems.filter(
           (item) =>
-            (item.key !== "features_google_calendar" || googleCalendarStatus?.policy.enabled) &&
+            (item.key !== "features_google_calendar" ||
+              (canAccessGoogleCalendar && googleCalendarStatus?.policy.enabled)) &&
             allowPermissions(item.access, EUserPermissionsLevel.PROJECT, workspaceSlug, projectId)
         );
 
