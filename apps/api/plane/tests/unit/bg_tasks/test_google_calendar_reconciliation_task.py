@@ -568,6 +568,48 @@ class TestScheduleGoogleCalendarReconciliations:
         disconnect_client.delete_calendar.assert_called_once_with("disconnect-calendar")
         disconnect_client.revoke_grant.assert_called_once_with()
 
+    @freeze_time("2026-08-24 12:00:00")
+    def test_recovers_operation_only_absent_cleanup_generation(self):
+        operation_id = UUID("12345678-1234-5678-1234-567812345678")
+        workspace_integration = _enabled_calendar_integration()
+        connection = GoogleCalendarConnectionFactory(
+            workspace_integration=workspace_integration,
+            pending_cleanup=True,
+            calendar_id="",
+            calendar_operation_id=operation_id,
+            lifecycle_generation=13,
+            retain_grant_after_cleanup=True,
+        )
+        deleted_at = timezone.now()
+        GoogleCalendarConnection.all_objects.filter(id=connection.id).update(deleted_at=deleted_at)
+        WorkspaceIntegration.all_objects.filter(id=workspace_integration.id).update(deleted_at=deleted_at)
+
+        with (
+            patch("plane.integrations.google_calendar.lifecycle._acquire_advisory_xact_lock"),
+            patch("plane.bgtasks.google_calendar_task.publish_google_calendar_task") as publish,
+        ):
+            assert schedule_google_calendar_reconciliations.run() == 1
+
+        assert [(call.args[1], call.args[2]) for call in publish.call_args_list] == [(str(connection.id), 13)]
+        assert publish.call_args.args[0].task == GOOGLE_CALENDAR_LIFECYCLE_TASK
+
+        client = Mock(access_token=None)
+        client.find_calendar.return_value = "created-before-crash"
+        with (
+            patch("plane.integrations.google_calendar.lifecycle._acquire_advisory_xact_lock"),
+            patch("plane.bgtasks.google_calendar_task.GoogleCalendarClient", return_value=client),
+        ):
+            assert reconcile_google_calendar_connection.run(str(connection.id), 13) == "disabled"
+
+        recovered = GoogleCalendarConnection.all_objects.get(id=connection.id)
+        assert recovered.status == GoogleCalendarConnection.Status.DISCONNECTED
+        assert recovered.calendar_id == ""
+        assert recovered.calendar_operation_id is None
+        assert recovered.refresh_token
+        client.find_calendar.assert_called_once_with(operation_id)
+        client.delete_calendar.assert_called_once_with("created-before-crash")
+        client.revoke_grant.assert_not_called()
+
     def test_recovered_cleanup_preserves_grant_for_soft_deleted_token_bearing_sibling(self):
         disconnect = GoogleCalendarConnectionFactory(
             workspace_integration=_enabled_calendar_integration(),

@@ -252,7 +252,7 @@ def _cleanup_recovery_candidates():
             desired_state=GoogleCalendarConnection.DesiredState.DISCONNECTED,
             status=GoogleCalendarConnection.Status.CLEANUP_PENDING,
         )
-        .filter(Q(retain_grant_after_cleanup=False) | ~Q(calendar_id=""))
+        .filter(Q(retain_grant_after_cleanup=False) | ~Q(calendar_id="") | Q(calendar_operation_id__isnull=False))
         .order_by("id")
         .values_list("id", flat=True)
     )
@@ -267,7 +267,11 @@ def _claim_cleanup_recovery(connection_id):
     if (
         connection.desired_state != GoogleCalendarConnection.DesiredState.DISCONNECTED
         or connection.status != GoogleCalendarConnection.Status.CLEANUP_PENDING
-        or (connection.retain_grant_after_cleanup and not connection.calendar_id)
+        or (
+            connection.retain_grant_after_cleanup
+            and not connection.calendar_id
+            and connection.calendar_operation_id is None
+        )
     ):
         return None
     return connection.lifecycle_generation
