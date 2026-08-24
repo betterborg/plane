@@ -7,7 +7,7 @@ from unittest.mock import call, patch
 import pytest
 
 from plane.db.signals import suppress_google_calendar_issue_signal_dispatch
-from plane.tests.factories import IssueAssigneeFactory, IssueFactory, IssueLabelFactory
+from plane.tests.factories import IssueAssigneeFactory, IssueFactory, IssueLabelFactory, StateFactory
 
 
 @pytest.mark.unit
@@ -60,3 +60,31 @@ class TestGoogleCalendarIssueSignals:
                 call(issue.id),
                 call(issue.id),
             ]
+
+
+@pytest.mark.unit
+@pytest.mark.django_db
+class TestGoogleCalendarStateSignals:
+    def test_state_creation_does_not_enqueue_a_resync(self):
+        with patch("plane.db.signals.enqueue_google_calendar_task_on_commit") as enqueue:
+            StateFactory()
+
+        enqueue.assert_not_called()
+
+    def test_existing_state_save_enqueues_resync_after_commit(self):
+        state = StateFactory()
+
+        with patch("plane.db.signals.enqueue_google_calendar_task_on_commit") as enqueue:
+            state.name = "Ready for review"
+            state.save(update_fields=["name", "updated_at"])
+
+        enqueue.assert_called_once()
+        assert enqueue.call_args.args[1:] == (str(state.id),)
+
+    def test_default_queryset_update_does_not_enqueue_a_resync(self):
+        state = StateFactory()
+
+        with patch("plane.db.signals.enqueue_google_calendar_task_on_commit") as enqueue:
+            type(state).objects.filter(id=state.id).update(default=True)
+
+        enqueue.assert_not_called()
