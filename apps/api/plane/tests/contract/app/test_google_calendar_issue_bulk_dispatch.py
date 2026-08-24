@@ -3,16 +3,27 @@
 # See the LICENSE file for details.
 
 from datetime import timedelta
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 from django.urls import reverse
 from django.utils import timezone
 from rest_framework import status
 
-from plane.db.models import Issue
+from plane.bgtasks.google_calendar_task import synchronize_google_calendar_cycle
+from plane.db.models import CycleIssue, GoogleCalendarEvent, Issue, Module, ModuleIssue
 from plane.db.signals import suppress_google_calendar_issue_signal_dispatch
-from plane.tests.factories import IssueFactory, ProjectFactory, ProjectMemberFactory, StateFactory
+from plane.tests.factories import (
+    CycleFactory,
+    CycleIssueFactory,
+    GoogleCalendarConnectionFactory,
+    IssueAssigneeFactory,
+    IssueFactory,
+    ProjectFactory,
+    ProjectMemberFactory,
+    StateFactory,
+    WorkspaceIntegrationFactory,
+)
 
 
 @pytest.fixture
@@ -151,3 +162,73 @@ class TestGoogleCalendarIssueBulkDispatch:
         for issue in issues:
             issue.refresh_from_db()
             assert issue.deleted_at is not None
+
+    def test_bulk_delete_dispatches_distinct_old_cycle_after_all_deletions(
+        self,
+        session_client,
+        workspace,
+        project,
+    ):
+        workspace_integration = WorkspaceIntegrationFactory(
+            workspace=workspace,
+            integration__provider="google_calendar",
+            config={"enabled": True, "recipients": "cycle_members"},
+        )
+        issues = _issues(project)
+        cycle = CycleFactory(project=project)
+        module = Module.objects.create(name="Bulk delete module", project=project)
+        connection = GoogleCalendarConnectionFactory(
+            workspace_integration=workspace_integration,
+            active=True,
+        )
+        with suppress_google_calendar_issue_signal_dispatch():
+            for issue in issues:
+                CycleIssueFactory(cycle=cycle, issue=issue, project=project)
+                ModuleIssue.objects.create(module=module, issue=issue, project=project)
+            IssueAssigneeFactory(issue=issues[0], assignee=connection.member, project=project)
+
+        provider_client = Mock()
+        provider_client.access_token = None
+        provider_client.list_events.return_value = []
+        observed_issue_ids = []
+        observed_cycle_ids = []
+
+        def inspect_deleted_issue(issue_id):
+            issue = Issue.all_objects.get(id=issue_id)
+            assert issue.deleted_at is not None
+            observed_issue_ids.append(issue.id)
+
+        def converge_cycle_from_final_state(cycle_id):
+            assert not CycleIssue.objects.filter(cycle_id=cycle_id).exists()
+            assert not ModuleIssue.objects.filter(issue_id__in=[issue.id for issue in issues]).exists()
+            assert not Issue.issue_objects.filter(id__in=[issue.id for issue in issues]).exists()
+            observed_cycle_ids.append(cycle_id)
+            return synchronize_google_calendar_cycle.run(cycle_id)
+
+        with (
+            patch("plane.bgtasks.google_calendar_task.GoogleCalendarClient", return_value=provider_client),
+            patch("plane.db.signals.synchronize_google_calendar_issue.delay", side_effect=inspect_deleted_issue),
+            patch.object(
+                synchronize_google_calendar_cycle,
+                "delay",
+                side_effect=converge_cycle_from_final_state,
+            ),
+        ):
+            assert synchronize_google_calendar_cycle.run(str(cycle.id)) == ["created"]
+            assert GoogleCalendarEvent.objects.filter(entity_id=cycle.id).count() == 1
+
+            response = session_client.delete(
+                reverse(
+                    "project-issues-bulk",
+                    kwargs={"slug": workspace.slug, "project_id": project.id},
+                ),
+                {"issue_ids": [str(issue.id) for issue in issues]},
+                format="json",
+            )
+
+        assert response.status_code == status.HTTP_200_OK
+        assert set(observed_issue_ids) == {issue.id for issue in issues}
+        assert observed_cycle_ids == [str(cycle.id)]
+        assert not CycleIssue.objects.filter(cycle=cycle).exists()
+        assert not GoogleCalendarEvent.objects.filter(entity_id=cycle.id).exists()
+        provider_client.delete_event.assert_called_once()

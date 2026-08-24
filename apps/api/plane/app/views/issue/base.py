@@ -61,7 +61,7 @@ from plane.db.models import (
     ProjectMember,
     UserRecentVisit,
 )
-from plane.db.signals import dispatch_google_calendar_issue_sync
+from plane.db.signals import dispatch_google_calendar_cycle_syncs, dispatch_google_calendar_issue_sync
 from plane.utils.filters import ComplexFilterBackend, IssueFilterSet
 from plane.utils.global_paginator import paginate
 from plane.utils.grouper import (
@@ -772,6 +772,12 @@ class BulkDeleteIssuesEndpoint(BaseAPIView):
         issues = Issue.issue_objects.filter(workspace__slug=slug, project_id=project_id, pk__in=issue_ids)
 
         affected_issue_ids = list(issues.values_list("id", flat=True))
+        affected_cycle_ids = list(
+            CycleIssue.objects.filter(issue_id__in=affected_issue_ids)
+            .order_by()
+            .values_list("cycle_id", flat=True)
+            .distinct()
+        )
         total_issues = len(affected_issue_ids)
 
         # First, delete all related cycle issues
@@ -785,6 +791,7 @@ class BulkDeleteIssuesEndpoint(BaseAPIView):
 
         for issue_id in affected_issue_ids:
             dispatch_google_calendar_issue_sync(issue_id)
+        dispatch_google_calendar_cycle_syncs(affected_cycle_ids)
 
         return Response(
             {"message": f"{total_issues} issues were deleted"},
