@@ -10,6 +10,7 @@ from unittest.mock import Mock, patch
 from urllib.parse import parse_qs, urlparse
 
 import pytest
+from django.conf import settings
 from django.db import close_old_connections, transaction
 from django.test import override_settings
 from django.urls import reverse
@@ -25,6 +26,7 @@ from plane.bgtasks.google_calendar_task import reconcile_google_calendar_connect
 from plane.db.models import GoogleCalendarConnection, WorkspaceMember
 from plane.integrations.google_calendar.lifecycle import (
     lock_google_calendar_connection,
+    lock_google_calendar_global_state,
     request_google_calendar_disconnect,
 )
 from plane.integrations.google_calendar.oauth import (
@@ -36,6 +38,12 @@ from plane.integrations.google_calendar.oauth import (
     GoogleCalendarOAuthGrant,
     GoogleCalendarOAuthIdentity,
     GoogleCalendarOAuthIdentityError,
+)
+from plane.license.models import InstanceConfiguration
+from plane.license.utils.encryption import encrypt_data
+from plane.license.utils.google_calendar_credentials import (
+    google_calendar_credential_fingerprint,
+    prepare_google_calendar_credential_replacement,
 )
 from plane.tests.factories import (
     GoogleCalendarConnectionFactory,
@@ -111,6 +119,100 @@ class TestGoogleCalendarOAuth:
 
         assert response.status_code == status.HTTP_404_NOT_FOUND
         assert not GoogleCalendarConnection.objects.exists()
+
+    @pytest.mark.django_db(transaction=True)
+    def test_start_waits_for_credential_replacement_and_uses_committed_generation(
+        self,
+        session_client,
+        workspace,
+        calendar_workspace_integration,
+    ):
+        InstanceConfiguration.objects.bulk_create(
+            [
+                InstanceConfiguration(
+                    key="GOOGLE_CALENDAR_CLIENT_ID",
+                    value="old-client",
+                    category="GOOGLE_CALENDAR",
+                    is_encrypted=False,
+                ),
+                InstanceConfiguration(
+                    key="GOOGLE_CALENDAR_CLIENT_SECRET",
+                    value=encrypt_data("old-secret"),
+                    category="GOOGLE_CALENDAR",
+                    is_encrypted=True,
+                ),
+                InstanceConfiguration(
+                    key="GOOGLE_CALENDAR_IS_PROJECT_DEDICATED",
+                    value="1",
+                    category="GOOGLE_CALENDAR",
+                    is_encrypted=False,
+                ),
+            ]
+        )
+        replacement_locked = Event()
+        replacement_can_commit = Event()
+        start_lock_requested = Event()
+        start_lock_acquired = Event()
+        replacement_values = {
+            "GOOGLE_CALENDAR_CLIENT_ID": "new-client",
+            "GOOGLE_CALENDAR_CLIENT_SECRET": encrypt_data("new-secret"),
+            "GOOGLE_CALENDAR_IS_PROJECT_DEDICATED": "1",
+        }
+
+        def replace_credentials():
+            close_old_connections()
+            try:
+                with transaction.atomic():
+                    locked_configurations = list(
+                        InstanceConfiguration.objects.select_for_update().filter(key__in=replacement_values)
+                    )
+                    prepare_google_calendar_credential_replacement(replacement_values)
+                    for configuration in locked_configurations:
+                        configuration.value = replacement_values[configuration.key]
+                    InstanceConfiguration.objects.bulk_update(locked_configurations, ["value"])
+                    replacement_locked.set()
+                    assert replacement_can_commit.wait(timeout=5)
+            finally:
+                close_old_connections()
+
+        def start_consent():
+            close_old_connections()
+            try:
+                return session_client.get(_start_url(workspace))
+            finally:
+                close_old_connections()
+
+        def acquire_start_global_lock():
+            start_lock_requested.set()
+            lock_google_calendar_global_state()
+            start_lock_acquired.set()
+
+        with (
+            override_settings(GOOGLE_CALENDAR_RELEASED=False, SKIP_ENV_VAR=True),
+            patch(
+                "plane.app.views.google_calendar_oauth.lock_google_calendar_global_state",
+                side_effect=acquire_start_global_lock,
+            ),
+        ):
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                replacement_future = executor.submit(replace_credentials)
+                assert replacement_locked.wait(timeout=5)
+
+                # Simulate enabling the release gate after an administrator
+                # has begun the otherwise-permitted replacement transaction.
+                settings.GOOGLE_CALENDAR_RELEASED = True
+                start_future = executor.submit(start_consent)
+                assert start_lock_requested.wait(timeout=5)
+                assert start_lock_acquired.wait(timeout=0.2) is False
+
+                replacement_can_commit.set()
+                replacement_future.result(timeout=5)
+                response = start_future.result(timeout=5)
+
+        assert response.status_code == status.HTTP_302_FOUND
+        assert parse_qs(urlparse(response.url).query)["client_id"] == ["new-client"]
+        connection = GoogleCalendarConnection.objects.get()
+        assert connection.oauth_state
 
     @pytest.mark.django_db
     def test_disabled_workspace_cannot_start_consent(
@@ -337,6 +439,10 @@ class TestGoogleCalendarOAuth:
         assert connection.provider_email == "member@example.com"
         assert connection.access_token == complete_grant.access_token
         assert connection.refresh_token == complete_grant.refresh_token
+        assert connection.credential_fingerprint == google_calendar_credential_fingerprint(
+            oauth_credentials.client_id,
+            oauth_credentials.client_secret,
+        )
         assert connection.desired_state == GoogleCalendarConnection.DesiredState.CONNECTED
         assert connection.status == GoogleCalendarConnection.Status.PENDING
         assert connection.lifecycle_generation == 1
@@ -443,7 +549,16 @@ class TestGoogleCalendarOAuth:
                 revoke_locked.wait(timeout=5)
                 callback_started.set()
                 request = SimpleNamespace(user=create_user)
-                return _complete_callback(request, payload, complete_grant, identity)
+                return _complete_callback(
+                    request,
+                    payload,
+                    complete_grant,
+                    identity,
+                    google_calendar_credential_fingerprint(
+                        oauth_credentials.client_id,
+                        oauth_credentials.client_secret,
+                    ),
+                )
             finally:
                 close_old_connections()
 

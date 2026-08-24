@@ -126,8 +126,11 @@ _PROVIDER_FIELDS = (
     "provider_email",
     "access_token",
     "refresh_token",
+    "sync_token",
+    "page_token",
     "token_expires_at",
     "scopes",
+    "credential_fingerprint",
 )
 _OAUTH_ATTEMPT_FIELDS = (
     "oauth_state",
@@ -166,6 +169,12 @@ def lock_google_calendar_connection(connection_id):
     return GoogleCalendarConnection.objects.select_for_update().get(id=connection_id)
 
 
+def lock_google_calendar_global_state():
+    """Serialize an instance-wide Calendar policy operation with lifecycle work."""
+
+    _acquire_global_lock()
+
+
 def lock_google_calendar_workspace_connections(workspace_id):
     """Lock a workspace's connections in stable UUID order after the global lock."""
 
@@ -178,6 +187,17 @@ def lock_google_calendar_workspace_connections(workspace_id):
     for connection_id in connection_ids:
         _acquire_connection_lock(connection_id)
     connections = GoogleCalendarConnection.objects.select_for_update().filter(id__in=connection_ids).order_by("id")
+    return list(connections)
+
+
+def lock_all_google_calendar_connections():
+    """Lock live and soft-deleted Calendar rows in the global lifecycle order."""
+
+    _acquire_global_lock()
+    connection_ids = list(GoogleCalendarConnection.all_objects.order_by("id").values_list("id", flat=True))
+    for connection_id in connection_ids:
+        _acquire_connection_lock(connection_id)
+    connections = GoogleCalendarConnection.all_objects.select_for_update().filter(id__in=connection_ids).order_by("id")
     return list(connections)
 
 
@@ -232,8 +252,11 @@ def _clear_provider_grant(connection):
     connection.provider_email = ""
     connection.access_token = ""
     connection.refresh_token = ""
+    connection.sync_token = ""
+    connection.page_token = ""
     connection.token_expires_at = None
     connection.scopes = []
+    connection.credential_fingerprint = ""
 
 
 @transaction.atomic
@@ -243,6 +266,7 @@ def apply_google_calendar_oauth_success(
     *,
     provider_account_id,
     provider_email,
+    credential_fingerprint,
     access_token="",
     refresh_token="",
     token_expires_at=None,
@@ -286,9 +310,12 @@ def apply_google_calendar_oauth_success(
     calendar_connection.refresh_token = refresh_token
     calendar_connection.token_expires_at = token_expires_at
     calendar_connection.scopes = list(scopes or [])
+    calendar_connection.credential_fingerprint = credential_fingerprint
     calendar_connection.desired_state = GoogleCalendarConnection.DesiredState.CONNECTED
-    if not has_usable_google_calendar_grant(calendar_connection):
-        raise UnusableGoogleCalendarGrant("OAuth success requires provider identity and a usable token")
+    if not credential_fingerprint or not has_usable_google_calendar_grant(calendar_connection):
+        raise UnusableGoogleCalendarGrant(
+            "OAuth success requires provider identity, a usable token, and a credential fingerprint"
+        )
 
     calendar_connection.desired_state, calendar_connection.status = oauth_success_state
     calendar_connection.lifecycle_generation = expected_generation + 1
@@ -423,8 +450,11 @@ def request_google_calendar_disconnect(connection_id, expected_generation):
                 calendar_connection.calendar_operation_id,
                 calendar_connection.access_token,
                 calendar_connection.refresh_token,
+                calendar_connection.sync_token,
+                calendar_connection.page_token,
                 calendar_connection.token_expires_at,
                 calendar_connection.scopes,
+                calendar_connection.credential_fingerprint,
             )
         )
     ):

@@ -12,7 +12,6 @@ from smtplib import (
 )
 
 # Django imports
-from django.conf import settings
 from django.core.mail import BadHeaderError, EmailMultiAlternatives, get_connection
 from django.db import transaction
 from django.db.models import Q, Case, When, Value
@@ -26,23 +25,13 @@ from .base import BaseAPIView
 from plane.license.api.permissions import InstanceAdminPermission
 from plane.license.models import InstanceConfiguration
 from plane.license.api.serializers import InstanceConfigurationSerializer
+from plane.license.utils.google_calendar_credentials import (
+    GoogleCalendarCredentialsLocked,
+    prepare_google_calendar_credential_replacement,
+)
 from plane.license.utils.encryption import encrypt_data
 from plane.utils.cache import cache_response, invalidate_cache
 from plane.license.utils.instance_value import get_email_configuration
-
-
-GOOGLE_CALENDAR_CREDENTIAL_KEYS = frozenset(
-    {
-        "GOOGLE_CALENDAR_CLIENT_ID",
-        "GOOGLE_CALENDAR_CLIENT_SECRET",
-        "GOOGLE_CALENDAR_IS_PROJECT_DEDICATED",
-    }
-)
-
-
-def google_calendar_credentials_are_locked(configuration_keys):
-    """Return whether a configuration update would replace released Calendar credentials."""
-    return settings.GOOGLE_CALENDAR_RELEASED and bool(GOOGLE_CALENDAR_CREDENTIAL_KEYS.intersection(configuration_keys))
 
 
 class InstanceConfigurationEndpoint(BaseAPIView):
@@ -58,11 +47,11 @@ class InstanceConfigurationEndpoint(BaseAPIView):
     @invalidate_cache(path="/api/instances/", user=False)
     def patch(self, request):
         with transaction.atomic():
-            configurations = list(
-                InstanceConfiguration.objects.select_for_update().filter(key__in=request.data.keys())
-            )
+            configurations = list(InstanceConfiguration.objects.select_for_update().filter(key__in=request.data.keys()))
 
-            if google_calendar_credentials_are_locked(request.data.keys()):
+            try:
+                prepare_google_calendar_credential_replacement(request.data.keys())
+            except GoogleCalendarCredentialsLocked:
                 return Response(
                     {"error": "google_calendar_credentials_locked"},
                     status=status.HTTP_409_CONFLICT,

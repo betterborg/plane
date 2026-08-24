@@ -530,6 +530,7 @@ class TestGoogleCalendarConvergenceTask:
                 provider_email="new@example.com",
                 refresh_token="new-refresh-token",
                 scopes=GOOGLE_CALENDAR_SCOPES,
+                credential_fingerprint="a" * 64,
             )
             reconcile_google_calendar_connection(str(connection.id), oauth.generation)
 
