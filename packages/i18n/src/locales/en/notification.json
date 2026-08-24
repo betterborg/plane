@@ -46,6 +46,13 @@
       "created": "Created by me",
       "subscribed": "Subscribed by me"
     },
+    "google_calendar": {
+      "connection_broken": {
+        "title": "Google Calendar disconnected",
+        "reconnect": "Reconnect Google Calendar to resume syncing.",
+        "credentials_changed": "Reconnect after the Google Calendar credentials changed."
+      }
+    },
     "snooze": {
       "1_day": "1 day",
       "3_days": "3 days",

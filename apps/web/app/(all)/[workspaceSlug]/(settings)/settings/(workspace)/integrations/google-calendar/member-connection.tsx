@@ -211,6 +211,8 @@ export const GoogleCalendarMemberConnection = observer(function GoogleCalendarMe
     );
 
   const connectionStatus = workspaceStatus.connection?.status ?? null;
+  const connectionError = searchParams.get("connection_error");
+  const isCredentialMismatch = connectionStatus === "broken" && connectionError === "oauth_credentials_changed";
   const canStartAuth =
     workspaceStatus.available && workspaceStatus.policy.enabled && connectionStatus !== "disconnecting";
   const hasConnection = connectionStatus !== null;
@@ -229,6 +231,17 @@ export const GoogleCalendarMemberConnection = observer(function GoogleCalendarMe
         <Banner
           variant="warning"
           title={t("workspace_settings.settings.integrations.google_calendar.member_connection.unavailable")}
+        />
+      )}
+      {connectionStatus === "broken" && (
+        <Banner
+          variant="error"
+          icon={<AlertCircle className="size-4" />}
+          title={t(
+            isCredentialMismatch
+              ? "workspace_settings.settings.integrations.google_calendar.member_connection.guidance.credentials_changed"
+              : "workspace_settings.settings.integrations.google_calendar.member_connection.guidance.broken"
+          )}
         />
       )}
 

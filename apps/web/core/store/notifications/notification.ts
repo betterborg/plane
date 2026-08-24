@@ -50,7 +50,7 @@ export class Notification implements INotification {
   is_inbox_issue: boolean | undefined = undefined;
   is_mentioned_notification: boolean | undefined = undefined;
   workspace: string | undefined = undefined;
-  project: string | undefined = undefined;
+  project: string | null | undefined = undefined;
   created_at: string | undefined = undefined;
   updated_at: string | undefined = undefined;
   created_by: string | undefined = undefined;

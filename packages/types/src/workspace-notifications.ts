@@ -27,7 +27,7 @@ export type TNotificationIssueLite = {
   state_group: string | undefined;
 };
 
-export type TNotificationData = {
+export type TNotificationIssueData = {
   issue: TNotificationIssueLite | undefined;
   issue_activity: {
     id: string | undefined;
@@ -39,6 +39,24 @@ export type TNotificationData = {
     old_value: string | undefined;
   };
 };
+
+export type TGoogleCalendarConnectionNotificationError =
+  | "authorization_failed"
+  | "oauth_credentials_changed"
+  | "provider_error"
+  | "refresh_token_invalid";
+
+export type TNotificationGoogleCalendarConnectionData = {
+  google_calendar_connection: {
+    id: string;
+    provider_email: string;
+    status: "broken";
+    error: TGoogleCalendarConnectionNotificationError;
+    action_url: string;
+  };
+};
+
+export type TNotificationData = TNotificationIssueData | TNotificationGoogleCalendarConnectionData;
 
 export type TNotification = {
   id: string;
@@ -59,7 +77,7 @@ export type TNotification = {
   is_inbox_issue: boolean | undefined;
   is_mentioned_notification: boolean | undefined;
   workspace: string | undefined;
-  project: string | undefined;
+  project: string | null | undefined;
   created_at: string | undefined;
   updated_at: string | undefined;
   created_by: string | undefined;

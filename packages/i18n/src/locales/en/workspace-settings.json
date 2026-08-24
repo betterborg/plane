@@ -190,6 +190,10 @@
             "unavailable": "Google Calendar is not configured for this Plane instance.",
             "load_error": "Your Google Calendar connection status could not be loaded.",
             "retry": "Retry",
+            "guidance": {
+              "broken": "Your Google Calendar connection stopped syncing. Reconnect it to resume syncing.",
+              "credentials_changed": "This Plane instance's Google Calendar credentials changed. Reconnect your Google account to authorize the new credentials and resume syncing."
+            },
             "status": {
               "disconnected": "Not connected",
               "provisioning": "Creating your dedicated calendar",
