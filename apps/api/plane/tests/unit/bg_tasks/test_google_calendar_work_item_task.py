@@ -133,6 +133,24 @@ class TestGoogleCalendarWorkItemTask:
         client.get_event.assert_called_once()
         client.update_event.assert_called_once()
 
+    def test_transient_update_conflict_then_tombstone_recreates_the_event(self):
+        client = _provider_client()
+
+        with patch("plane.bgtasks.google_calendar_task.GoogleCalendarClient", return_value=client):
+            assert synchronize_google_calendar_issue.run(str(self.issue.id)) == ["created"]
+            client.reset_mock()
+            client.access_token = None
+            client.get_event.side_effect = [{"id": "existing-event"}, None]
+            client.update_event.side_effect = GoogleCalendarClientConflict("transient conflict")
+            self.issue.name = "Changed while provider conflicted"
+            self.issue.save(update_fields=["name", "updated_at"])
+            result = synchronize_google_calendar_issue.run(str(self.issue.id))
+
+        assert result == ["updated"]
+        assert client.get_event.call_count == 2
+        client.insert_event.assert_called_once()
+        assert GoogleCalendarEvent.objects.filter(entity_id=self.issue.id).count() == 1
+
     def test_provider_retry_commits_refreshed_access_token_once(self):
         credentials = GoogleCalendarOAuthCredentials("client-id", "client-secret")
         self.connection.access_token = "expired-access-token"

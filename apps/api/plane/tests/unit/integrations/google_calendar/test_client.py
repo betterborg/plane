@@ -11,11 +11,14 @@ import requests
 from django.utils import timezone
 
 from plane.integrations.google_calendar.client import (
+    GoogleCalendarCalendarAbsent,
     GoogleCalendarClient,
     GoogleCalendarClientConflict,
     GoogleCalendarClientError,
     GoogleCalendarCredentialMismatch,
+    GoogleCalendarEventAbsent,
     GoogleCalendarProviderError,
+    GoogleCalendarSyncTokenExpired,
 )
 from plane.integrations.google_calendar.oauth import GoogleCalendarOAuthCredentials
 from plane.license.utils.google_calendar_credentials import google_calendar_credential_fingerprint
@@ -100,6 +103,45 @@ class TestGoogleCalendarClient:
         }
         assert request.call_args_list[1].kwargs["params"]["pageToken"] == "next"
 
+    def test_incremental_inventory_returns_one_opaque_page(self):
+        response = Mock(status_code=200)
+        response.json.return_value = {
+            "items": [{"id": "changed"}],
+            "nextPageToken": "next-page",
+        }
+        client = _client(
+            access_token="access-token",
+            token_expires_at=timezone.now() + timedelta(hours=1),
+        )
+
+        with patch("plane.integrations.google_calendar.client.requests.request", return_value=response) as request:
+            page = client.list_event_page("calendar", sync_token="sync-token")
+
+        assert page.events == ({"id": "changed"},)
+        assert page.next_page_token == "next-page"
+        assert page.next_sync_token is None
+        assert request.call_args.kwargs["params"] == {
+            "maxResults": 250,
+            "showDeleted": True,
+            "singleEvents": True,
+            "syncToken": "sync-token",
+        }
+
+    def test_expired_incremental_token_requires_full_inventory(self):
+        response = Mock(status_code=410)
+        client = _client(
+            access_token="access-token",
+            token_expires_at=timezone.now() + timedelta(hours=1),
+        )
+
+        with (
+            patch("plane.integrations.google_calendar.client.requests.request", return_value=response),
+            pytest.raises(GoogleCalendarSyncTokenExpired),
+        ):
+            client.list_event_page("calendar", sync_token="expired-token")
+
+        response.raise_for_status.assert_not_called()
+
     def test_event_insert_surfaces_a_conflict_without_provider_content(self):
         response = Mock(status_code=409)
         client = _client(
@@ -112,6 +154,37 @@ class TestGoogleCalendarClient:
             pytest.raises(GoogleCalendarClientConflict, match="already exists"),
         ):
             client.insert_event("calendar", "event", {"summary": "Created"})
+
+    @pytest.mark.parametrize("status_code", [404, 410])
+    def test_event_update_classifies_provider_absence(self, status_code):
+        response = Mock(status_code=status_code)
+        client = _client(
+            access_token="access-token",
+            token_expires_at=timezone.now() + timedelta(hours=1),
+        )
+
+        with (
+            patch("plane.integrations.google_calendar.client.requests.request", return_value=response),
+            pytest.raises(GoogleCalendarEventAbsent),
+        ):
+            client.update_event("calendar", "event", {})
+
+    @pytest.mark.parametrize("operation", ["get", "update"])
+    def test_event_fetch_and_update_classify_conflicts(self, operation):
+        response = Mock(status_code=409)
+        client = _client(
+            access_token="access-token",
+            token_expires_at=timezone.now() + timedelta(hours=1),
+        )
+
+        with (
+            patch("plane.integrations.google_calendar.client.requests.request", return_value=response),
+            pytest.raises(GoogleCalendarClientConflict),
+        ):
+            if operation == "get":
+                client.get_event("calendar", "event")
+            else:
+                client.update_event("calendar", "event", {})
 
     @pytest.mark.parametrize("status_code", [404, 410])
     def test_event_delete_treats_provider_absence_as_converged(self, status_code):
@@ -225,6 +298,87 @@ class TestGoogleCalendarClient:
 
         response.raise_for_status.assert_not_called()
 
+    @pytest.mark.parametrize("status_code", [404, 410])
+    def test_calendar_lookup_classifies_confirmed_absence(self, status_code):
+        response = Mock(status_code=status_code)
+        client = _client(
+            access_token="access-token",
+            token_expires_at=timezone.now() + timedelta(hours=1),
+        )
+
+        with (
+            patch("plane.integrations.google_calendar.client.requests.request", return_value=response),
+            pytest.raises(GoogleCalendarCalendarAbsent),
+        ):
+            client.get_calendar("calendar")
+
+    def test_transient_provider_failures_use_exponential_jitter_and_eventually_succeed(self):
+        unavailable = Mock(status_code=503, headers={})
+        throttled = Mock(status_code=429, headers={})
+        success = Mock(status_code=200)
+        success.json.return_value = {"id": "calendar"}
+        client = _client(
+            access_token="access-token",
+            token_expires_at=timezone.now() + timedelta(hours=1),
+        )
+
+        with (
+            patch(
+                "plane.integrations.google_calendar.client.requests.request",
+                side_effect=[unavailable, throttled, success],
+            ),
+            patch("plane.integrations.google_calendar.client.random.uniform", side_effect=[0.25, 0.5]) as jitter,
+            patch("plane.integrations.google_calendar.client.time.sleep") as sleep,
+        ):
+            assert client.get_calendar("calendar") == {"id": "calendar"}
+
+        assert jitter.call_args_list[0].args == (0, 1)
+        assert jitter.call_args_list[1].args == (0, 2)
+        assert [call.args[0] for call in sleep.call_args_list] == [1.25, 2.5]
+
+    def test_retry_after_takes_precedence_over_jitter(self):
+        throttled = Mock(status_code=429, headers={"Retry-After": "7"})
+        success = Mock(status_code=200)
+        success.json.return_value = {"id": "calendar"}
+        client = _client(
+            access_token="access-token",
+            token_expires_at=timezone.now() + timedelta(hours=1),
+        )
+
+        with (
+            patch(
+                "plane.integrations.google_calendar.client.requests.request",
+                side_effect=[throttled, success],
+            ),
+            patch("plane.integrations.google_calendar.client.random.uniform") as jitter,
+            patch("plane.integrations.google_calendar.client.time.sleep") as sleep,
+        ):
+            client.get_calendar("calendar")
+
+        sleep.assert_called_once_with(7)
+        jitter.assert_not_called()
+
+    def test_transient_retry_exhaustion_raises_sanitized_provider_error(self):
+        unavailable = Mock(status_code=503, headers={})
+        unavailable.raise_for_status.side_effect = requests.HTTPError("private response")
+        client = _client(
+            access_token="access-token",
+            token_expires_at=timezone.now() + timedelta(hours=1),
+            max_retries=2,
+        )
+
+        with (
+            patch("plane.integrations.google_calendar.client.requests.request", return_value=unavailable) as request,
+            patch("plane.integrations.google_calendar.client.random.uniform", return_value=0),
+            patch("plane.integrations.google_calendar.client.time.sleep") as sleep,
+            pytest.raises(GoogleCalendarProviderError, match="lookup failed") as error,
+        ):
+            client.get_calendar("calendar")
+
+        assert request.call_count == 3
+        assert [call.args[0] for call in sleep.call_args_list] == [1, 2]
+        assert "private response" not in str(error.value)
+
     def test_revoke_treats_only_invalid_token_as_already_converged(self):
         response = Mock(status_code=400)
         response.json.return_value = {"error": "invalid_token"}
@@ -313,6 +467,7 @@ class TestGoogleCalendarClient:
         client = _client(
             access_token="access-token",
             token_expires_at=timezone.now() + timedelta(hours=1),
+            max_retries=0,
         )
 
         with (
@@ -476,6 +631,7 @@ class TestGoogleCalendarClient:
         client = _client(
             access_token="access-token",
             token_expires_at=timezone.now() + timedelta(hours=1),
+            max_retries=0,
         )
 
         with (
