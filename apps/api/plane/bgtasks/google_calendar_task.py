@@ -101,12 +101,12 @@ def _cycle_queryset():
     return Cycle.all_objects.select_related("workspace", "project")
 
 
-def _client_event_id_from_recovery(client, connection, entity, deterministic_event_id):
+def _client_event_id_from_recovery(client, connection, entity_id, deterministic_event_id):
     existing_event = client.get_event(connection.calendar_id, deterministic_event_id)
     if existing_event is not None:
         return deterministic_event_id
 
-    marker = f"plane_entity_id={entity.id}"
+    marker = f"plane_entity_id={entity_id}"
     recovered_events = client.list_events(
         connection.calendar_id,
         private_extended_property=marker,
@@ -118,12 +118,69 @@ def _client_event_id_from_recovery(client, connection, entity, deterministic_eve
     return None
 
 
-def _delete_work_item_event(connection, correlation):
+def _delete_provider_event(connection, correlation):
     if connection.calendar_id:
         client = _client_for(connection)
         client.delete_event(connection.calendar_id, correlation.google_event_id)
         _persist_refreshed_access_token(connection, client)
     correlation.delete(soft=False)
+
+
+def _converge_provider_event(connection, entity_type, entity_id, payload, correlation):
+    payload_hash = google_calendar_payload_hash(payload)
+    if correlation is not None and correlation.payload_hash == payload_hash:
+        return "unchanged"
+
+    client = _client_for(connection)
+    deterministic_event_id = google_calendar_event_id(connection.id, entity_type, entity_id)
+    if correlation is None:
+        provider_event_id = deterministic_event_id
+        try:
+            client.insert_event(connection.calendar_id, provider_event_id, payload)
+        except GoogleCalendarClientConflict:
+            provider_event_id = _client_event_id_from_recovery(
+                client,
+                connection,
+                entity_id,
+                deterministic_event_id,
+            )
+            if provider_event_id is None:
+                client.insert_event(connection.calendar_id, deterministic_event_id, payload)
+                provider_event_id = deterministic_event_id
+            else:
+                client.update_event(connection.calendar_id, provider_event_id, payload)
+        GoogleCalendarEvent.objects.create(
+            connection=connection,
+            entity_type=entity_type,
+            entity_id=entity_id,
+            google_event_id=provider_event_id,
+            payload_hash=payload_hash,
+            last_synced_at=timezone.now(),
+        )
+        _persist_refreshed_access_token(connection, client)
+        return "created"
+
+    provider_event_id = _client_event_id_from_recovery(
+        client,
+        connection,
+        entity_id,
+        correlation.google_event_id,
+    )
+    if provider_event_id is None:
+        try:
+            client.insert_event(connection.calendar_id, deterministic_event_id, payload)
+            provider_event_id = deterministic_event_id
+        except GoogleCalendarClientConflict:
+            provider_event_id = deterministic_event_id
+            client.update_event(connection.calendar_id, provider_event_id, payload)
+    else:
+        client.update_event(connection.calendar_id, provider_event_id, payload)
+    correlation.google_event_id = provider_event_id
+    correlation.payload_hash = payload_hash
+    correlation.last_synced_at = timezone.now()
+    correlation.save(update_fields=["google_event_id", "payload_hash", "last_synced_at", "updated_at"])
+    _persist_refreshed_access_token(connection, client)
+    return "updated"
 
 
 @transaction.atomic
@@ -147,7 +204,7 @@ def _synchronize_issue_for_connection(issue_id, connection_id):
     except Issue.DoesNotExist:
         if correlation is None:
             return "missing"
-        _delete_work_item_event(connection, correlation)
+        _delete_provider_event(connection, correlation)
         return "deleted"
 
     eligible = is_issue_assignment_eligible(issue, connection)
@@ -156,68 +213,17 @@ def _synchronize_issue_for_connection(issue_id, connection_id):
     if not eligible or (terminal and not update_terminal):
         if correlation is None:
             return "ineligible"
-        _delete_work_item_event(connection, correlation)
+        _delete_provider_event(connection, correlation)
         return "deleted"
 
     payload = build_google_calendar_work_item_event(issue)
-    payload_hash = google_calendar_payload_hash(payload)
-    if correlation is not None and correlation.payload_hash == payload_hash:
-        return "unchanged"
-
-    client = _client_for(connection)
-    deterministic_event_id = google_calendar_event_id(
-        connection.id,
+    return _converge_provider_event(
+        connection,
         GoogleCalendarEvent.EntityType.WORK_ITEM,
         issue.id,
+        payload,
+        correlation,
     )
-    if correlation is None:
-        provider_event_id = deterministic_event_id
-        try:
-            client.insert_event(connection.calendar_id, provider_event_id, payload)
-        except GoogleCalendarClientConflict:
-            provider_event_id = _client_event_id_from_recovery(
-                client,
-                connection,
-                issue,
-                deterministic_event_id,
-            )
-            if provider_event_id is None:
-                client.insert_event(connection.calendar_id, deterministic_event_id, payload)
-                provider_event_id = deterministic_event_id
-            else:
-                client.update_event(connection.calendar_id, provider_event_id, payload)
-        correlation = GoogleCalendarEvent.objects.create(
-            connection=connection,
-            entity_type=GoogleCalendarEvent.EntityType.WORK_ITEM,
-            entity_id=issue.id,
-            google_event_id=provider_event_id,
-            payload_hash=payload_hash,
-            last_synced_at=timezone.now(),
-        )
-        _persist_refreshed_access_token(connection, client)
-        return "created"
-
-    provider_event_id = _client_event_id_from_recovery(
-        client,
-        connection,
-        issue,
-        correlation.google_event_id,
-    )
-    if provider_event_id is None:
-        try:
-            client.insert_event(connection.calendar_id, deterministic_event_id, payload)
-            provider_event_id = deterministic_event_id
-        except GoogleCalendarClientConflict:
-            provider_event_id = deterministic_event_id
-            client.update_event(connection.calendar_id, provider_event_id, payload)
-    else:
-        client.update_event(connection.calendar_id, provider_event_id, payload)
-    correlation.google_event_id = provider_event_id
-    correlation.payload_hash = payload_hash
-    correlation.last_synced_at = timezone.now()
-    correlation.save(update_fields=["google_event_id", "payload_hash", "last_synced_at", "updated_at"])
-    _persist_refreshed_access_token(connection, client)
-    return "updated"
 
 
 def _connection_ids_for_issue(issue, connection_id=None):
@@ -268,14 +274,6 @@ def synchronize_google_calendar_issue(issue_id, connection_id=None):
     return results
 
 
-def _delete_cycle_event(connection, correlation):
-    if connection.calendar_id:
-        client = _client_for(connection)
-        client.delete_event(connection.calendar_id, correlation.google_event_id)
-        _persist_refreshed_access_token(connection, client)
-    correlation.delete(soft=False)
-
-
 @transaction.atomic
 def _synchronize_cycle_for_connection(cycle_id, connection_id):
     try:
@@ -297,7 +295,7 @@ def _synchronize_cycle_for_connection(cycle_id, connection_id):
     except Cycle.DoesNotExist:
         if correlation is None:
             return "missing"
-        _delete_cycle_event(connection, correlation)
+        _delete_provider_event(connection, correlation)
         return "deleted"
 
     recipient_connection_ids = []
@@ -320,68 +318,17 @@ def _synchronize_cycle_for_connection(cycle_id, connection_id):
     if not creatable:
         if correlation is None:
             return "ineligible"
-        _delete_cycle_event(connection, correlation)
+        _delete_provider_event(connection, correlation)
         return "deleted"
 
     payload = build_google_calendar_cycle_event(cycle)
-    payload_hash = google_calendar_payload_hash(payload)
-    if correlation is not None and correlation.payload_hash == payload_hash:
-        return "unchanged"
-
-    client = _client_for(connection)
-    deterministic_event_id = google_calendar_event_id(
-        connection.id,
+    return _converge_provider_event(
+        connection,
         GoogleCalendarEvent.EntityType.CYCLE,
         cycle.id,
+        payload,
+        correlation,
     )
-    if correlation is None:
-        provider_event_id = deterministic_event_id
-        try:
-            client.insert_event(connection.calendar_id, provider_event_id, payload)
-        except GoogleCalendarClientConflict:
-            provider_event_id = _client_event_id_from_recovery(
-                client,
-                connection,
-                cycle,
-                deterministic_event_id,
-            )
-            if provider_event_id is None:
-                client.insert_event(connection.calendar_id, deterministic_event_id, payload)
-                provider_event_id = deterministic_event_id
-            else:
-                client.update_event(connection.calendar_id, provider_event_id, payload)
-        GoogleCalendarEvent.objects.create(
-            connection=connection,
-            entity_type=GoogleCalendarEvent.EntityType.CYCLE,
-            entity_id=cycle.id,
-            google_event_id=provider_event_id,
-            payload_hash=payload_hash,
-            last_synced_at=timezone.now(),
-        )
-        _persist_refreshed_access_token(connection, client)
-        return "created"
-
-    provider_event_id = _client_event_id_from_recovery(
-        client,
-        connection,
-        cycle,
-        correlation.google_event_id,
-    )
-    if provider_event_id is None:
-        try:
-            client.insert_event(connection.calendar_id, deterministic_event_id, payload)
-            provider_event_id = deterministic_event_id
-        except GoogleCalendarClientConflict:
-            provider_event_id = deterministic_event_id
-            client.update_event(connection.calendar_id, provider_event_id, payload)
-    else:
-        client.update_event(connection.calendar_id, provider_event_id, payload)
-    correlation.google_event_id = provider_event_id
-    correlation.payload_hash = payload_hash
-    correlation.last_synced_at = timezone.now()
-    correlation.save(update_fields=["google_event_id", "payload_hash", "last_synced_at", "updated_at"])
-    _persist_refreshed_access_token(connection, client)
-    return "updated"
 
 
 def _connection_ids_for_cycle(cycle, connection_id=None):
