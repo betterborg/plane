@@ -19,6 +19,7 @@ from plane.bgtasks.google_calendar_task import (
     backfill_google_calendar_open_issues,
     reconcile_google_calendar_workspace_issue_resyncs,
     reconcile_google_calendar_connection,
+    resync_google_calendar_state_issues,
     resync_google_calendar_workspace_issues,
     synchronize_google_calendar_issue,
 )
@@ -28,6 +29,7 @@ from plane.integrations.google_calendar.client import GoogleCalendarClient, Goog
 from plane.integrations.google_calendar.dispatch import (
     GOOGLE_CALENDAR_ISSUE_SYNC_TASK,
     GOOGLE_CALENDAR_LIFECYCLE_TASK,
+    GOOGLE_CALENDAR_STATE_ISSUE_RESYNC_TASK,
     GOOGLE_CALENDAR_WORKSPACE_ISSUE_RESYNC_METADATA_KEY,
     GOOGLE_CALENDAR_WORKSPACE_ISSUE_RESYNC_RECONCILIATION_TASK,
     GOOGLE_CALENDAR_WORKSPACE_ISSUE_RESYNC_TASK,
@@ -229,6 +231,115 @@ class TestGoogleCalendarWorkItemTask:
         assert second_sync.args[0].options["countdown"] == 1
         assert continuation.args[0].task == "plane.bgtasks.google_calendar_task.backfill_google_calendar_open_issues"
         assert continuation.args[0].options["countdown"] == 2
+
+    def test_state_resync_dispatches_only_matching_issues_in_keyset_pages(self):
+        state = self.issue.state
+        matching_issues = [
+            self.issue,
+            IssueFactory(project=self.issue.project, state=state),
+            IssueFactory(project=self.issue.project, state=state),
+        ]
+        IssueFactory(project=self.issue.project)
+        expected_ids = sorted((issue.id for issue in matching_issues), key=str)
+
+        with (
+            patch("plane.db.signals.dispatch_google_calendar_issue_sync") as dispatch,
+            patch("plane.bgtasks.google_calendar_task.publish_google_calendar_task") as publish,
+        ):
+            published = resync_google_calendar_state_issues.run(str(state.id), batch_size=2)
+
+        assert published == 2
+        assert [call.args[0] for call in dispatch.call_args_list] == expected_ids[:2]
+        publish.assert_called_once()
+        continuation = publish.call_args
+        assert continuation.args[0].task == GOOGLE_CALENDAR_STATE_ISSUE_RESYNC_TASK
+        assert continuation.args[1:] == (
+            str(state.id),
+            str(expected_ids[1]),
+            2,
+        )
+
+        with (
+            patch("plane.db.signals.dispatch_google_calendar_issue_sync") as dispatch,
+            patch("plane.bgtasks.google_calendar_task.publish_google_calendar_task") as publish,
+        ):
+            published = resync_google_calendar_state_issues.run(
+                str(state.id),
+                after_id=str(expected_ids[1]),
+                batch_size=2,
+            )
+
+        assert published == 1
+        dispatch.assert_called_once_with(expected_ids[2])
+        publish.assert_not_called()
+
+    def test_state_resync_converges_saved_terminal_and_reopened_definitions(self):
+        client = _provider_client()
+        state = self.issue.state
+
+        def synchronize_now(issue_id):
+            return synchronize_google_calendar_issue.run(str(issue_id))
+
+        with (
+            patch("plane.bgtasks.google_calendar_task.GoogleCalendarClient", return_value=client),
+            patch("plane.db.signals.dispatch_google_calendar_issue_sync", side_effect=synchronize_now),
+        ):
+            synchronize_google_calendar_issue.run(str(self.issue.id))
+
+            state.name = "Shipped"
+            state.group = "completed"
+            state.save(update_fields=["name", "group", "updated_at"])
+            completed_result = resync_google_calendar_state_issues.run(str(state.id))
+
+            state.name = "Won't do"
+            state.group = "cancelled"
+            state.save(update_fields=["name", "group", "updated_at"])
+            cancelled_result = resync_google_calendar_state_issues.run(str(state.id))
+
+            state.name = "In progress again"
+            state.group = "started"
+            state.save(update_fields=["name", "group", "updated_at"])
+            reopened_result = resync_google_calendar_state_issues.run(str(state.id))
+
+        assert completed_result == 1
+        assert cancelled_result == 1
+        assert reopened_result == 1
+        completed_payload, cancelled_payload, reopened_payload = [
+            call.args[2] for call in client.update_event.call_args_list[-3:]
+        ]
+        assert completed_payload["summary"].startswith("[Completed]")
+        assert completed_payload["colorId"] == "10"
+        assert "State: Shipped" in completed_payload["description"]
+        assert cancelled_payload["summary"].startswith("[Cancelled]")
+        assert cancelled_payload["colorId"] == "10"
+        assert "State: Won't do" in cancelled_payload["description"]
+        assert reopened_payload["summary"].startswith(f"[{self.issue.project.identifier}-")
+        assert "colorId" not in reopened_payload
+        assert reopened_payload["status"] == "confirmed"
+        assert "State: In progress again" in reopened_payload["description"]
+
+    def test_state_resync_applies_delete_completion_policy_to_saved_group(self):
+        client = _provider_client()
+        state = self.issue.state
+
+        def synchronize_now(issue_id):
+            return synchronize_google_calendar_issue.run(str(issue_id))
+
+        with (
+            patch("plane.bgtasks.google_calendar_task.GoogleCalendarClient", return_value=client),
+            patch("plane.db.signals.dispatch_google_calendar_issue_sync", side_effect=synchronize_now),
+        ):
+            synchronize_google_calendar_issue.run(str(self.issue.id))
+            self.workspace_integration.config["update_on_completion"] = False
+            self.workspace_integration.save(update_fields=["config", "updated_at"])
+            state.group = "completed"
+            state.save(update_fields=["group", "updated_at"])
+
+            published = resync_google_calendar_state_issues.run(str(state.id))
+
+        assert published == 1
+        assert GoogleCalendarEvent.objects.filter(entity_id=self.issue.id).count() == 0
+        client.delete_event.assert_called_once()
 
     def test_workspace_resync_includes_current_and_ledger_only_issue_ids_once(self):
         ledger_only_issue_id = uuid4()

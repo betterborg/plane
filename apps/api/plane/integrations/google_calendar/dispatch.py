@@ -11,6 +11,7 @@ from django.db import transaction
 GOOGLE_CALENDAR_LIFECYCLE_TASK = "plane.bgtasks.google_calendar_task.reconcile_google_calendar_connection"
 GOOGLE_CALENDAR_ISSUE_SYNC_TASK = "plane.bgtasks.google_calendar_task.synchronize_google_calendar_issue"
 GOOGLE_CALENDAR_OPEN_BACKFILL_TASK = "plane.bgtasks.google_calendar_task.backfill_google_calendar_open_issues"
+GOOGLE_CALENDAR_STATE_ISSUE_RESYNC_TASK = "plane.bgtasks.google_calendar_task.resync_google_calendar_state_issues"
 GOOGLE_CALENDAR_WORKSPACE_ISSUE_RESYNC_TASK = (
     "plane.bgtasks.google_calendar_task.resync_google_calendar_workspace_issues"
 )

@@ -8,8 +8,11 @@ from contextvars import ContextVar
 from django.db.models.signals import post_delete, post_save
 from django.dispatch import receiver
 
-from plane.bgtasks.google_calendar_task import synchronize_google_calendar_issue
-from plane.db.models import Issue, IssueAssignee, IssueLabel
+from plane.bgtasks.google_calendar_task import (
+    resync_google_calendar_state_issues,
+    synchronize_google_calendar_issue,
+)
+from plane.db.models import Issue, IssueAssignee, IssueLabel, State
 from plane.integrations.google_calendar.dispatch import enqueue_google_calendar_task_on_commit
 
 
@@ -55,3 +58,11 @@ def dispatch_google_calendar_issue_model_signal(sender, instance, **kwargs):
 def dispatch_google_calendar_issue_relation_signal(sender, instance, **kwargs):
     if not _google_calendar_issue_signal_dispatch_is_suppressed():
         dispatch_google_calendar_issue_sync(instance.issue_id)
+
+
+@receiver(post_save, sender=State, dispatch_uid="google_calendar_state_post_save")
+def dispatch_google_calendar_state_model_signal(sender, instance, created, **kwargs):
+    """Resync issues only when an existing State definition is saved."""
+
+    if not created:
+        enqueue_google_calendar_task_on_commit(resync_google_calendar_state_issues, str(instance.id))

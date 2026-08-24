@@ -20,6 +20,7 @@ from plane.integrations.google_calendar.dispatch import (
     GOOGLE_CALENDAR_ISSUE_SYNC_TASK,
     GOOGLE_CALENDAR_LIFECYCLE_TASK,
     GOOGLE_CALENDAR_OPEN_BACKFILL_TASK,
+    GOOGLE_CALENDAR_STATE_ISSUE_RESYNC_TASK,
     GOOGLE_CALENDAR_WORKSPACE_ISSUE_RESYNC_METADATA_KEY,
     GOOGLE_CALENDAR_WORKSPACE_ISSUE_RESYNC_RECONCILIATION_TASK,
     GOOGLE_CALENDAR_WORKSPACE_ISSUE_RESYNC_TASK,
@@ -286,6 +287,34 @@ def backfill_google_calendar_open_issues(connection_id, after_id=None, batch_siz
             int(batch_size),
         )
     return published
+
+
+@shared_task
+def resync_google_calendar_state_issues(state_id, after_id=None, batch_size=100):
+    """Publish a bounded convergence batch for issues using one saved State."""
+
+    issue_ids = Issue.all_objects.filter(state_id=state_id).order_by("id")
+    if after_id is not None:
+        issue_ids = issue_ids.filter(id__gt=after_id)
+    issue_ids = list(issue_ids.values_list("id", flat=True)[: int(batch_size) + 1])
+    current_batch = issue_ids[: int(batch_size)]
+
+    # Import locally because the signal module owns this shared dispatch boundary
+    # and imports the task definitions while Django initializes receivers.
+    from plane.db.signals import dispatch_google_calendar_issue_sync
+
+    for issue_id in current_batch:
+        dispatch_google_calendar_issue_sync(issue_id)
+
+    if len(issue_ids) > len(current_batch) and current_batch:
+        continuation = current_app.signature(GOOGLE_CALENDAR_STATE_ISSUE_RESYNC_TASK)
+        publish_google_calendar_task(
+            continuation,
+            str(state_id),
+            str(current_batch[-1]),
+            int(batch_size),
+        )
+    return len(current_batch)
 
 
 def _workspace_issue_ids_for_resync(workspace_id, after_id=None):
