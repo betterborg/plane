@@ -234,7 +234,7 @@ class GoogleCalendarWorkspacePolicyEndpoint(BaseAPIView):
                 command.generation,
             )
         enqueue_google_calendar_workspace_policy_resyncs_on_commit(
-            workspace_integration.workspace_id,
+            workspace_integration,
             previous_policy,
             policy,
         )

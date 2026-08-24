@@ -11,6 +11,7 @@ from django.urls import reverse
 from rest_framework import status
 
 from plane.bgtasks.google_calendar_task import (
+    reconcile_google_calendar_workspace_issue_resyncs,
     resync_google_calendar_workspace_issues,
     synchronize_google_calendar_issue,
 )
@@ -22,6 +23,11 @@ from plane.db.models import (
     WorkspaceMember,
 )
 from plane.db.signals import suppress_google_calendar_issue_signal_dispatch
+from plane.integrations.google_calendar.dispatch import (
+    GOOGLE_CALENDAR_ISSUE_SYNC_TASK,
+    GOOGLE_CALENDAR_WORKSPACE_ISSUE_RESYNC_METADATA_KEY,
+    GOOGLE_CALENDAR_WORKSPACE_ISSUE_RESYNC_TASK,
+)
 from plane.tests.factories import (
     GoogleCalendarConnectionFactory,
     IntegrationFactory,
@@ -329,10 +335,13 @@ class TestGoogleCalendarWorkspacePolicy:
         def publish_issue_immediately(task, issue_id):
             synchronize_google_calendar_issue.run(issue_id)
 
-        def resync_after_commit(workspace_id):
+        def resync_after_commit(workspace_id, *, policy_generation):
             workspace_integration.refresh_from_db()
             assert workspace_integration.config["update_on_completion"] is False
-            return resync_google_calendar_workspace_issues.run(workspace_id)
+            return resync_google_calendar_workspace_issues.run(
+                workspace_id,
+                policy_generation=policy_generation,
+            )
 
         workspace_resync_task.delay.side_effect = resync_after_commit
         with (
@@ -344,7 +353,7 @@ class TestGoogleCalendarWorkspacePolicy:
                 return_value=workspace_resync_task,
             ),
             patch(
-                "plane.bgtasks.google_calendar_task.enqueue_google_calendar_task_on_commit",
+                "plane.bgtasks.google_calendar_task.publish_google_calendar_task",
                 side_effect=publish_issue_immediately,
             ),
             patch("plane.bgtasks.google_calendar_task.GoogleCalendarClient", return_value=provider_client),
@@ -356,7 +365,13 @@ class TestGoogleCalendarWorkspacePolicy:
             )
 
         assert response.status_code == status.HTTP_200_OK
-        workspace_resync_task.delay.assert_called_once_with(str(workspace.id))
+        workspace_integration.refresh_from_db()
+        generation = workspace_resync_task.delay.call_args.kwargs["policy_generation"]
+        workspace_resync_task.delay.assert_called_once_with(
+            str(workspace.id),
+            policy_generation=generation,
+        )
+        assert GOOGLE_CALENDAR_WORKSPACE_ISSUE_RESYNC_METADATA_KEY not in workspace_integration.metadata
         assert set(GoogleCalendarEvent.objects.filter(connection=connection).values_list("entity_id", flat=True)) == {
             reopened.id
         }
@@ -413,7 +428,7 @@ class TestGoogleCalendarWorkspacePolicy:
                 return_value=workspace_resync_task,
             ),
             patch(
-                "plane.bgtasks.google_calendar_task.enqueue_google_calendar_task_on_commit",
+                "plane.bgtasks.google_calendar_task.publish_google_calendar_task",
                 side_effect=publish_issue_immediately,
             ),
             patch("plane.bgtasks.google_calendar_task.GoogleCalendarClient", return_value=provider_client),
@@ -431,7 +446,7 @@ class TestGoogleCalendarWorkspacePolicy:
         assert any(summary.startswith("[Cancelled]") for summary in inserted_summaries)
 
     @pytest.mark.django_db(transaction=True)
-    def test_completion_resync_publication_failure_preserves_policy_and_manual_resync_recovers(
+    def test_completion_resync_publication_failure_is_rediscovered_by_reconciliation(
         self,
         session_client,
         workspace,
@@ -484,20 +499,28 @@ class TestGoogleCalendarWorkspacePolicy:
         workspace_integration.refresh_from_db()
         assert workspace_integration.config["update_on_completion"] is False
         assert GoogleCalendarEvent.objects.filter(connection=connection, entity_id=completed.id).exists()
+        assert GOOGLE_CALENDAR_WORKSPACE_ISSUE_RESYNC_METADATA_KEY in workspace_integration.metadata
 
         provider_client = _provider_client()
 
-        def publish_issue_immediately(task, issue_id):
-            synchronize_google_calendar_issue.run(issue_id)
+        def publish_immediately(task, *args, **kwargs):
+            if task.task == GOOGLE_CALENDAR_WORKSPACE_ISSUE_RESYNC_TASK:
+                return resync_google_calendar_workspace_issues.run(*args, **kwargs)
+            if task.task == GOOGLE_CALENDAR_ISSUE_SYNC_TASK:
+                return synchronize_google_calendar_issue.run(*args, **kwargs)
+            raise AssertionError(f"Unexpected reconciliation task: {task.task}")
 
         with (
             patch(
-                "plane.bgtasks.google_calendar_task.enqueue_google_calendar_task_on_commit",
-                side_effect=publish_issue_immediately,
+                "plane.bgtasks.google_calendar_task.publish_google_calendar_task",
+                side_effect=publish_immediately,
             ),
             patch("plane.bgtasks.google_calendar_task.GoogleCalendarClient", return_value=provider_client),
         ):
-            resync_google_calendar_workspace_issues.run(workspace.id)
+            discovered = reconcile_google_calendar_workspace_issue_resyncs.run()
 
+        assert discovered == 1
         assert not GoogleCalendarEvent.objects.filter(connection=connection, entity_id=completed.id).exists()
         provider_client.delete_event.assert_called_once_with(connection.calendar_id, "completed-event")
+        workspace_integration.refresh_from_db()
+        assert GOOGLE_CALENDAR_WORKSPACE_ISSUE_RESYNC_METADATA_KEY not in workspace_integration.metadata

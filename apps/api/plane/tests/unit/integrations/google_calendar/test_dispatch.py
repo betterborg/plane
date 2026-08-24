@@ -9,10 +9,12 @@ import pytest
 from django.db import transaction
 
 from plane.integrations.google_calendar.dispatch import (
+    GOOGLE_CALENDAR_WORKSPACE_ISSUE_RESYNC_METADATA_KEY,
     GOOGLE_CALENDAR_WORKSPACE_ISSUE_RESYNC_TASK,
     enqueue_google_calendar_task_on_commit,
     enqueue_google_calendar_workspace_policy_resyncs_on_commit,
 )
+from plane.tests.factories import WorkspaceIntegrationFactory
 
 
 @pytest.mark.unit
@@ -85,26 +87,43 @@ class TestEnqueueGoogleCalendarTaskOnCommit:
 class TestEnqueueGoogleCalendarWorkspacePolicyResyncsOnCommit:
     def test_completion_change_publishes_workspace_resync_only_after_commit(self):
         task = Mock()
+        workspace_integration = WorkspaceIntegrationFactory(
+            integration__provider="google_calendar",
+            metadata={"existing": "metadata"},
+        )
 
         with patch("plane.integrations.google_calendar.dispatch.current_app.signature", return_value=task) as signature:
             with transaction.atomic():
-                enqueue_google_calendar_workspace_policy_resyncs_on_commit(
-                    "workspace-id",
+                generation = enqueue_google_calendar_workspace_policy_resyncs_on_commit(
+                    workspace_integration,
                     {"update_on_completion": True},
                     {"update_on_completion": False},
                 )
                 task.delay.assert_not_called()
 
-            task.delay.assert_called_once_with("workspace-id")
+            task.delay.assert_called_once_with(
+                str(workspace_integration.workspace_id),
+                policy_generation=generation,
+            )
 
         signature.assert_called_once_with(GOOGLE_CALENDAR_WORKSPACE_ISSUE_RESYNC_TASK)
+        workspace_integration.refresh_from_db()
+        assert workspace_integration.metadata == {
+            "existing": "metadata",
+            GOOGLE_CALENDAR_WORKSPACE_ISSUE_RESYNC_METADATA_KEY: generation,
+        }
 
     def test_unchanged_completion_behavior_does_not_publish(self):
+        workspace_integration = WorkspaceIntegrationFactory(integration__provider="google_calendar")
+
         with patch("plane.integrations.google_calendar.dispatch.current_app.signature") as signature:
-            enqueue_google_calendar_workspace_policy_resyncs_on_commit(
-                "workspace-id",
+            generation = enqueue_google_calendar_workspace_policy_resyncs_on_commit(
+                workspace_integration,
                 {},
                 {"update_on_completion": True},
             )
 
+        assert generation is None
         signature.assert_not_called()
+        workspace_integration.refresh_from_db()
+        assert GOOGLE_CALENDAR_WORKSPACE_ISSUE_RESYNC_METADATA_KEY not in workspace_integration.metadata
