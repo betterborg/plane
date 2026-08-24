@@ -166,6 +166,61 @@ class TestCycleListCreateAPIEndpoint:
         assert cycle.end_date.astimezone(kolkata).date() == date(2035, 2, 5)
 
     @pytest.mark.django_db
+    @pytest.mark.parametrize(
+        ("client_fixture", "api_prefix"),
+        (("session_client", "/api"), ("api_key_client", "/api/v1")),
+    )
+    @pytest.mark.parametrize(
+        ("date_field", "updated_date", "expected_start_date", "expected_end_date"),
+        (
+            ("start_date", "2035-01-11T00:00:00Z", date(2035, 1, 11), date(2035, 1, 12)),
+            ("end_date", "2035-01-13T00:00:00Z", date(2035, 1, 10), date(2035, 1, 13)),
+        ),
+    )
+    def test_one_sided_cycle_date_updates_renormalize_both_boundaries(
+        self,
+        request,
+        client_fixture,
+        api_prefix,
+        date_field,
+        updated_date,
+        expected_start_date,
+        expected_end_date,
+        workspace,
+        project,
+    ):
+        """A new snapshot describes both boundaries after a one-sided date update."""
+        client = request.getfixturevalue(client_fixture)
+        project.timezone = "America/New_York"
+        project.save(update_fields=["timezone"])
+        list_url = f"{api_prefix}/workspaces/{workspace.slug}/projects/{project.id}/cycles/"
+        response = client.post(
+            list_url,
+            {
+                "name": "One-sided timezone update",
+                "start_date": "2035-01-10T00:00:00Z",
+                "end_date": "2035-01-12T00:00:00Z",
+            },
+            format="json",
+        )
+        assert response.status_code == status.HTTP_201_CREATED
+
+        cycle = Cycle.objects.get(name="One-sided timezone update")
+        project.timezone = "Pacific/Honolulu"
+        project.save(update_fields=["timezone"])
+        detail_url = f"{list_url}{cycle.id}/"
+
+        response = client.patch(detail_url, {date_field: updated_date}, format="json")
+
+        assert response.status_code == status.HTTP_200_OK
+        assert response.data["timezone"] == "Pacific/Honolulu"
+        cycle.refresh_from_db()
+        assert cycle.timezone == "Pacific/Honolulu"
+        honolulu = pytz.timezone(cycle.timezone)
+        assert cycle.start_date.astimezone(honolulu).date() == expected_start_date
+        assert cycle.end_date.astimezone(honolulu).date() == expected_end_date
+
+    @pytest.mark.django_db
     def test_create_cycle_invalid_data(self, api_key_client, workspace, project):
         """Test cycle creation with invalid data"""
         url = self.get_cycle_url(workspace.slug, project.id)

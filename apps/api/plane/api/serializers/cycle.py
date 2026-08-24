@@ -9,7 +9,7 @@ from rest_framework import serializers
 # Module imports
 from .base import BaseSerializer
 from plane.db.models import Cycle, CycleIssue, User, Project
-from plane.utils.timezone_converter import convert_to_utc
+from plane.utils.timezone_converter import normalize_cycle_date_fields
 
 
 class CycleCreateSerializer(BaseSerializer):
@@ -78,14 +78,12 @@ class CycleCreateSerializer(BaseSerializer):
         dates_changed = any(field in data for field in date_fields)
 
         if self.instance is None or dates_changed:
-            for field, is_start_date in (("start_date", True), ("end_date", False)):
-                if field in data and data[field] is not None:
-                    data[field] = convert_to_utc(
-                        date=str(data[field].date()),
-                        project_id=project_id,
-                        is_start_date=is_start_date,
-                        project_timezone=project.timezone,
-                    )
+            normalize_cycle_date_fields(
+                data=data,
+                instance=self.instance,
+                project_id=project_id,
+                project_timezone=project.timezone,
+            )
             data["timezone"] = project.timezone
 
         start_date = data.get("start_date", self.instance.start_date if self.instance else None)

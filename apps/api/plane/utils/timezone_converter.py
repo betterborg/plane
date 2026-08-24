@@ -98,6 +98,29 @@ def convert_to_utc(date, project_id, is_start_date=False, project_timezone=None)
         return utc_datetime
 
 
+def normalize_cycle_date_fields(data, instance, project_id, project_timezone):
+    """Normalize changed and retained cycle boundaries under one timezone snapshot."""
+    previous_timezone = pytz.timezone(instance.timezone) if instance else None
+
+    for field, is_start_date in (("start_date", True), ("end_date", False)):
+        if field in data:
+            boundary = data[field]
+        elif instance:
+            boundary = getattr(instance, field)
+            if boundary is not None:
+                boundary = boundary.astimezone(previous_timezone)
+        else:
+            continue
+
+        if boundary is not None:
+            data[field] = convert_to_utc(
+                date=str(boundary.date()),
+                project_id=project_id,
+                is_start_date=is_start_date,
+                project_timezone=project_timezone,
+            )
+
+
 def convert_utc_to_project_timezone(utc_datetime, project_id):
     """
     Converts a UTC datetime (stored in the database) to the project's local timezone.
