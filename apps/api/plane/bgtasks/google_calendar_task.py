@@ -1990,7 +1990,7 @@ def _account_has_other_token_bearing_connection(connection):
     if not connection.provider_account_id:
         return False
     return (
-        GoogleCalendarConnection.objects.select_for_update()
+        GoogleCalendarConnection.all_objects.select_for_update()
         .filter(provider_account_id=connection.provider_account_id)
         .exclude(id=connection.id)
         .filter(Q(access_token__gt="") | Q(refresh_token__gt=""))
@@ -2233,7 +2233,7 @@ def _complete_absent(connection, generation):
     except (GoogleCalendarClientError, GoogleCalendarOAuthConfigurationError) as exc:
         return _record_cleanup_error(connection, generation, exc)
 
-    GoogleCalendarEvent.objects.filter(connection=connection).delete(soft=False)
+    GoogleCalendarEvent.all_objects.filter(connection=connection).delete()
 
     retain_grant = connection.retain_grant_after_cleanup
     if not retain_grant and not _account_has_other_token_bearing_connection(connection):

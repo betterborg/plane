@@ -505,8 +505,10 @@ class TestScheduleGoogleCalendarReconciliations:
             lifecycle_generation=11,
             retain_grant_after_cleanup=False,
         )
+        deleted_correlation = GoogleCalendarEventFactory(connection=disconnect)
         deleted_at = timezone.now()
         GoogleCalendarConnection.all_objects.filter(id__in=[absent.id, disconnect.id]).update(deleted_at=deleted_at)
+        GoogleCalendarEvent.all_objects.filter(id=deleted_correlation.id).update(deleted_at=deleted_at)
         for workspace_integration in (absent_integration, disconnect_integration):
             WorkspaceIntegration.all_objects.filter(id=workspace_integration.id).update(deleted_at=deleted_at)
 
@@ -560,10 +562,47 @@ class TestScheduleGoogleCalendarReconciliations:
         assert recovered_absent.refresh_token
         assert recovered_disconnect.status == GoogleCalendarConnection.Status.DISCONNECTED
         assert recovered_disconnect.refresh_token == ""
+        assert not GoogleCalendarEvent.all_objects.filter(id=deleted_correlation.id).exists()
         absent_client.delete_calendar.assert_called_once_with("absent-calendar")
         absent_client.revoke_grant.assert_not_called()
         disconnect_client.delete_calendar.assert_called_once_with("disconnect-calendar")
         disconnect_client.revoke_grant.assert_called_once_with()
+
+    def test_recovered_cleanup_preserves_grant_for_soft_deleted_token_bearing_sibling(self):
+        disconnect = GoogleCalendarConnectionFactory(
+            workspace_integration=_enabled_calendar_integration(),
+            provider_account_id="shared-google-account",
+            pending_cleanup=True,
+            calendar_id="disconnect-calendar",
+            lifecycle_generation=3,
+            retain_grant_after_cleanup=False,
+        )
+        sibling = GoogleCalendarConnectionFactory(
+            workspace_integration=_enabled_calendar_integration(),
+            provider_account_id="shared-google-account",
+            pending_cleanup=True,
+            calendar_id="sibling-calendar",
+            lifecycle_generation=5,
+            retain_grant_after_cleanup=False,
+        )
+        deleted_at = timezone.now()
+        GoogleCalendarConnection.all_objects.filter(id__in=[disconnect.id, sibling.id]).update(deleted_at=deleted_at)
+        WorkspaceIntegration.all_objects.filter(
+            id__in=[disconnect.workspace_integration_id, sibling.workspace_integration_id]
+        ).update(deleted_at=deleted_at)
+        client = Mock(access_token=None)
+
+        with (
+            patch("plane.integrations.google_calendar.lifecycle._acquire_advisory_xact_lock"),
+            patch("plane.bgtasks.google_calendar_task.GoogleCalendarClient", return_value=client),
+        ):
+            assert reconcile_google_calendar_connection.run(str(disconnect.id), 3) == "disconnected"
+
+        recovered_sibling = GoogleCalendarConnection.all_objects.get(id=sibling.id)
+        assert recovered_sibling.status == GoogleCalendarConnection.Status.CLEANUP_PENDING
+        assert recovered_sibling.refresh_token
+        client.delete_calendar.assert_called_once_with("disconnect-calendar")
+        client.revoke_grant.assert_not_called()
 
     @freeze_time("2026-08-24 12:00:00")
     def test_cleanup_recovery_excludes_terminal_attempt_and_soft_deleted_present_state(self):
