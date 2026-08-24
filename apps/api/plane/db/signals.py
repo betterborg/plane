@@ -11,9 +11,10 @@ from django.dispatch import receiver
 from plane.bgtasks.google_calendar_task import (
     resync_google_calendar_label,
     resync_google_calendar_state_issues,
+    synchronize_google_calendar_cycle,
     synchronize_google_calendar_issue,
 )
-from plane.db.models import Issue, IssueAssignee, IssueLabel, Label, State
+from plane.db.models import Cycle, CycleIssue, Issue, IssueAssignee, IssueLabel, Label, State
 from plane.integrations.google_calendar.dispatch import enqueue_google_calendar_task_on_commit
 
 
@@ -36,9 +37,18 @@ def suppress_google_calendar_issue_signal_dispatch():
 
 
 def dispatch_google_calendar_issue_sync(issue_id):
-    """Enqueue convergence for one issue after the current transaction commits."""
+    """Enqueue convergence for one issue and its current cycle after commit."""
 
     enqueue_google_calendar_task_on_commit(synchronize_google_calendar_issue, str(issue_id))
+    cycle_id = CycleIssue.objects.filter(issue_id=issue_id).values_list("cycle_id", flat=True).first()
+    if cycle_id is not None:
+        dispatch_google_calendar_cycle_sync(cycle_id)
+
+
+def dispatch_google_calendar_cycle_sync(cycle_id):
+    """Enqueue convergence for one cycle after the current transaction commits."""
+
+    enqueue_google_calendar_task_on_commit(synchronize_google_calendar_cycle, str(cycle_id))
 
 
 def _google_calendar_issue_signal_dispatch_is_suppressed():
@@ -75,3 +85,12 @@ def dispatch_google_calendar_label_model_signal(sender, instance, created, **kwa
 
     if not created:
         enqueue_google_calendar_task_on_commit(resync_google_calendar_label, str(instance.id))
+
+
+@receiver(post_save, sender=Cycle, dispatch_uid="google_calendar_cycle_post_save")
+@receiver(post_delete, sender=Cycle, dispatch_uid="google_calendar_cycle_post_delete")
+def dispatch_google_calendar_cycle_model_signal(sender, instance, **kwargs):
+    """Converge an existing cycle after a lifecycle mutation is durable."""
+
+    if not kwargs.get("created", False):
+        dispatch_google_calendar_cycle_sync(instance.id)
