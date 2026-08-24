@@ -16,6 +16,7 @@ from django.utils import timezone
 # Module imports
 from plane.bgtasks.issue_activities_task import issue_activity
 from plane.db.models import Issue, Project, State
+from plane.db.signals import dispatch_google_calendar_issue_sync
 from plane.utils.exception_logger import log_exception
 
 
@@ -66,6 +67,8 @@ def archive_old_issues():
                 # Bulk Update the issues and log the activity
                 if issues_to_update:
                     Issue.objects.bulk_update(issues_to_update, ["archived_at"], batch_size=100)
+                    for issue in issues_to_update:
+                        dispatch_google_calendar_issue_sync(issue.id)
                     _ = [
                         issue_activity.delay(
                             type="issue.activity.updated",
@@ -129,6 +132,8 @@ def close_old_issues():
                 # Bulk Update the issues and log the activity
                 if issues_to_update:
                     Issue.objects.bulk_update(issues_to_update, ["state"], batch_size=100)
+                    for issue in issues_to_update:
+                        dispatch_google_calendar_issue_sync(issue.id)
                     [
                         issue_activity.delay(
                             type="issue.activity.updated",
