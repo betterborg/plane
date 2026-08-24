@@ -6,8 +6,10 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 from threading import Barrier, Event, current_thread, main_thread
 from unittest.mock import Mock, patch
+from uuid import uuid4
 
 import pytest
+from celery.exceptions import Retry
 from django.db import close_old_connections
 from django.utils import timezone
 
@@ -15,11 +17,21 @@ from plane.bgtasks.google_calendar_task import (
     _connection_ids_for_issue,
     _synchronize_issue_for_connection,
     backfill_google_calendar_open_issues,
+    reconcile_google_calendar_workspace_issue_resyncs,
     reconcile_google_calendar_connection,
+    resync_google_calendar_workspace_issues,
     synchronize_google_calendar_issue,
 )
+from plane.celery import app as celery_app
 from plane.db.models import GoogleCalendarEvent
 from plane.integrations.google_calendar.client import GoogleCalendarClient, GoogleCalendarClientConflict
+from plane.integrations.google_calendar.dispatch import (
+    GOOGLE_CALENDAR_ISSUE_SYNC_TASK,
+    GOOGLE_CALENDAR_LIFECYCLE_TASK,
+    GOOGLE_CALENDAR_WORKSPACE_ISSUE_RESYNC_METADATA_KEY,
+    GOOGLE_CALENDAR_WORKSPACE_ISSUE_RESYNC_RECONCILIATION_TASK,
+    GOOGLE_CALENDAR_WORKSPACE_ISSUE_RESYNC_TASK,
+)
 from plane.integrations.google_calendar.lifecycle import (
     request_google_calendar_workspace_policy_disable,
     request_google_calendar_workspace_policy_enable,
@@ -52,7 +64,8 @@ def calendar_app_base_url(settings):
 class TestGoogleCalendarWorkItemTask:
     def setup_method(self):
         self.workspace_integration = WorkspaceIntegrationFactory(
-            config={"enabled": True, "mode": "assignment", "update_on_completion": True}
+            integration__provider="google_calendar",
+            config={"enabled": True, "mode": "assignment", "update_on_completion": True},
         )
         self.issue = IssueFactory(project__workspace=self.workspace_integration.workspace)
         self.connection = GoogleCalendarConnectionFactory(
@@ -217,6 +230,158 @@ class TestGoogleCalendarWorkItemTask:
         assert continuation.args[0].task == "plane.bgtasks.google_calendar_task.backfill_google_calendar_open_issues"
         assert continuation.args[0].options["countdown"] == 2
 
+    def test_workspace_resync_includes_current_and_ledger_only_issue_ids_once(self):
+        ledger_only_issue_id = uuid4()
+        GoogleCalendarEvent.objects.create(
+            connection=self.connection,
+            entity_type=GoogleCalendarEvent.EntityType.WORK_ITEM,
+            entity_id=self.issue.id,
+            google_event_id="current-issue-event",
+            payload_hash="current-issue-payload",
+        )
+        GoogleCalendarEvent.objects.create(
+            connection=self.connection,
+            entity_type=GoogleCalendarEvent.EntityType.WORK_ITEM,
+            entity_id=ledger_only_issue_id,
+            google_event_id="ledger-only-event",
+            payload_hash="ledger-only-payload",
+        )
+        IssueFactory()
+
+        with patch("plane.bgtasks.google_calendar_task.publish_google_calendar_task") as publish:
+            published = resync_google_calendar_workspace_issues.run(self.workspace_integration.workspace_id)
+
+        assert published == 2
+        assert {call.args[1] for call in publish.call_args_list} == {
+            str(self.issue.id),
+            str(ledger_only_issue_id),
+        }
+        assert all(
+            call.args[0].task == "plane.bgtasks.google_calendar_task.synchronize_google_calendar_issue"
+            for call in publish.call_args_list
+        )
+
+    def test_workspace_resync_paces_pages(self):
+        second_issue = IssueFactory(project=self.issue.project)
+        third_issue = IssueFactory(project=self.issue.project)
+
+        with patch("plane.bgtasks.google_calendar_task.publish_google_calendar_task") as publish:
+            published = resync_google_calendar_workspace_issues.run(
+                self.workspace_integration.workspace_id,
+                batch_size=2,
+            )
+
+        assert published == 2
+        assert publish.call_count == 3
+        first_sync, second_sync, continuation = publish.call_args_list
+        assert {first_sync.args[1], second_sync.args[1]} < {
+            str(self.issue.id),
+            str(second_issue.id),
+            str(third_issue.id),
+        }
+        assert first_sync.args[0].options["countdown"] == 0
+        assert second_sync.args[0].options["countdown"] == 1
+        assert continuation.args[0].task == (
+            "plane.bgtasks.google_calendar_task.resync_google_calendar_workspace_issues"
+        )
+        assert continuation.args[0].options["countdown"] == 2
+        assert continuation.args[1] == str(self.workspace_integration.workspace_id)
+        assert continuation.args[3] == 2
+
+    def test_workspace_resync_clears_only_its_durable_generation_after_final_publication(self):
+        generation = str(uuid4())
+        self.workspace_integration.metadata = {
+            "existing": "metadata",
+            GOOGLE_CALENDAR_WORKSPACE_ISSUE_RESYNC_METADATA_KEY: generation,
+        }
+        self.workspace_integration.save(update_fields=["metadata", "updated_at"])
+
+        with patch("plane.bgtasks.google_calendar_task.publish_google_calendar_task") as publish:
+            published = resync_google_calendar_workspace_issues.run(
+                self.workspace_integration.workspace_id,
+                policy_generation=generation,
+            )
+
+        assert published == 1
+        assert publish.call_args.args[0].task == GOOGLE_CALENDAR_ISSUE_SYNC_TASK
+        self.workspace_integration.refresh_from_db()
+        assert self.workspace_integration.metadata == {"existing": "metadata"}
+
+    def test_workspace_resync_keeps_durable_generation_when_child_publication_fails(self):
+        generation = str(uuid4())
+        self.workspace_integration.metadata = {
+            GOOGLE_CALENDAR_WORKSPACE_ISSUE_RESYNC_METADATA_KEY: generation,
+        }
+        self.workspace_integration.save(update_fields=["metadata", "updated_at"])
+
+        with (
+            patch(
+                "plane.bgtasks.google_calendar_task.publish_google_calendar_task",
+                side_effect=RuntimeError("broker unavailable"),
+            ),
+            patch.object(resync_google_calendar_workspace_issues, "retry", side_effect=Retry()) as retry,
+            pytest.raises(Retry),
+        ):
+            resync_google_calendar_workspace_issues.run(
+                self.workspace_integration.workspace_id,
+                policy_generation=generation,
+            )
+
+        retry.assert_called_once()
+        self.workspace_integration.refresh_from_db()
+        assert self.workspace_integration.metadata[GOOGLE_CALENDAR_WORKSPACE_ISSUE_RESYNC_METADATA_KEY] == generation
+
+    def test_reconciliation_rediscovers_durable_workspace_resync(self):
+        generation = str(uuid4())
+        self.workspace_integration.metadata = {
+            GOOGLE_CALENDAR_WORKSPACE_ISSUE_RESYNC_METADATA_KEY: generation,
+        }
+        self.workspace_integration.save(update_fields=["metadata", "updated_at"])
+
+        with patch("plane.bgtasks.google_calendar_task.publish_google_calendar_task") as publish:
+            discovered = reconcile_google_calendar_workspace_issue_resyncs.run()
+
+        assert discovered == 1
+        task, workspace_id = publish.call_args.args
+        assert task.task == GOOGLE_CALENDAR_WORKSPACE_ISSUE_RESYNC_TASK
+        assert workspace_id == str(self.workspace_integration.workspace_id)
+        assert publish.call_args.kwargs == {"policy_generation": generation}
+
+    def test_reconciliation_republishes_pending_lifecycle_before_workspace_resync(self):
+        generation = str(uuid4())
+        self.workspace_integration.metadata = {
+            GOOGLE_CALENDAR_WORKSPACE_ISSUE_RESYNC_METADATA_KEY: generation,
+        }
+        self.workspace_integration.save(update_fields=["metadata", "updated_at"])
+        self.connection.status = "pending"
+        self.connection.lifecycle_generation = 4
+        self.connection.save(update_fields=["status", "lifecycle_generation", "updated_at"])
+
+        with patch("plane.bgtasks.google_calendar_task.publish_google_calendar_task") as publish:
+            discovered = reconcile_google_calendar_workspace_issue_resyncs.run()
+
+        assert discovered == 1
+        lifecycle_call, resync_call = publish.call_args_list
+        assert lifecycle_call.args[0].task == GOOGLE_CALENDAR_LIFECYCLE_TASK
+        assert lifecycle_call.args[1:] == (str(self.connection.id), 4)
+        assert resync_call.args[0].task == GOOGLE_CALENDAR_WORKSPACE_ISSUE_RESYNC_TASK
+        assert resync_call.args[1] == str(self.workspace_integration.workspace_id)
+        assert resync_call.kwargs == {"policy_generation": generation}
+
+    def test_workspace_resync_waits_for_policy_lifecycle_reconciliation(self):
+        self.connection.status = "pending"
+        self.connection.save(update_fields=["status", "updated_at"])
+
+        with (
+            patch.object(resync_google_calendar_workspace_issues, "retry", side_effect=Retry()) as retry,
+            patch("plane.bgtasks.google_calendar_task.publish_google_calendar_task") as publish,
+            pytest.raises(Retry),
+        ):
+            resync_google_calendar_workspace_issues.run(self.workspace_integration.workspace_id)
+
+        retry.assert_called_once_with(countdown=5)
+        publish.assert_not_called()
+
     def test_successful_initial_provisioning_enqueues_open_item_backfill(self):
         connection = GoogleCalendarConnectionFactory(
             workspace_integration=self.workspace_integration,
@@ -282,6 +447,13 @@ class TestGoogleCalendarWorkItemTask:
         assert result == "disabled"
         assert GoogleCalendarEvent.objects.filter(entity_id=self.issue.id).count() == 0
         client.delete_calendar.assert_called_once_with(self.connection.calendar_id)
+
+
+@pytest.mark.unit
+def test_workspace_resync_reconciliation_has_a_periodic_production_entrypoint():
+    schedule = celery_app.conf.beat_schedule["reconcile-google-calendar-workspace-issue-resyncs"]
+
+    assert schedule["task"] == GOOGLE_CALENDAR_WORKSPACE_ISSUE_RESYNC_RECONCILIATION_TASK
 
 
 @pytest.mark.unit

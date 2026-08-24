@@ -24,6 +24,7 @@ from plane.db.models import GoogleCalendarConnection, Integration, Workspace, Wo
 from plane.integrations.google_calendar.dispatch import (
     GOOGLE_CALENDAR_LIFECYCLE_TASK,
     enqueue_google_calendar_task_on_commit,
+    enqueue_google_calendar_workspace_policy_resyncs_on_commit,
 )
 from plane.integrations.google_calendar.lifecycle import (
     GoogleCalendarDisableCleanupInProgress,
@@ -206,6 +207,7 @@ class GoogleCalendarWorkspacePolicyEndpoint(BaseAPIView):
         )
         lock_google_calendar_workspace_connections(workspace.id)
         workspace_integration = WorkspaceIntegration.objects.select_for_update().get(id=workspace_integration.id)
+        previous_policy = dict(workspace_integration.config or {})
         was_enabled = bool(workspace_integration.config.get("enabled", False))
         try:
             if policy["enabled"] and not was_enabled:
@@ -231,4 +233,9 @@ class GoogleCalendarWorkspacePolicyEndpoint(BaseAPIView):
                 str(command.connection_id),
                 command.generation,
             )
+        enqueue_google_calendar_workspace_policy_resyncs_on_commit(
+            workspace_integration,
+            previous_policy,
+            policy,
+        )
         return Response(serializer.data, status=status.HTTP_200_OK)

@@ -10,10 +10,35 @@ from django.test import override_settings
 from django.urls import reverse
 from rest_framework import status
 
-from plane.db.models import GoogleCalendarConnection, Label, WorkspaceIntegration, WorkspaceMember
+from plane.bgtasks.google_calendar_task import (
+    backfill_google_calendar_open_issues,
+    reconcile_google_calendar_connection,
+    reconcile_google_calendar_workspace_issue_resyncs,
+    resync_google_calendar_workspace_issues,
+    synchronize_google_calendar_issue,
+)
+from plane.db.models import (
+    GoogleCalendarConnection,
+    GoogleCalendarEvent,
+    Label,
+    WorkspaceIntegration,
+    WorkspaceMember,
+)
+from plane.db.signals import suppress_google_calendar_issue_signal_dispatch
+from plane.integrations.google_calendar.dispatch import (
+    GOOGLE_CALENDAR_ISSUE_SYNC_TASK,
+    GOOGLE_CALENDAR_LIFECYCLE_TASK,
+    GOOGLE_CALENDAR_OPEN_BACKFILL_TASK,
+    GOOGLE_CALENDAR_WORKSPACE_ISSUE_RESYNC_METADATA_KEY,
+    GOOGLE_CALENDAR_WORKSPACE_ISSUE_RESYNC_TASK,
+)
 from plane.tests.factories import (
     GoogleCalendarConnectionFactory,
     IntegrationFactory,
+    IssueAssigneeFactory,
+    IssueFactory,
+    ProjectFactory,
+    StateFactory,
     WorkspaceFactory,
     WorkspaceIntegrationFactory,
 )
@@ -26,6 +51,14 @@ def calendar_integration(db):
 
 def _policy_url(workspace):
     return reverse("google-calendar-workspace-policy", kwargs={"slug": workspace.slug})
+
+
+def _provider_client():
+    client = Mock()
+    client.access_token = None
+    client.get_event.return_value = {"id": "existing-event"}
+    client.list_events.return_value = []
+    return client
 
 
 @pytest.mark.contract
@@ -262,3 +295,248 @@ class TestGoogleCalendarWorkspacePolicy:
         assert connection.status == GoogleCalendarConnection.Status.PENDING
         assert connection.lifecycle_generation == 5
         lifecycle_task.delay.assert_called_once_with(str(connection.id), 5)
+
+    @pytest.mark.django_db(transaction=True)
+    def test_completion_policy_update_resyncs_terminal_and_reopened_events_after_commit(
+        self,
+        session_client,
+        workspace,
+        create_user,
+        calendar_integration,
+    ):
+        workspace_integration = WorkspaceIntegrationFactory(
+            workspace=workspace,
+            integration=calendar_integration,
+            config={"enabled": True, "mode": "assignment", "update_on_completion": True},
+        )
+        connection = GoogleCalendarConnectionFactory(
+            workspace_integration=workspace_integration,
+            member=create_user,
+            active=True,
+        )
+        project = ProjectFactory(workspace=workspace)
+        completed_state = StateFactory(project=project, group="completed", name="Done")
+        cancelled_state = StateFactory(project=project, group="cancelled", name="Cancelled")
+        reopened_state = StateFactory(project=project, group="started", name="In progress")
+        with suppress_google_calendar_issue_signal_dispatch():
+            completed = IssueFactory(project=project, state=completed_state)
+            cancelled = IssueFactory(project=project, state=cancelled_state)
+            reopened = IssueFactory(project=project, state=reopened_state)
+            for issue in (completed, cancelled, reopened):
+                IssueAssigneeFactory(issue=issue, assignee=create_user, project=project)
+        for index, issue in enumerate((completed, cancelled, reopened)):
+            GoogleCalendarEvent.objects.create(
+                connection=connection,
+                entity_type=GoogleCalendarEvent.EntityType.WORK_ITEM,
+                entity_id=issue.id,
+                google_event_id=f"existing-event-{index}",
+                payload_hash=f"stale-payload-{index}",
+            )
+
+        provider_client = _provider_client()
+        workspace_resync_task = Mock()
+
+        def publish_issue_immediately(task, issue_id):
+            synchronize_google_calendar_issue.run(issue_id)
+
+        def resync_after_commit(workspace_id, *, policy_generation):
+            workspace_integration.refresh_from_db()
+            assert workspace_integration.config["update_on_completion"] is False
+            return resync_google_calendar_workspace_issues.run(
+                workspace_id,
+                policy_generation=policy_generation,
+            )
+
+        workspace_resync_task.delay.side_effect = resync_after_commit
+        with (
+            override_settings(GOOGLE_CALENDAR_RELEASED=True),
+            patch("plane.app.views.integration._has_complete_google_calendar_credentials", return_value=True),
+            patch("plane.app.views.integration.request_google_calendar_workspace_reconciliation", return_value=[]),
+            patch(
+                "plane.integrations.google_calendar.dispatch.current_app.signature",
+                return_value=workspace_resync_task,
+            ),
+            patch(
+                "plane.bgtasks.google_calendar_task.publish_google_calendar_task",
+                side_effect=publish_issue_immediately,
+            ),
+            patch("plane.bgtasks.google_calendar_task.GoogleCalendarClient", return_value=provider_client),
+        ):
+            response = session_client.patch(
+                _policy_url(workspace),
+                {"enabled": True, "update_on_completion": False},
+                format="json",
+            )
+
+        assert response.status_code == status.HTTP_200_OK
+        workspace_integration.refresh_from_db()
+        generation = workspace_resync_task.delay.call_args.kwargs["policy_generation"]
+        workspace_resync_task.delay.assert_called_once_with(
+            str(workspace.id),
+            policy_generation=generation,
+        )
+        assert GOOGLE_CALENDAR_WORKSPACE_ISSUE_RESYNC_METADATA_KEY not in workspace_integration.metadata
+        assert set(GoogleCalendarEvent.objects.filter(connection=connection).values_list("entity_id", flat=True)) == {
+            reopened.id
+        }
+        assert provider_client.delete_event.call_count == 2
+        reopened_payload = provider_client.update_event.call_args.args[2]
+        assert reopened_payload["summary"].startswith(f"[{project.identifier}-")
+        assert "colorId" not in reopened_payload
+        assert reopened_payload["status"] == "confirmed"
+
+    @pytest.mark.django_db(transaction=True)
+    def test_completion_policy_delete_to_update_restores_terminal_events(
+        self,
+        session_client,
+        workspace,
+        create_user,
+        calendar_integration,
+    ):
+        workspace_integration = WorkspaceIntegrationFactory(
+            workspace=workspace,
+            integration=calendar_integration,
+            config={"enabled": True, "mode": "assignment", "update_on_completion": False},
+        )
+        connection = GoogleCalendarConnectionFactory(
+            workspace_integration=workspace_integration,
+            member=create_user,
+            active=True,
+        )
+        project = ProjectFactory(workspace=workspace)
+        with suppress_google_calendar_issue_signal_dispatch():
+            completed = IssueFactory(
+                project=project,
+                state=StateFactory(project=project, group="completed", name="Done"),
+            )
+            cancelled = IssueFactory(
+                project=project,
+                state=StateFactory(project=project, group="cancelled", name="Cancelled"),
+            )
+            for issue in (completed, cancelled):
+                IssueAssigneeFactory(issue=issue, assignee=create_user, project=project)
+
+        provider_client = _provider_client()
+        workspace_resync_task = Mock()
+        workspace_resync_task.delay.side_effect = resync_google_calendar_workspace_issues.run
+
+        def publish_issue_immediately(task, issue_id):
+            synchronize_google_calendar_issue.run(issue_id)
+
+        with (
+            override_settings(GOOGLE_CALENDAR_RELEASED=True),
+            patch("plane.app.views.integration._has_complete_google_calendar_credentials", return_value=True),
+            patch("plane.app.views.integration.request_google_calendar_workspace_reconciliation", return_value=[]),
+            patch(
+                "plane.integrations.google_calendar.dispatch.current_app.signature",
+                return_value=workspace_resync_task,
+            ),
+            patch(
+                "plane.bgtasks.google_calendar_task.publish_google_calendar_task",
+                side_effect=publish_issue_immediately,
+            ),
+            patch("plane.bgtasks.google_calendar_task.GoogleCalendarClient", return_value=provider_client),
+        ):
+            response = session_client.patch(
+                _policy_url(workspace),
+                {"enabled": True, "update_on_completion": True},
+                format="json",
+            )
+
+        assert response.status_code == status.HTTP_200_OK
+        assert GoogleCalendarEvent.objects.filter(connection=connection).count() == 2
+        inserted_summaries = {call.args[2]["summary"] for call in provider_client.insert_event.call_args_list}
+        assert any(summary.startswith("[Completed]") for summary in inserted_summaries)
+        assert any(summary.startswith("[Cancelled]") for summary in inserted_summaries)
+
+    @pytest.mark.django_db(transaction=True)
+    def test_completion_resync_publication_failure_is_rediscovered_by_reconciliation(
+        self,
+        session_client,
+        workspace,
+        create_user,
+        calendar_integration,
+    ):
+        workspace_integration = WorkspaceIntegrationFactory(
+            workspace=workspace,
+            integration=calendar_integration,
+            config={"enabled": True, "mode": "assignment", "update_on_completion": True},
+        )
+        connection = GoogleCalendarConnectionFactory(
+            workspace_integration=workspace_integration,
+            member=create_user,
+            active=True,
+        )
+        project = ProjectFactory(workspace=workspace)
+        with suppress_google_calendar_issue_signal_dispatch():
+            completed = IssueFactory(
+                project=project,
+                state=StateFactory(project=project, group="completed", name="Done"),
+            )
+            IssueAssigneeFactory(issue=completed, assignee=create_user, project=project)
+        GoogleCalendarEvent.objects.create(
+            connection=connection,
+            entity_type=GoogleCalendarEvent.EntityType.WORK_ITEM,
+            entity_id=completed.id,
+            google_event_id="completed-event",
+            payload_hash="completed-payload",
+        )
+        with (
+            override_settings(GOOGLE_CALENDAR_RELEASED=True),
+            patch("plane.app.views.integration._has_complete_google_calendar_credentials", return_value=True),
+            patch("plane.integrations.google_calendar.lifecycle._acquire_advisory_xact_lock"),
+            patch(
+                "plane.integrations.google_calendar.dispatch.publish_google_calendar_task",
+                side_effect=RuntimeError("broker unavailable"),
+            ) as failed_publish,
+        ):
+            response = session_client.patch(
+                _policy_url(workspace),
+                {"enabled": True, "update_on_completion": False},
+                format="json",
+            )
+
+        assert response.status_code == status.HTTP_200_OK
+        workspace_integration.refresh_from_db()
+        connection.refresh_from_db()
+        assert workspace_integration.config["update_on_completion"] is False
+        assert connection.status == GoogleCalendarConnection.Status.PENDING
+        assert connection.lifecycle_generation == 2
+        assert GoogleCalendarEvent.objects.filter(connection=connection, entity_id=completed.id).exists()
+        assert GOOGLE_CALENDAR_WORKSPACE_ISSUE_RESYNC_METADATA_KEY in workspace_integration.metadata
+        assert failed_publish.call_count == 2
+        assert [publication.args[0].task for publication in failed_publish.call_args_list] == [
+            GOOGLE_CALENDAR_LIFECYCLE_TASK,
+            GOOGLE_CALENDAR_WORKSPACE_ISSUE_RESYNC_TASK,
+        ]
+
+        provider_client = _provider_client()
+
+        def publish_immediately(task, *args, **kwargs):
+            if task.task == GOOGLE_CALENDAR_LIFECYCLE_TASK:
+                return reconcile_google_calendar_connection.run(*args, **kwargs)
+            if task.task == GOOGLE_CALENDAR_OPEN_BACKFILL_TASK:
+                return backfill_google_calendar_open_issues.run(*args, **kwargs)
+            if task.task == GOOGLE_CALENDAR_WORKSPACE_ISSUE_RESYNC_TASK:
+                return resync_google_calendar_workspace_issues.run(*args, **kwargs)
+            if task.task == GOOGLE_CALENDAR_ISSUE_SYNC_TASK:
+                return synchronize_google_calendar_issue.run(*args, **kwargs)
+            raise AssertionError(f"Unexpected reconciliation task: {task.task}")
+
+        with (
+            patch("plane.integrations.google_calendar.lifecycle._acquire_advisory_xact_lock"),
+            patch(
+                "plane.bgtasks.google_calendar_task.publish_google_calendar_task",
+                side_effect=publish_immediately,
+            ),
+            patch("plane.bgtasks.google_calendar_task.GoogleCalendarClient", return_value=provider_client),
+        ):
+            discovered = reconcile_google_calendar_workspace_issue_resyncs.run()
+
+        assert discovered == 1
+        connection.refresh_from_db()
+        assert connection.status == GoogleCalendarConnection.Status.ACTIVE
+        assert not GoogleCalendarEvent.objects.filter(connection=connection, entity_id=completed.id).exists()
+        provider_client.delete_event.assert_called_once_with(connection.calendar_id, "completed-event")
+        workspace_integration.refresh_from_db()
+        assert GOOGLE_CALENDAR_WORKSPACE_ISSUE_RESYNC_METADATA_KEY not in workspace_integration.metadata
