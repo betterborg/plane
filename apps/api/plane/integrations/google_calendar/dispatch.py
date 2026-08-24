@@ -19,6 +19,35 @@ GOOGLE_CALENDAR_WORKSPACE_ISSUE_RESYNC_RECONCILIATION_TASK = (
     "plane.bgtasks.google_calendar_task.reconcile_google_calendar_workspace_issue_resyncs"
 )
 GOOGLE_CALENDAR_WORKSPACE_ISSUE_RESYNC_METADATA_KEY = "google_calendar_workspace_issue_resync"
+_GOOGLE_CALENDAR_WORKSPACE_POLICY_RESYNC_FIELDS = (
+    "update_on_completion",
+    "mode",
+    "priorities",
+    "label_ids",
+    "label_match",
+)
+
+
+def _workspace_policy_resync_value(policy, field):
+    if field == "update_on_completion":
+        return policy.get(field, True)
+    if field == "mode":
+        return policy.get(field, "assignment")
+    if field == "priorities":
+        priorities = policy.get(field)
+        if priorities is None:
+            priority = policy.get("priority")
+            priorities = [] if priority is None else [priority]
+        return frozenset(priorities)
+    if field == "label_ids":
+        label_ids = policy.get(field)
+        if label_ids is None:
+            label_id = policy.get("label_id")
+            label_ids = [] if label_id is None else [label_id]
+        return frozenset(str(label_id) for label_id in label_ids)
+    if field == "label_match":
+        return policy.get(field, "any")
+    raise ValueError(f"Unsupported Google Calendar workspace policy field: {field}")
 
 
 def publish_google_calendar_task(task, *args, **kwargs):
@@ -43,9 +72,10 @@ def enqueue_google_calendar_workspace_policy_resyncs_on_commit(
 ):
     """Durably request after-commit convergence for a workspace policy change."""
 
-    previous_update_on_completion = previous_policy.get("update_on_completion", True)
-    current_update_on_completion = current_policy.get("update_on_completion", True)
-    if previous_update_on_completion == current_update_on_completion:
+    if all(
+        _workspace_policy_resync_value(previous_policy, field) == _workspace_policy_resync_value(current_policy, field)
+        for field in _GOOGLE_CALENDAR_WORKSPACE_POLICY_RESYNC_FIELDS
+    ):
         return None
 
     generation = str(uuid4())

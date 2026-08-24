@@ -113,6 +113,82 @@ class TestEnqueueGoogleCalendarWorkspacePolicyResyncsOnCommit:
             GOOGLE_CALENDAR_WORKSPACE_ISSUE_RESYNC_METADATA_KEY: generation,
         }
 
+    @pytest.mark.parametrize(
+        "current_policy",
+        (
+            {
+                "mode": "assignment",
+                "priorities": ["urgent"],
+                "label_ids": ["10000000-0000-0000-0000-000000000001"],
+                "label_match": "any",
+            },
+            {
+                "mode": "filter",
+                "priorities": ["high"],
+                "label_ids": ["10000000-0000-0000-0000-000000000001"],
+                "label_match": "any",
+            },
+            {
+                "mode": "filter",
+                "priorities": ["urgent"],
+                "label_ids": ["20000000-0000-0000-0000-000000000002"],
+                "label_match": "any",
+            },
+            {
+                "mode": "filter",
+                "priorities": ["urgent"],
+                "label_ids": ["10000000-0000-0000-0000-000000000001"],
+                "label_match": "all",
+            },
+        ),
+    )
+    def test_filter_change_publishes_one_workspace_resync_after_commit(self, current_policy):
+        task = Mock()
+        workspace_integration = WorkspaceIntegrationFactory(integration__provider="google_calendar")
+        previous_policy = {
+            "mode": "filter",
+            "priorities": ["urgent"],
+            "label_ids": ["10000000-0000-0000-0000-000000000001"],
+            "label_match": "any",
+        }
+
+        with patch("plane.integrations.google_calendar.dispatch.current_app.signature", return_value=task):
+            with transaction.atomic():
+                generation = enqueue_google_calendar_workspace_policy_resyncs_on_commit(
+                    workspace_integration,
+                    previous_policy,
+                    current_policy,
+                )
+                task.delay.assert_not_called()
+
+            task.delay.assert_called_once_with(
+                str(workspace_integration.workspace_id),
+                policy_generation=generation,
+            )
+
+    def test_reordered_filter_selections_do_not_publish(self):
+        workspace_integration = WorkspaceIntegrationFactory(integration__provider="google_calendar")
+
+        with patch("plane.integrations.google_calendar.dispatch.current_app.signature") as signature:
+            generation = enqueue_google_calendar_workspace_policy_resyncs_on_commit(
+                workspace_integration,
+                {
+                    "mode": "filter",
+                    "priorities": ["urgent", "high"],
+                    "label_ids": ["label-1", "label-2"],
+                    "label_match": "all",
+                },
+                {
+                    "mode": "filter",
+                    "priorities": ["high", "urgent"],
+                    "label_ids": ["label-2", "label-1"],
+                    "label_match": "all",
+                },
+            )
+
+        assert generation is None
+        signature.assert_not_called()
+
     def test_unchanged_completion_behavior_does_not_publish(self):
         workspace_integration = WorkspaceIntegrationFactory(integration__provider="google_calendar")
 
