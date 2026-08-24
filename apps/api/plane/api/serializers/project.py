@@ -236,6 +236,7 @@ class ProjectSerializer(BaseSerializer):
             "updated_by",
             "deleted_at",
             "cover_image_url",
+            "google_calendar_sync_enabled",
         ]
 
     def validate(self, data):

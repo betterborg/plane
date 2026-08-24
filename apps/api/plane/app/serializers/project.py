@@ -34,7 +34,7 @@ class ProjectSerializer(BaseSerializer):
     class Meta:
         model = Project
         fields = "__all__"
-        read_only_fields = ["workspace", "deleted_at"]
+        read_only_fields = ["workspace", "deleted_at", "google_calendar_sync_enabled"]
 
     def validate_name(self, name):
         project_id = self.instance.id if self.instance else None
