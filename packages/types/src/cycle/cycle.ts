@@ -99,6 +99,7 @@ export interface ICycle extends TProgressSnapshot {
   status?: TCycleGroups;
   sort_order: number;
   start_date: string | null;
+  readonly timezone: string;
   sub_issues?: number;
   updated_at?: string;
   updated_by?: string;

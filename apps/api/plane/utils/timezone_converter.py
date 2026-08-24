@@ -39,7 +39,7 @@ def user_timezone_converter(queryset, datetime_fields, user_timezone):
         return queryset_values
 
 
-def convert_to_utc(date, project_id, is_start_date=False):
+def convert_to_utc(date, project_id, is_start_date=False, project_timezone=None):
     """
     Converts a start date string to the project's local timezone at 12:00 AM
     and then converts it to UTC for storage.
@@ -47,13 +47,17 @@ def convert_to_utc(date, project_id, is_start_date=False):
     Args:
         date (str): The date string in "YYYY-MM-DD" format.
         project_id (int): The project's ID to fetch the associated timezone.
+        is_start_date (bool): Whether to normalize to the start of the day.
+        project_timezone (str): An already-fetched project timezone to use.
 
     Returns:
         datetime: The UTC datetime.
     """
-    # Retrieve the project's timezone using the project ID
-    project = Project.objects.get(id=project_id)
-    project_timezone = project.timezone
+    # Retrieve the project's timezone using the project ID when the caller has
+    # not already fetched the project being used for the write.
+    if project_timezone is None:
+        project = Project.objects.get(id=project_id)
+        project_timezone = project.timezone
     if not date or not project_timezone:
         raise ValueError("Both date and timezone must be provided.")
 
@@ -92,6 +96,29 @@ def convert_to_utc(date, project_id, is_start_date=False):
 
         # Return the UTC datetime for storage
         return utc_datetime
+
+
+def normalize_cycle_date_fields(data, instance, project_id, project_timezone):
+    """Normalize changed and retained cycle boundaries under one timezone snapshot."""
+    previous_timezone = pytz.timezone(instance.timezone) if instance else None
+
+    for field, is_start_date in (("start_date", True), ("end_date", False)):
+        if field in data:
+            boundary = data[field]
+        elif instance:
+            boundary = getattr(instance, field)
+            if boundary is not None:
+                boundary = boundary.astimezone(previous_timezone)
+        else:
+            continue
+
+        if boundary is not None:
+            data[field] = convert_to_utc(
+                date=str(boundary.date()),
+                project_id=project_id,
+                is_start_date=is_start_date,
+                project_timezone=project_timezone,
+            )
 
 
 def convert_utc_to_project_timezone(utc_datetime, project_id):
