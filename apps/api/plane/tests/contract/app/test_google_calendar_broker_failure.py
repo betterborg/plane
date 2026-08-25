@@ -18,14 +18,18 @@ from plane.app.views.google_calendar_oauth import GOOGLE_CALENDAR_OAUTH_SESSION_
 from plane.bgtasks.google_calendar_task import (
     _mark_authorization_failure,
     _send_google_calendar_disconnected_email,
+    reconcile_google_calendar_inventory,
     reconcile_google_calendar_workspace_issue_resyncs,
     schedule_google_calendar_reconciliations,
     send_google_calendar_disconnected_email,
 )
+from plane.bgtasks.issue_automation_task import archive_old_issues, close_old_issues
 from plane.db.models import (
     Cycle,
     CycleIssue,
+    DraftIssue,
     GoogleCalendarConnection,
+    GoogleCalendarEvent,
     Issue,
     IssueAssignee,
     IssueLabel,
@@ -37,7 +41,8 @@ from plane.db.models import (
     Workspace,
     WorkspaceMember,
 )
-from plane.integrations.google_calendar.client import GoogleCalendarInvalidGrant
+from plane.db.signals import suppress_google_calendar_issue_signal_dispatch
+from plane.integrations.google_calendar.client import GoogleCalendarEventPage, GoogleCalendarInvalidGrant
 from plane.integrations.google_calendar.dispatch import (
     GOOGLE_CALENDAR_CYCLE_SYNC_TASK,
     GOOGLE_CALENDAR_INVENTORY_TASK,
@@ -48,6 +53,8 @@ from plane.integrations.google_calendar.dispatch import (
     GOOGLE_CALENDAR_STATE_ISSUE_RESYNC_TASK,
     GOOGLE_CALENDAR_WORKSPACE_ISSUE_RESYNC_METADATA_KEY,
     GOOGLE_CALENDAR_WORKSPACE_ISSUE_RESYNC_TASK,
+    GOOGLE_CALENDAR_WORKSPACE_CYCLE_RESYNC_METADATA_KEY,
+    GOOGLE_CALENDAR_WORKSPACE_CYCLE_RESYNC_TASK,
 )
 from plane.integrations.google_calendar.oauth import (
     GOOGLE_CALENDAR_LIST_SCOPE,
@@ -59,6 +66,7 @@ from plane.integrations.google_calendar.oauth import (
 from plane.tests.factories import (
     CycleFactory,
     GoogleCalendarConnectionFactory,
+    GoogleCalendarEventFactory,
     IntegrationFactory,
     IssueFactory,
     LabelFactory,
@@ -70,6 +78,16 @@ from plane.tests.factories import (
     WorkspaceIntegrationFactory,
     WorkspaceMemberFactory,
 )
+
+
+def _owner_publications(observed_publications, start, task_name, entity_id):
+    """Return one owner's publications without collapsing shared task names."""
+
+    return [
+        publication
+        for publication in observed_publications[start:]
+        if publication[0] == task_name and publication[1] and str(publication[1][0]) == str(entity_id)
+    ]
 
 
 def _task_name(task):
@@ -146,6 +164,18 @@ class TestGoogleCalendarBrokerFailureReleaseGate:
             "assignees": [str(create_user.id)],
             "labels": [str(label.id)],
         }
+        with suppress_google_calendar_issue_signal_dispatch():
+            bulk_issue = IssueFactory(project=project, state=state)
+            membership_issue = IssueFactory(project=project, state=state)
+        membership_cycle = CycleFactory(project=project)
+        cycle = CycleFactory(project=project)
+        GoogleCalendarEventFactory(connection=connection, entity_id=bulk_issue.id)
+        GoogleCalendarEventFactory(
+            connection=connection,
+            entity_type=GoogleCalendarEvent.EntityType.CYCLE,
+            entity_id=cycle.id,
+        )
+        issue_activity = Mock()
 
         with (
             override_settings(GOOGLE_CALENDAR_RELEASED=True),
@@ -153,9 +183,10 @@ class TestGoogleCalendarBrokerFailureReleaseGate:
                 "plane.integrations.google_calendar.dispatch.publish_google_calendar_task",
                 side_effect=fail_after_observing_committed_state,
             ),
-            patch("plane.app.views.issue.base.issue_activity.delay"),
+            patch("plane.app.views.issue.base.issue_activity.delay", issue_activity),
             patch("plane.db.mixins.soft_delete_related_objects.delay"),
         ):
+            owner_start = len(observed_publications)
             serializer = IssueCreateSerializer(
                 data=app_payload,
                 context={
@@ -166,15 +197,36 @@ class TestGoogleCalendarBrokerFailureReleaseGate:
             )
             assert serializer.is_valid(), serializer.errors
             app_issue = serializer.save()
+            assert (
+                len(
+                    _owner_publications(
+                        observed_publications, owner_start, GOOGLE_CALENDAR_ISSUE_SYNC_TASK, app_issue.id
+                    )
+                )
+                == 1
+            )
 
+            owner_start = len(observed_publications)
             public_response = api_key_client.post(
                 f"/api/v1/workspaces/{workspace.slug}/projects/{project.id}/work-items/",
                 public_payload,
                 format="json",
             )
             assert public_response.status_code == status.HTTP_201_CREATED, public_response.data
+            public_issue_id = public_response.data["id"]
+            assert (
+                len(
+                    _owner_publications(
+                        observed_publications,
+                        owner_start,
+                        GOOGLE_CALENDAR_ISSUE_SYNC_TASK,
+                        public_issue_id,
+                    )
+                )
+                == 1
+            )
 
-            bulk_issue = IssueFactory(project=project, state=state)
+            owner_start = len(observed_publications)
             bulk_response = session_client.post(
                 reverse(
                     "project-issue-dates",
@@ -192,34 +244,92 @@ class TestGoogleCalendarBrokerFailureReleaseGate:
                 format="json",
             )
             assert bulk_response.status_code == status.HTTP_200_OK, bulk_response.data
+            assert (
+                len(
+                    _owner_publications(
+                        observed_publications,
+                        owner_start,
+                        GOOGLE_CALENDAR_ISSUE_SYNC_TASK,
+                        bulk_issue.id,
+                    )
+                )
+                == 1
+            )
+            assert issue_activity.call_count == 2
 
+            owner_start = len(observed_publications)
             state_response = session_client.patch(
                 f"/api/workspaces/{workspace.slug}/projects/{project.id}/states/{state.id}/",
                 {"name": "Ready for release"},
                 format="json",
             )
             assert state_response.status_code == status.HTTP_200_OK, state_response.data
+            assert (
+                len(
+                    _owner_publications(
+                        observed_publications,
+                        owner_start,
+                        GOOGLE_CALENDAR_STATE_ISSUE_RESYNC_TASK,
+                        state.id,
+                    )
+                )
+                == 1
+            )
 
+            owner_start = len(observed_publications)
             label_response = api_key_client.patch(
                 f"/api/v1/workspaces/{workspace.slug}/projects/{project.id}/labels/{label.id}/",
                 {"name": "Release label"},
                 format="json",
             )
             assert label_response.status_code == status.HTTP_200_OK, label_response.data
+            assert (
+                len(
+                    _owner_publications(
+                        observed_publications,
+                        owner_start,
+                        GOOGLE_CALENDAR_LABEL_ISSUE_RESYNC_TASK,
+                        label.id,
+                    )
+                )
+                == 1
+            )
 
-            cycle = CycleFactory(project=project)
+            owner_start = len(observed_publications)
             cycle.name = "Release cycle"
             cycle.save(update_fields=["name", "updated_at"])
+            assert (
+                len(
+                    _owner_publications(
+                        observed_publications,
+                        owner_start,
+                        GOOGLE_CALENDAR_CYCLE_SYNC_TASK,
+                        cycle.id,
+                    )
+                )
+                == 1
+            )
 
-            membership_issue = IssueFactory(project=project, state=state)
-            membership_cycle = CycleFactory(project=project)
+            owner_start = len(observed_publications)
             membership_response = session_client.post(
                 f"/api/workspaces/{workspace.slug}/projects/{project.id}/cycles/{membership_cycle.id}/cycle-issues/",
                 {"issues": [str(membership_issue.id)]},
                 format="json",
             )
             assert membership_response.status_code in (status.HTTP_200_OK, status.HTTP_201_CREATED)
+            assert (
+                len(
+                    _owner_publications(
+                        observed_publications,
+                        owner_start,
+                        GOOGLE_CALENDAR_CYCLE_SYNC_TASK,
+                        membership_cycle.id,
+                    )
+                )
+                == 1
+            )
 
+            owner_start = len(observed_publications)
             project_response = session_client.patch(
                 reverse(
                     "google-calendar-project-sync",
@@ -229,6 +339,57 @@ class TestGoogleCalendarBrokerFailureReleaseGate:
                 format="json",
             )
             assert project_response.status_code == status.HTTP_200_OK, project_response.data
+            assert (
+                len(
+                    _owner_publications(
+                        observed_publications,
+                        owner_start,
+                        GOOGLE_CALENDAR_PROJECT_ISSUE_RESYNC_TASK,
+                        project.id,
+                    )
+                )
+                == 1
+            )
+
+            owner_start = len(observed_publications)
+            archive_project_response = session_client.post(
+                reverse(
+                    "project-archive-unarchive",
+                    kwargs={"slug": workspace.slug, "project_id": project.id},
+                )
+            )
+            assert archive_project_response.status_code == status.HTTP_200_OK
+            assert (
+                len(
+                    _owner_publications(
+                        observed_publications,
+                        owner_start,
+                        GOOGLE_CALENDAR_PROJECT_ISSUE_RESYNC_TASK,
+                        project.id,
+                    )
+                )
+                == 1
+            )
+
+            owner_start = len(observed_publications)
+            restore_project_response = session_client.delete(
+                reverse(
+                    "project-archive-unarchive",
+                    kwargs={"slug": workspace.slug, "project_id": project.id},
+                )
+            )
+            assert restore_project_response.status_code == status.HTTP_204_NO_CONTENT
+            assert (
+                len(
+                    _owner_publications(
+                        observed_publications,
+                        owner_start,
+                        GOOGLE_CALENDAR_PROJECT_ISSUE_RESYNC_TASK,
+                        project.id,
+                    )
+                )
+                == 1
+            )
 
         app_issue.refresh_from_db()
         bulk_issue.refresh_from_db()
@@ -249,27 +410,264 @@ class TestGoogleCalendarBrokerFailureReleaseGate:
         assert project.google_calendar_sync_enabled is False
         assert CycleIssue.objects.filter(cycle=membership_cycle, issue=membership_issue).exists()
 
-        published_task_names = {task_name for task_name, _args, _kwargs in observed_publications}
-        assert {
-            GOOGLE_CALENDAR_ISSUE_SYNC_TASK,
-            GOOGLE_CALENDAR_STATE_ISSUE_RESYNC_TASK,
-            GOOGLE_CALENDAR_LABEL_ISSUE_RESYNC_TASK,
-            GOOGLE_CALENDAR_CYCLE_SYNC_TASK,
-            GOOGLE_CALENDAR_PROJECT_ISSUE_RESYNC_TASK,
-        } <= published_task_names
-
-        recovered = Mock()
-        recovered.set.return_value = recovered
+        scheduled_inventory = Mock()
+        scheduled_inventory.set.return_value = scheduled_inventory
         with patch(
             "plane.bgtasks.google_calendar_task.current_app.signature",
-            return_value=recovered,
+            return_value=scheduled_inventory,
         ) as signature:
             discovered = schedule_google_calendar_reconciliations.run()
 
         assert discovered == 1
         signature.assert_called_once_with(GOOGLE_CALENDAR_INVENTORY_TASK)
-        recovered.set.assert_called_once()
-        recovered.delay.assert_called_once_with(str(connection.id))
+        scheduled_inventory.set.assert_called_once()
+        scheduled_inventory.delay.assert_called_once_with(str(connection.id))
+
+        provider_client = Mock()
+        provider_client.access_token = None
+        provider_client.list_event_page.return_value = GoogleCalendarEventPage((), None, "next-sync-token")
+        with (
+            patch("plane.bgtasks.google_calendar_task.GoogleCalendarClient", return_value=provider_client),
+            patch("plane.bgtasks.google_calendar_task.publish_google_calendar_task") as recovered_publish,
+        ):
+            assert reconcile_google_calendar_inventory.run(str(connection.id), force_local_scan=True) == "continued"
+            continuation = recovered_publish.call_args
+            assert _task_name(continuation.args[0]) == GOOGLE_CALENDAR_INVENTORY_TASK
+            recovered_publish.reset_mock()
+
+            assert reconcile_google_calendar_inventory.run(*continuation.args[1:]) == "complete"
+
+        recovered_entities = {
+            (_task_name(invocation.args[0]), invocation.args[1], invocation.args[2])
+            for invocation in recovered_publish.call_args_list
+        }
+        assert (
+            GOOGLE_CALENDAR_ISSUE_SYNC_TASK,
+            str(bulk_issue.id),
+            str(connection.id),
+        ) in recovered_entities
+        assert (
+            GOOGLE_CALENDAR_CYCLE_SYNC_TASK,
+            str(cycle.id),
+            str(connection.id),
+        ) in recovered_entities
+
+    def test_bulk_automation_draft_and_membership_owners_publish_independently(
+        self,
+        session_client,
+        workspace,
+        create_user,
+    ):
+        """Shared task names cannot hide an omitted mutation owner."""
+
+        workspace_integration = _calendar_integration(workspace)
+        _active_connection(workspace_integration, create_user)
+        project = ProjectFactory(workspace=workspace)
+        ProjectMemberFactory(project=project, member=create_user, role=20)
+        open_state = StateFactory(project=project, group="started")
+        completed_state = StateFactory(project=project, group="completed")
+        with suppress_google_calendar_issue_signal_dispatch():
+            archive_issue = IssueFactory(project=project, state=completed_state)
+            delete_issue = IssueFactory(project=project, state=open_state)
+        delete_cycle = CycleFactory(project=project)
+        CycleIssue.objects.create(
+            cycle=delete_cycle,
+            issue=delete_issue,
+            project=project,
+            workspace=workspace,
+        )
+        with suppress_google_calendar_issue_signal_dispatch():
+            membership_issue = IssueFactory(project=project, state=open_state)
+        membership_cycle = CycleFactory(project=project)
+        CycleIssue.objects.create(
+            cycle=membership_cycle,
+            issue=membership_issue,
+            project=project,
+            workspace=workspace,
+        )
+        draft_cycle = CycleFactory(project=project)
+        draft = DraftIssue.objects.create(
+            name="Release draft",
+            project=project,
+            state=open_state,
+            created_by=create_user,
+        )
+
+        archive_project = ProjectFactory(workspace=workspace, archive_in=1)
+        archive_state = StateFactory(project=archive_project, group="completed")
+        with suppress_google_calendar_issue_signal_dispatch():
+            automated_archive_issue = IssueFactory(project=archive_project, state=archive_state)
+        close_project = ProjectFactory(workspace=workspace, close_in=1)
+        close_state = StateFactory(project=close_project, group="started")
+        cancelled_state = StateFactory(project=close_project, group="cancelled")
+        close_project.default_state = cancelled_state
+        close_project.save(update_fields=["default_state", "updated_at"])
+        with suppress_google_calendar_issue_signal_dispatch():
+            automated_close_issue = IssueFactory(project=close_project, state=close_state)
+        Issue.objects.filter(id__in=[automated_archive_issue.id, automated_close_issue.id]).update(
+            updated_at=timezone.now() - timedelta(days=31)
+        )
+
+        observed_publications = []
+        draft_activity = Mock()
+
+        def fail_publication(task, *args, **kwargs):
+            observed_publications.append((_task_name(task), args, kwargs))
+            raise RuntimeError("broker unavailable")
+
+        with (
+            override_settings(GOOGLE_CALENDAR_RELEASED=True),
+            patch(
+                "plane.integrations.google_calendar.dispatch.publish_google_calendar_task",
+                side_effect=fail_publication,
+            ),
+            patch("plane.app.views.issue.archive.issue_activity.delay"),
+            patch("plane.app.views.workspace.draft.issue_activity.delay", draft_activity),
+            patch("plane.bgtasks.issue_automation_task.issue_activity.delay"),
+            patch("plane.db.mixins.soft_delete_related_objects.delay"),
+        ):
+            owner_start = len(observed_publications)
+            archive_response = session_client.post(
+                reverse(
+                    "bulk-archive-issues",
+                    kwargs={"slug": workspace.slug, "project_id": project.id},
+                ),
+                {"issue_ids": [str(archive_issue.id)]},
+                format="json",
+            )
+            assert archive_response.status_code == status.HTTP_200_OK
+            assert (
+                len(
+                    _owner_publications(
+                        observed_publications,
+                        owner_start,
+                        GOOGLE_CALENDAR_ISSUE_SYNC_TASK,
+                        archive_issue.id,
+                    )
+                )
+                == 1
+            )
+
+            owner_start = len(observed_publications)
+            delete_response = session_client.delete(
+                reverse(
+                    "project-issues-bulk",
+                    kwargs={"slug": workspace.slug, "project_id": project.id},
+                ),
+                {"issue_ids": [str(delete_issue.id)]},
+                format="json",
+            )
+            assert delete_response.status_code == status.HTTP_200_OK
+            issue_publications = _owner_publications(
+                observed_publications,
+                owner_start,
+                GOOGLE_CALENDAR_ISSUE_SYNC_TASK,
+                delete_issue.id,
+            )
+            cycle_publications = _owner_publications(
+                observed_publications,
+                owner_start,
+                GOOGLE_CALENDAR_CYCLE_SYNC_TASK,
+                delete_cycle.id,
+            )
+            assert len(issue_publications) == 1
+            assert len(cycle_publications) == 1
+            assert observed_publications.index(cycle_publications[0]) > observed_publications.index(
+                issue_publications[0]
+            )
+
+            owner_start = len(observed_publications)
+            membership_response = session_client.delete(
+                f"/api/workspaces/{workspace.slug}/projects/{project.id}/cycles/"
+                f"{membership_cycle.id}/cycle-issues/{membership_issue.id}/"
+            )
+            assert membership_response.status_code == status.HTTP_204_NO_CONTENT
+            assert (
+                len(
+                    _owner_publications(
+                        observed_publications,
+                        owner_start,
+                        GOOGLE_CALENDAR_CYCLE_SYNC_TASK,
+                        membership_cycle.id,
+                    )
+                )
+                == 1
+            )
+
+            owner_start = len(observed_publications)
+            draft_response = session_client.post(
+                f"/api/workspaces/{workspace.slug}/draft-to-issue/{draft.id}/",
+                {
+                    "name": "Converted release issue",
+                    "state_id": str(open_state.id),
+                    "assignee_ids": [str(create_user.id)],
+                    "cycle_id": str(draft_cycle.id),
+                },
+                format="json",
+            )
+            assert draft_response.status_code == status.HTTP_201_CREATED, draft_response.data
+            assert (
+                len(
+                    _owner_publications(
+                        observed_publications,
+                        owner_start,
+                        GOOGLE_CALENDAR_ISSUE_SYNC_TASK,
+                        draft_response.data["id"],
+                    )
+                )
+                == 1
+            )
+            assert (
+                len(
+                    _owner_publications(
+                        observed_publications,
+                        owner_start,
+                        GOOGLE_CALENDAR_CYCLE_SYNC_TASK,
+                        draft_cycle.id,
+                    )
+                )
+                == 1
+            )
+            assert draft_activity.call_count == 2
+
+            owner_start = len(observed_publications)
+            archive_old_issues()
+            assert (
+                len(
+                    _owner_publications(
+                        observed_publications,
+                        owner_start,
+                        GOOGLE_CALENDAR_ISSUE_SYNC_TASK,
+                        automated_archive_issue.id,
+                    )
+                )
+                == 1
+            )
+
+            owner_start = len(observed_publications)
+            close_old_issues()
+            assert (
+                len(
+                    _owner_publications(
+                        observed_publications,
+                        owner_start,
+                        GOOGLE_CALENDAR_ISSUE_SYNC_TASK,
+                        automated_close_issue.id,
+                    )
+                )
+                == 1
+            )
+
+        archive_issue.refresh_from_db()
+        delete_issue.refresh_from_db()
+        automated_archive_issue.refresh_from_db()
+        automated_close_issue.refresh_from_db()
+        assert archive_issue.archived_at == timezone.localdate()
+        assert delete_issue.deleted_at is not None
+        assert not CycleIssue.objects.filter(cycle=delete_cycle, issue=delete_issue).exists()
+        assert not CycleIssue.objects.filter(cycle=membership_cycle, issue=membership_issue).exists()
+        assert automated_archive_issue.archived_at == timezone.localdate()
+        assert automated_close_issue.state_id == cancelled_state.id
 
     def test_oauth_policy_and_disconnect_keep_exact_durable_recovery_selectors(
         self,
@@ -348,6 +746,22 @@ class TestGoogleCalendarBrokerFailureReleaseGate:
             assert schedule_google_calendar_reconciliations.run() == 1
         selector_task.delay.assert_called_once_with(str(connection.id), 1)
 
+        workspace_integration.config = {"enabled": False}
+        workspace_integration.save(update_fields=["config", "updated_at"])
+        connection.active = False
+        connection.desired_state = GoogleCalendarConnection.DesiredState.DISCONNECTED
+        connection.status = GoogleCalendarConnection.Status.DISCONNECTED
+        connection.calendar_id = ""
+        connection.save(
+            update_fields=[
+                "active",
+                "desired_state",
+                "status",
+                "calendar_id",
+                "updated_at",
+            ]
+        )
+
         with (
             override_settings(GOOGLE_CALENDAR_RELEASED=True),
             patch("plane.app.views.integration._has_complete_google_calendar_credentials", return_value=True),
@@ -364,7 +778,7 @@ class TestGoogleCalendarBrokerFailureReleaseGate:
                     "enabled": True,
                     "mode": "assignment",
                     "update_on_completion": False,
-                    "recipients": "cycle_members",
+                    "recipients": "project_members",
                 },
                 format="json",
             )
@@ -377,7 +791,33 @@ class TestGoogleCalendarBrokerFailureReleaseGate:
         assert policy_generation == 2
         issue_generation = workspace_integration.metadata[GOOGLE_CALENDAR_WORKSPACE_ISSUE_RESYNC_METADATA_KEY]
         assert issue_generation
-        later_callback.assert_not_called()
+        cycle_generation = workspace_integration.metadata[GOOGLE_CALENDAR_WORKSPACE_CYCLE_RESYNC_METADATA_KEY]
+        assert cycle_generation == issue_generation
+        failed_policy_calls = {
+            (task_name, args, tuple(sorted(kwargs.items()))) for task_name, args, kwargs in failed_tasks
+        }
+        assert (
+            GOOGLE_CALENDAR_LIFECYCLE_TASK,
+            (str(connection.id), policy_generation),
+            (),
+        ) in failed_policy_calls
+        assert (
+            GOOGLE_CALENDAR_WORKSPACE_ISSUE_RESYNC_TASK,
+            (str(workspace.id),),
+            (("policy_generation", issue_generation),),
+        ) in failed_policy_calls
+        assert (
+            GOOGLE_CALENDAR_WORKSPACE_CYCLE_RESYNC_TASK,
+            (str(workspace.id),),
+            (("policy_generation", cycle_generation),),
+        ) in failed_policy_calls
+        adoption = next(
+            invocation
+            for invocation in later_callback.call_args_list
+            if invocation.args == ("google_calendar_adopted",)
+        )
+        assert adoption.kwargs["workspace_id"] == workspace.id
+        assert adoption.kwargs["outcome"] == "enabled"
 
         recovered_policy_task = Mock()
         with patch(
@@ -385,9 +825,29 @@ class TestGoogleCalendarBrokerFailureReleaseGate:
             side_effect=lambda task, *args, **kwargs: recovered_policy_task(task, *args, **kwargs),
         ):
             assert reconcile_google_calendar_workspace_issue_resyncs.run() == 1
-        recovered_policy_task.assert_called_once()
-        assert _task_name(recovered_policy_task.call_args.args[0]) == GOOGLE_CALENDAR_WORKSPACE_ISSUE_RESYNC_TASK
-        assert recovered_policy_task.call_args.kwargs == {"policy_generation": issue_generation}
+        recovered_policy_calls = {
+            (
+                _task_name(invocation.args[0]),
+                invocation.args[1:],
+                tuple(sorted(invocation.kwargs.items())),
+            )
+            for invocation in recovered_policy_task.call_args_list
+        }
+        assert (
+            GOOGLE_CALENDAR_LIFECYCLE_TASK,
+            (str(connection.id), policy_generation),
+            (),
+        ) in recovered_policy_calls
+        assert (
+            GOOGLE_CALENDAR_WORKSPACE_ISSUE_RESYNC_TASK,
+            (str(workspace.id),),
+            (("policy_generation", issue_generation),),
+        ) in recovered_policy_calls
+        assert (
+            GOOGLE_CALENDAR_WORKSPACE_CYCLE_RESYNC_TASK,
+            (str(workspace.id),),
+            (("policy_generation", cycle_generation),),
+        ) in recovered_policy_calls
 
         connection.refresh_from_db()
         with (
