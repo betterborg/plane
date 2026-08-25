@@ -9,6 +9,7 @@ from datetime import timedelta
 from unittest.mock import Mock, patch
 
 import pytest
+import requests
 from django.urls import reverse
 from django.utils import timezone
 from rest_framework import status
@@ -22,7 +23,11 @@ from plane.integrations.google_calendar.dispatch import (
     GOOGLE_CALENDAR_LIFECYCLE_TASK,
     publish_google_calendar_task,
 )
-from plane.integrations.google_calendar.oauth import GoogleCalendarOAuthCredentials
+from plane.integrations.google_calendar.oauth import (
+    GoogleCalendarOAuthCredentials,
+    GoogleCalendarOAuthGrant,
+    revoke_rejected_google_calendar_grant,
+)
 from plane.integrations.google_calendar.telemetry import (
     log_google_calendar_operation,
     publish_google_calendar_analytics,
@@ -396,3 +401,85 @@ def test_calendar_analytics_are_allowlisted_and_secret_free():
         "forbidden-task-secret",
     ):
         assert forbidden not in serialized_call
+
+
+@pytest.mark.contract
+def test_calendar_telemetry_rejects_secret_bearing_operation_and_event_names(caplog):
+    forbidden_name = "forbidden-provider-identity"
+    logger = logging.getLogger("plane.tests.google_calendar.telemetry")
+
+    with (
+        caplog.at_level(logging.INFO, logger=logger.name),
+        patch("plane.bgtasks.event_tracking_task.track_event.delay") as track,
+    ):
+        log_google_calendar_operation(logger, forbidden_name, outcome="ignored")
+        published = publish_google_calendar_analytics(
+            forbidden_name,
+            user_id="member-id",
+            workspace_id=uuid.uuid4(),
+            workspace_slug="workspace-slug",
+        )
+
+    assert caplog.records[-1].operation == "unrecognized"
+    assert forbidden_name not in repr(caplog.records[-1].__dict__)
+    assert published is False
+    track.assert_not_called()
+
+
+@pytest.mark.contract
+def test_rejected_grant_revocation_failure_logs_no_exception_or_tokens(caplog):
+    access_token = "forbidden-rejected-access-token"
+    refresh_token = "forbidden-rejected-refresh-token"
+    grant = GoogleCalendarOAuthGrant(
+        access_token=access_token,
+        refresh_token=refresh_token,
+        token_expires_at=timezone.now() + timedelta(hours=1),
+        scopes=frozenset(),
+    )
+
+    with (
+        caplog.at_level(logging.ERROR, logger="plane.integrations.google_calendar.oauth"),
+        patch(
+            "plane.integrations.google_calendar.oauth.requests.post",
+            side_effect=requests.RequestException(f"provider echoed {refresh_token}"),
+        ),
+    ):
+        assert revoke_rejected_google_calendar_grant(grant) is False
+
+    record = caplog.records[-1]
+    assert record.operation == "rejected_grant_revocation"
+    assert record.outcome == "failed"
+    assert record.attempt == 1
+    assert record.google_status_class == "transport_error"
+    assert record.reconciliation_action == "best_effort_revoke"
+    assert record.exc_info is None
+    serialized_record = repr(record.__dict__)
+    assert access_token not in serialized_record
+    assert refresh_token not in serialized_record
+
+
+@pytest.mark.contract
+def test_rejected_grant_revocation_success_logs_provider_status_class(caplog):
+    access_token = "forbidden-rejected-access-token"
+    response = Mock(status_code=204)
+    grant = GoogleCalendarOAuthGrant(
+        access_token=access_token,
+        refresh_token="",
+        token_expires_at=timezone.now() + timedelta(hours=1),
+        scopes=frozenset(),
+    )
+
+    with (
+        caplog.at_level(logging.INFO, logger="plane.integrations.google_calendar.oauth"),
+        patch("plane.integrations.google_calendar.oauth.requests.post", return_value=response),
+    ):
+        assert revoke_rejected_google_calendar_grant(grant) is True
+
+    response.raise_for_status.assert_called_once_with()
+    record = caplog.records[-1]
+    assert record.operation == "rejected_grant_revocation"
+    assert record.outcome == "revoked"
+    assert record.attempt == 1
+    assert record.google_status_class == "2xx"
+    assert record.reconciliation_action == "best_effort_revoke"
+    assert access_token not in repr(record.__dict__)

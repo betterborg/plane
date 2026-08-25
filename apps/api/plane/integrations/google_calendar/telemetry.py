@@ -6,6 +6,43 @@
 
 from uuid import UUID
 
+from plane.utils.analytics_events import (
+    GOOGLE_CALENDAR_ADOPTED,
+    GOOGLE_CALENDAR_CREDENTIAL_MISMATCH,
+    GOOGLE_CALENDAR_INVENTORY_RESET,
+    GOOGLE_CALENDAR_LIFECYCLE_RECOVERY,
+    GOOGLE_CALENDAR_PUBLICATION_FAILURE,
+    GOOGLE_CALENDAR_RECONCILIATION_OVERDUE,
+)
+
+
+_ANALYTICS_EVENTS = frozenset(
+    {
+        GOOGLE_CALENDAR_ADOPTED,
+        GOOGLE_CALENDAR_CREDENTIAL_MISMATCH,
+        GOOGLE_CALENDAR_INVENTORY_RESET,
+        GOOGLE_CALENDAR_LIFECYCLE_RECOVERY,
+        GOOGLE_CALENDAR_PUBLICATION_FAILURE,
+        GOOGLE_CALENDAR_RECONCILIATION_OVERDUE,
+    }
+)
+_OPERATIONS = frozenset(
+    {
+        "credential_binding",
+        "cycle_publication",
+        "health_notice_publication",
+        "lifecycle_reconciliation",
+        "lifecycle_recovery",
+        "local_inventory",
+        "provider_inventory",
+        "rejected_grant_revocation",
+        "release_readiness",
+        "scheduled_reconciliation",
+        "task_publication",
+        "work_item_publication",
+        "workspace_adoption",
+    }
+)
 _OPERATIONAL_FIELDS = frozenset(
     {
         "workspace_id",
@@ -43,15 +80,22 @@ def _safe_operational_fields(fields):
 def log_google_calendar_operation(logger, operation, **fields):
     """Write one structured Calendar log without accepting secret-bearing fields."""
 
+    safe_operation = operation if isinstance(operation, str) and operation in _OPERATIONS else "unrecognized"
     log_method = logger.error if fields.get("outcome") in {"failed", "publication_failed", "mismatch"} else logger.info
     log_method(
         "Google Calendar operation",
-        extra={"operation": operation, **_safe_operational_fields(fields)},
+        extra={
+            "operation": safe_operation,
+            **_safe_operational_fields(fields),
+        },
     )
 
 
 def publish_google_calendar_analytics(event_name, *, user_id, workspace_id, workspace_slug, **fields):
     """Publish an approved Calendar analytics event without leaking provider data."""
+
+    if not isinstance(event_name, str) or event_name not in _ANALYTICS_EVENTS:
+        return False
 
     from plane.bgtasks.event_tracking_task import track_event
 
