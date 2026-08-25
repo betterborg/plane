@@ -3,6 +3,7 @@
 # See the LICENSE file for details.
 
 import json
+import logging
 from datetime import timedelta
 from unittest.mock import Mock, patch
 from uuid import UUID, uuid4
@@ -118,7 +119,7 @@ class TestScheduleGoogleCalendarReconciliations:
         assert str(unhealthy.id) not in published_ids
 
     @freeze_time("2026-08-24 12:00:00")
-    def test_stagger_is_deterministic_capped_and_overdue_work_is_immediate(self):
+    def test_stagger_is_deterministic_capped_and_overdue_work_is_immediate(self, caplog):
         at = timezone.now()
         workspace_integration = _enabled_calendar_integration()
         staggered = GoogleCalendarConnectionFactory(
@@ -140,13 +141,36 @@ class TestScheduleGoogleCalendarReconciliations:
             reconciliation_completed_at=None,
         )
 
-        with patch("plane.bgtasks.google_calendar_task.publish_google_calendar_task") as publish:
+        with (
+            caplog.at_level(logging.INFO, logger="plane.worker"),
+            patch("plane.bgtasks.google_calendar_task.publish_google_calendar_task") as publish,
+            patch("plane.bgtasks.google_calendar_task.publish_google_calendar_analytics") as analytics,
+        ):
             assert schedule_google_calendar_reconciliations.run() == 3
 
         countdowns = {call.args[1]: call.args[0].options["countdown"] for call in publish.call_args_list}
         assert countdowns[str(staggered.id)] == GOOGLE_CALENDAR_RECONCILIATION_MAX_STAGGER_SECONDS
         assert countdowns[str(overdue.id)] == 0
         assert countdowns[str(never_completed.id)] == 0
+        overdue_record = next(
+            record
+            for record in caplog.records
+            if getattr(record, "operation", None) == "scheduled_reconciliation"
+            and record.connection_id == str(overdue.id)
+        )
+        assert overdue_record.workspace_id == str(workspace_integration.workspace_id)
+        assert overdue_record.outcome == "published"
+        assert overdue_record.attempt == 1
+        assert overdue_record.enqueue_latency_ms >= 0
+        assert overdue_record.google_status_class == "not_requested"
+        assert overdue_record.calendar_generation == overdue.calendar_generation
+        assert overdue_record.reconciliation_action == "overdue"
+        assert overdue_record.last_completion_age_seconds == 18 * 60 * 60
+        overdue_analytics = next(
+            call for call in analytics.call_args_list if call.args == ("google_calendar_reconciliation_overdue",)
+        )
+        assert overdue_analytics.kwargs["connection_id"] == overdue.id
+        assert overdue_analytics.kwargs["last_completion_age_seconds"] == 18 * 60 * 60
 
     @freeze_time("2026-08-24 12:00:00")
     def test_publication_failure_is_isolated_and_failed_connection_remains_due(self):
@@ -346,7 +370,7 @@ class TestScheduleGoogleCalendarReconciliations:
         publish.assert_not_called()
 
     @freeze_time("2026-08-24 12:00:00")
-    def test_expired_attempts_clear_only_attempt_metadata_without_scheduling_work(self):
+    def test_expired_attempts_clear_only_attempt_metadata_without_scheduling_work(self, caplog):
         at = timezone.now()
         workspace_integration = _enabled_calendar_integration()
         popup_abandonment = GoogleCalendarConnectionFactory(
@@ -389,10 +413,12 @@ class TestScheduleGoogleCalendarReconciliations:
         row_count = GoogleCalendarConnection.objects.count()
 
         with (
+            caplog.at_level(logging.INFO, logger="plane.worker"),
             patch("plane.integrations.google_calendar.lifecycle._acquire_advisory_xact_lock"),
             patch("plane.bgtasks.google_calendar_task.publish_google_calendar_task") as publish,
             patch("plane.bgtasks.google_calendar_task.enqueue_google_calendar_task_on_commit") as enqueue,
             patch("plane.bgtasks.google_calendar_task.GoogleCalendarClient") as client_class,
+            patch("plane.bgtasks.google_calendar_task.publish_google_calendar_analytics") as analytics,
         ):
             assert schedule_google_calendar_reconciliations.run() == 0
             assert schedule_google_calendar_reconciliations.run() == 0
@@ -401,6 +427,24 @@ class TestScheduleGoogleCalendarReconciliations:
         publish.assert_not_called()
         enqueue.assert_not_called()
         client_class.assert_not_called()
+        recovery_records = [
+            record for record in caplog.records if getattr(record, "operation", None) == "lifecycle_recovery"
+        ]
+        assert len(recovery_records) == len(attempts)
+        assert {record.connection_id for record in recovery_records} == {str(connection.id) for connection in attempts}
+        for record in recovery_records:
+            assert record.workspace_id == str(workspace_integration.workspace_id)
+            assert record.outcome == "recovered"
+            assert record.attempt == 1
+            assert record.google_status_class == "not_requested"
+            assert record.reconciliation_action == "expire_oauth_attempt"
+        recovery_analytics = [
+            call for call in analytics.call_args_list if call.args == ("google_calendar_lifecycle_recovery",)
+        ]
+        assert len(recovery_analytics) == len(attempts)
+        assert not any(
+            connection.oauth_state in repr(record.__dict__) for connection in attempts for record in caplog.records
+        )
         for connection in attempts:
             connection.refresh_from_db()
             assert connection.oauth_state == ""
@@ -1051,7 +1095,7 @@ class TestGoogleCalendarReconciliationTask:
             "sync_token": "current-sync-token",
         }
 
-    def test_local_scan_uses_bounded_keyset_pages_without_overlapping_pacing_windows(self):
+    def test_local_scan_uses_bounded_keyset_pages_without_overlapping_pacing_windows(self, caplog):
         run_id = str(uuid4())
         connection = GoogleCalendarConnectionFactory(
             active=True,
@@ -1084,7 +1128,10 @@ class TestGoogleCalendarReconciliationTask:
             ]
         )
 
-        with patch("plane.bgtasks.google_calendar_task.publish_google_calendar_task") as publish:
+        with (
+            caplog.at_level(logging.INFO, logger="plane.worker"),
+            patch("plane.bgtasks.google_calendar_task.publish_google_calendar_task") as publish,
+        ):
             assert reconcile_google_calendar_inventory.run(str(connection.id), run_id) == "continued"
 
             first_page_calls = publish.call_args_list
@@ -1102,11 +1149,29 @@ class TestGoogleCalendarReconciliationTask:
 
         assert publish.call_count == 1
         assert publish.call_args.args[0].task == GOOGLE_CALENDAR_ISSUE_SYNC_TASK
+        local_inventory_records = [
+            record for record in caplog.records if getattr(record, "operation", None) == "local_inventory"
+        ]
+        assert len(local_inventory_records) == 2
+        assert [record.local_candidate_count for record in local_inventory_records] == [1000, 1]
+        assert [record.reconciliation_action for record in local_inventory_records] == [
+            "continue_local_scan",
+            "complete_local_scan",
+        ]
+        for record in local_inventory_records:
+            assert record.workspace_id == str(connection.workspace_integration.workspace_id)
+            assert record.connection_id == str(connection.id)
+            assert record.outcome == "page_selected"
+            assert record.attempt == 1
+            assert record.google_status_class == "not_requested"
+            assert record.inventory_mode == "local"
+            assert record.provider_page_count == 0
+            assert record.calendar_generation == connection.calendar_generation
         connection.refresh_from_db()
         assert connection.reconciliation_phase == ""
         assert connection.reconciliation_completed_at is not None
 
-    def test_expired_list_token_starts_full_inventory_without_touching_unknown_events(self):
+    def test_expired_list_token_starts_full_inventory_without_touching_unknown_events(self, caplog):
         connection = GoogleCalendarConnectionFactory(active=True, sync_token="expired-sync-token")
         correlation = GoogleCalendarEventFactory(
             connection=connection,
@@ -1122,8 +1187,10 @@ class TestGoogleCalendarReconciliationTask:
         client = _provider_client(GoogleCalendarSyncTokenExpired("expired"), full_page)
 
         with (
+            caplog.at_level(logging.INFO, logger="plane.worker"),
             patch("plane.bgtasks.google_calendar_task.GoogleCalendarClient", return_value=client),
             patch("plane.bgtasks.google_calendar_task.publish_google_calendar_task"),
+            patch("plane.bgtasks.google_calendar_task.publish_google_calendar_analytics") as analytics,
         ):
             assert reconcile_google_calendar_inventory.run(str(connection.id)) == "continued"
 
@@ -1137,6 +1204,21 @@ class TestGoogleCalendarReconciliationTask:
         assert correlation.provider_payload_hash == ""
         assert correlation.provider_status == ""
         assert GoogleCalendarEvent.objects.filter(connection=connection).count() == 1
+        reset_record = next(record for record in caplog.records if getattr(record, "outcome", None) == "reset")
+        assert reset_record.operation == "provider_inventory"
+        assert reset_record.workspace_id == str(connection.workspace_integration.workspace_id)
+        assert reset_record.connection_id == str(connection.id)
+        assert reset_record.attempt == 1
+        assert reset_record.google_status_class == "4xx"
+        assert reset_record.inventory_mode == "full"
+        assert reset_record.provider_page_count == 0
+        assert reset_record.local_candidate_count == 0
+        assert reset_record.calendar_generation == connection.calendar_generation
+        assert reset_record.reconciliation_action == "reset_inventory"
+        reset_analytics = next(
+            call for call in analytics.call_args_list if call.args == ("google_calendar_inventory_reset",)
+        )
+        assert reset_analytics.kwargs["connection_id"] == connection.id
 
     def test_failed_continuation_publication_cannot_record_completion(self):
         connection = GoogleCalendarConnectionFactory(active=True, sync_token="current-sync-token")

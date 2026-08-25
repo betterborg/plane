@@ -4,6 +4,7 @@
 
 import json
 import logging
+import time
 from datetime import timedelta
 from uuid import UUID, uuid4
 
@@ -39,6 +40,10 @@ from plane.integrations.google_calendar.client import (
     GoogleCalendarEventAbsent,
     GoogleCalendarInvalidGrant,
     GoogleCalendarSyncTokenExpired,
+)
+from plane.integrations.google_calendar.contracts import (
+    expired_google_calendar_oauth_attempts,
+    is_google_calendar_reconciliation_overdue,
 )
 from plane.integrations.google_calendar.dispatch import (
     GOOGLE_CALENDAR_CYCLE_BACKFILL_TASK,
@@ -85,7 +90,17 @@ from plane.integrations.google_calendar.lifecycle import (
     record_google_calendar_cleanup_error,
 )
 from plane.integrations.google_calendar.oauth import GoogleCalendarOAuthConfigurationError
+from plane.integrations.google_calendar.telemetry import (
+    log_google_calendar_operation,
+    publish_google_calendar_analytics,
+)
 from plane.license.utils.instance_value import get_email_configuration
+from plane.utils.analytics_events import (
+    GOOGLE_CALENDAR_CREDENTIAL_MISMATCH,
+    GOOGLE_CALENDAR_INVENTORY_RESET,
+    GOOGLE_CALENDAR_LIFECYCLE_RECOVERY,
+    GOOGLE_CALENDAR_RECONCILIATION_OVERDUE,
+)
 
 
 GOOGLE_CALENDAR_RECONCILIATION_LEASE = timedelta(minutes=5)
@@ -94,12 +109,53 @@ GOOGLE_CALENDAR_RECONCILIATION_LOCAL_PAGE_SIZE = 1000
 GOOGLE_CALENDAR_RECONCILIATION_PROVIDER_PHASE = "provider_inventory"
 GOOGLE_CALENDAR_RECONCILIATION_LOCAL_PHASE = "local_scan"
 GOOGLE_CALENDAR_HEALTHY_RECONCILIATION_INTERVAL = timedelta(hours=6)
-GOOGLE_CALENDAR_HEALTHY_RECONCILIATION_OVERDUE = timedelta(hours=18)
 GOOGLE_CALENDAR_SCHEDULER_LEASE = timedelta(hours=2)
 GOOGLE_CALENDAR_RECONCILIATION_MAX_STAGGER_SECONDS = 30 * 60
 GOOGLE_CALENDAR_OAUTH_ATTEMPT_EXPIRY_PAGE_SIZE = 100
 
 logger = logging.getLogger("plane.worker")
+
+
+def _google_calendar_log_context(connection, at=None):
+    completed_at = connection.reconciliation_completed_at
+    completion_age = None
+    if completed_at is not None:
+        completion_age = max(0, int(((at or timezone.now()) - completed_at).total_seconds()))
+    return {
+        "workspace_id": connection.workspace_integration.workspace_id,
+        "connection_id": connection.id,
+        "calendar_generation": connection.calendar_generation,
+        "last_completion_age_seconds": completion_age,
+    }
+
+
+def _publish_connection_analytics(event_name, connection, **fields):
+    try:
+        workspace = connection.workspace_integration.workspace
+        return publish_google_calendar_analytics(
+            event_name,
+            user_id=connection.member_id,
+            workspace_id=workspace.id,
+            workspace_slug=workspace.slug,
+            connection_id=connection.id,
+            calendar_generation=connection.calendar_generation,
+            **fields,
+        )
+    except Exception:
+        return False
+
+
+def _publication_failure(connection, operation, error, **fields):
+    failure_class = type(error).__name__
+    log_google_calendar_operation(
+        logger,
+        operation,
+        outcome="publication_failed",
+        publication_failure_class=failure_class,
+        google_status_class="not_requested",
+        **_google_calendar_log_context(connection),
+        **fields,
+    )
 
 
 def _google_calendar_settings_path(workspace_slug):
@@ -234,11 +290,11 @@ def _mark_google_calendar_connection_broken(connection, error):
     )
     connection_id = str(connection.id)
     broken_notified_at = connection.broken_notified_at.isoformat()
-
-    def _send_disconnected_email():
-        send_google_calendar_disconnected_email.delay(connection_id, broken_notified_at)
-
-    transaction.on_commit(_send_disconnected_email, robust=True)
+    enqueue_google_calendar_task_on_commit(
+        send_google_calendar_disconnected_email,
+        connection_id,
+        broken_notified_at,
+    )
     return True
 
 
@@ -351,7 +407,7 @@ def _claim_present_recovery(connection_id):
 def _expired_oauth_attempt_pages(at):
     after_id = None
     while True:
-        candidates = GoogleCalendarConnection.objects.filter(oauth_attempt_expires_at__lte=at).exclude(oauth_state="")
+        candidates = GoogleCalendarConnection.objects.filter(expired_google_calendar_oauth_attempts(at))
         if after_id is not None:
             candidates = candidates.filter(id__gt=after_id)
         page = list(
@@ -390,6 +446,22 @@ def _clear_expired_oauth_attempt(connection_id, attempt_generation, expires_at, 
             "oauth_redirect_uri",
             "oauth_attempt_expires_at",
         ]
+    )
+    log_google_calendar_operation(
+        logger,
+        "lifecycle_recovery",
+        outcome="recovered",
+        attempt=1,
+        google_status_class="not_requested",
+        reconciliation_action="expire_oauth_attempt",
+        **_google_calendar_log_context(connection, at),
+    )
+    _publish_connection_analytics(
+        GOOGLE_CALENDAR_LIFECYCLE_RECOVERY,
+        connection,
+        outcome="recovered",
+        google_status_class="not_requested",
+        reconciliation_action="expire_oauth_attempt",
     )
     return True
 
@@ -462,21 +534,44 @@ def schedule_google_calendar_reconciliations():
         if claim is None:
             continue
         connection, lease_expires_at = claim
-        overdue = (
-            connection.reconciliation_completed_at is None
-            or connection.reconciliation_completed_at <= at - GOOGLE_CALENDAR_HEALTHY_RECONCILIATION_OVERDUE
-        )
+        overdue = is_google_calendar_reconciliation_overdue(connection.reconciliation_completed_at, at)
         countdown = 0 if overdue else _healthy_reconciliation_countdown(connection.id)
         inventory_task = current_app.signature(GOOGLE_CALENDAR_INVENTORY_TASK).set(countdown=countdown)
+        publish_started_at = time.monotonic()
         try:
             publish_google_calendar_task(inventory_task, str(connection.id))
-        except Exception:
+        except Exception as exc:
             _release_scheduler_lease(connection.id, lease_expires_at)
-            logger.exception(
-                "Failed to publish scheduled Google Calendar reconciliation",
-                extra={"connection_id": str(connection.id)},
+            _publication_failure(
+                connection,
+                "scheduled_reconciliation",
+                exc,
+                attempt=1,
+                enqueue_latency_ms=round((time.monotonic() - publish_started_at) * 1000, 3),
+                reconciliation_action="overdue" if overdue else "scheduled",
             )
             continue
+        enqueue_latency_ms = round((time.monotonic() - publish_started_at) * 1000, 3)
+        log_google_calendar_operation(
+            logger,
+            "scheduled_reconciliation",
+            outcome="published",
+            attempt=1,
+            enqueue_latency_ms=enqueue_latency_ms,
+            google_status_class="not_requested",
+            reconciliation_action="overdue" if overdue else "scheduled",
+            **_google_calendar_log_context(connection, at),
+        )
+        if overdue:
+            _publish_connection_analytics(
+                GOOGLE_CALENDAR_RECONCILIATION_OVERDUE,
+                connection,
+                outcome="published",
+                enqueue_latency_ms=enqueue_latency_ms,
+                google_status_class="not_requested",
+                reconciliation_action="overdue",
+                last_completion_age_seconds=_google_calendar_log_context(connection, at)["last_completion_age_seconds"],
+            )
         published += 1
 
     for candidate in _present_recovery_candidates():
@@ -484,14 +579,38 @@ def schedule_google_calendar_reconciliations():
         if generation is None:
             continue
         lifecycle_task = current_app.signature(GOOGLE_CALENDAR_LIFECYCLE_TASK)
+        publish_started_at = time.monotonic()
         try:
             publish_google_calendar_task(lifecycle_task, str(candidate.id), generation)
-        except Exception:
-            logger.exception(
-                "Failed to publish Google Calendar present recovery",
-                extra={"connection_id": str(candidate.id), "generation": generation},
+        except Exception as exc:
+            _publication_failure(
+                candidate,
+                "lifecycle_recovery",
+                exc,
+                attempt=1,
+                enqueue_latency_ms=round((time.monotonic() - publish_started_at) * 1000, 3),
+                reconciliation_action="present",
             )
             continue
+        enqueue_latency_ms = round((time.monotonic() - publish_started_at) * 1000, 3)
+        log_google_calendar_operation(
+            logger,
+            "lifecycle_recovery",
+            outcome="published",
+            attempt=1,
+            enqueue_latency_ms=enqueue_latency_ms,
+            google_status_class="not_requested",
+            reconciliation_action="present",
+            **_google_calendar_log_context(candidate, at),
+        )
+        _publish_connection_analytics(
+            GOOGLE_CALENDAR_LIFECYCLE_RECOVERY,
+            candidate,
+            outcome="published",
+            enqueue_latency_ms=enqueue_latency_ms,
+            google_status_class="not_requested",
+            reconciliation_action="present",
+        )
         published += 1
 
     for page in _expired_oauth_attempt_pages(at):
@@ -502,26 +621,75 @@ def schedule_google_calendar_reconciliations():
         generation = _claim_cleanup_recovery(connection_id)
         if generation is None:
             continue
+        connection = GoogleCalendarConnection.all_objects.select_related("workspace_integration__workspace").get(
+            id=connection_id
+        )
         lifecycle_task = current_app.signature(GOOGLE_CALENDAR_LIFECYCLE_TASK)
+        publish_started_at = time.monotonic()
         try:
             publish_google_calendar_task(lifecycle_task, str(connection_id), generation)
-        except Exception:
-            logger.exception(
-                "Failed to publish Google Calendar cleanup recovery",
-                extra={"connection_id": str(connection_id), "generation": generation},
+        except Exception as exc:
+            _publication_failure(
+                connection,
+                "lifecycle_recovery",
+                exc,
+                attempt=1,
+                enqueue_latency_ms=round((time.monotonic() - publish_started_at) * 1000, 3),
+                reconciliation_action="cleanup",
             )
             continue
+        enqueue_latency_ms = round((time.monotonic() - publish_started_at) * 1000, 3)
+        log_google_calendar_operation(
+            logger,
+            "lifecycle_recovery",
+            outcome="published",
+            attempt=1,
+            enqueue_latency_ms=enqueue_latency_ms,
+            google_status_class="not_requested",
+            reconciliation_action="cleanup",
+            **_google_calendar_log_context(connection, at),
+        )
+        _publish_connection_analytics(
+            GOOGLE_CALENDAR_LIFECYCLE_RECOVERY,
+            connection,
+            outcome="published",
+            enqueue_latency_ms=enqueue_latency_ms,
+            google_status_class="not_requested",
+            reconciliation_action="cleanup",
+        )
         published += 1
 
     for connection_id, broken_notified_at in _broken_email_recovery_candidates().iterator():
+        connection = GoogleCalendarConnection.objects.select_related("workspace_integration__workspace").get(
+            id=connection_id
+        )
+        publish_started_at = time.monotonic()
         try:
-            send_google_calendar_disconnected_email.delay(str(connection_id), broken_notified_at.isoformat())
-        except Exception:
-            logger.exception(
-                "Failed to publish Google Calendar disconnected email recovery",
-                extra={"connection_id": str(connection_id)},
+            publish_google_calendar_task(
+                send_google_calendar_disconnected_email,
+                str(connection_id),
+                broken_notified_at.isoformat(),
+            )
+        except Exception as exc:
+            _publication_failure(
+                connection,
+                "health_notice_publication",
+                exc,
+                attempt=1,
+                enqueue_latency_ms=round((time.monotonic() - publish_started_at) * 1000, 3),
+                reconciliation_action="recover_health_notice",
             )
             continue
+        log_google_calendar_operation(
+            logger,
+            "health_notice_publication",
+            outcome="published",
+            attempt=1,
+            enqueue_latency_ms=round((time.monotonic() - publish_started_at) * 1000, 3),
+            google_status_class="not_requested",
+            reconciliation_action="recover_health_notice",
+            **_google_calendar_log_context(connection, at),
+        )
         published += 1
     return published
 
@@ -546,9 +714,24 @@ def _persist_refreshed_access_token(connection, client):
 def _mark_credential_mismatch(connection):
     if connection.desired_state == GoogleCalendarConnection.DesiredState.CONNECTED:
         _mark_google_calendar_connection_broken(connection, GoogleCalendarCredentialMismatch.classification)
-        return
-    connection.last_error = GoogleCalendarCredentialMismatch.classification
-    connection.save(update_fields=["last_error", "updated_at"])
+    else:
+        connection.last_error = GoogleCalendarCredentialMismatch.classification
+        connection.save(update_fields=["last_error", "updated_at"])
+    log_google_calendar_operation(
+        logger,
+        "credential_binding",
+        outcome="mismatch",
+        google_status_class="not_requested",
+        reconciliation_action="blocked",
+        **_google_calendar_log_context(connection),
+    )
+    _publish_connection_analytics(
+        GOOGLE_CALENDAR_CREDENTIAL_MISMATCH,
+        connection,
+        outcome="mismatch",
+        google_status_class="not_requested",
+        reconciliation_action="blocked",
+    )
 
 
 def _mark_authorization_failure(connection, error):
@@ -937,8 +1120,48 @@ def _synchronize_issue_for_connection_transaction(issue_id, connection_id):
 def _synchronize_issue_for_connection(issue_id, connection_id):
     result = _synchronize_issue_for_connection_transaction(issue_id, connection_id)
     if isinstance(result, _GoogleCalendarProviderRetry):
+        _log_google_calendar_entity_sync(
+            "work_item_publication",
+            issue_id,
+            connection_id,
+            "failed",
+            google_status_class="provider_error",
+        )
         raise result.error
+    _log_google_calendar_entity_sync("work_item_publication", issue_id, connection_id, result)
     return result
+
+
+def _log_google_calendar_entity_sync(operation, entity_id, connection_id, outcome, google_status_class=None):
+    connection = (
+        GoogleCalendarConnection.all_objects.select_related("workspace_integration").filter(id=connection_id).first()
+    )
+    if connection is None:
+        return
+    log_google_calendar_operation(
+        logger,
+        operation,
+        entity_id=entity_id,
+        outcome=outcome,
+        attempt=1,
+        google_status_class=google_status_class or _entity_sync_google_status_class(outcome),
+        reconciliation_action="converge_entity",
+        **_google_calendar_log_context(connection),
+    )
+
+
+def _entity_sync_google_status_class(outcome):
+    if outcome in {"created", "updated"}:
+        return "2xx"
+    if outcome in {"missing_connection", "missing", "ineligible", "retained", "stale", "unchanged"}:
+        return "not_requested"
+    if outcome == "credential_mismatch":
+        return "not_requested"
+    if outcome in {"authorization_failed", "replacement_pending"}:
+        return "4xx"
+    # A deletion may be provider-backed or local-only depending on the
+    # correlation generation, so do not claim a Google response class.
+    return "unknown"
 
 
 def _connection_ids_for_issue(issue, connection_id=None):
@@ -1052,7 +1275,15 @@ def _synchronize_cycle_for_connection_transaction(cycle_id, connection_id):
 def _synchronize_cycle_for_connection(cycle_id, connection_id):
     result = _synchronize_cycle_for_connection_transaction(cycle_id, connection_id)
     if isinstance(result, _GoogleCalendarProviderRetry):
+        _log_google_calendar_entity_sync(
+            "cycle_publication",
+            cycle_id,
+            connection_id,
+            "failed",
+            google_status_class="provider_error",
+        )
         raise result.error
+    _log_google_calendar_entity_sync("cycle_publication", cycle_id, connection_id, result)
     return result
 
 
@@ -1777,7 +2008,7 @@ def _apply_inventory_marker_candidates(connection, candidates):
 
 
 @transaction.atomic
-def _record_inventory_page(connection_id, run_id, lease_token, page):
+def _record_inventory_page(connection_id, run_id, lease_token, page, attempt=1):
     connection = GoogleCalendarConnection.objects.select_for_update().get(id=connection_id)
     state = _reconciliation_state(connection)
     if not _owns_reconciliation_lease(
@@ -1880,8 +2111,21 @@ def _record_inventory_page(connection_id, run_id, lease_token, page):
 
     state["provider_marker_candidates"] = marker_candidates
     state["saw_delta"] = state.get("saw_delta", False) or bool(page.events)
+    inventory_mode = "full" if state.get("full_inventory") else "incremental"
     if page.next_page_token:
         _save_reconciliation_state(connection, state, page_token=page.next_page_token)
+        log_google_calendar_operation(
+            logger,
+            "provider_inventory",
+            outcome="page_recorded",
+            attempt=attempt,
+            google_status_class="2xx",
+            inventory_mode=inventory_mode,
+            provider_page_count=attempt,
+            local_candidate_count=len(changed),
+            reconciliation_action="continue_provider_inventory",
+            **_google_calendar_log_context(connection),
+        )
         return "more"
 
     if state.get("full_inventory"):
@@ -1898,12 +2142,36 @@ def _record_inventory_page(connection_id, run_id, lease_token, page):
             phase=GOOGLE_CALENDAR_RECONCILIATION_LOCAL_PHASE,
             page_token="",
         )
+        log_google_calendar_operation(
+            logger,
+            "provider_inventory",
+            outcome="page_recorded",
+            attempt=attempt,
+            google_status_class="2xx",
+            inventory_mode=inventory_mode,
+            provider_page_count=attempt,
+            local_candidate_count=len(changed),
+            reconciliation_action="start_local_scan",
+            **_google_calendar_log_context(connection),
+        )
         return "local"
+    log_google_calendar_operation(
+        logger,
+        "provider_inventory",
+        outcome="complete",
+        attempt=attempt,
+        google_status_class="2xx",
+        inventory_mode=inventory_mode,
+        provider_page_count=attempt,
+        local_candidate_count=0,
+        reconciliation_action="complete",
+        **_google_calendar_log_context(connection),
+    )
     return _complete_reconciliation_run(connection, state)
 
 
 @transaction.atomic
-def _expire_inventory_sync_token(connection_id, run_id, lease_token):
+def _expire_inventory_sync_token(connection_id, run_id, lease_token, attempt=1):
     connection = GoogleCalendarConnection.objects.select_for_update().get(id=connection_id)
     state = _reconciliation_state(connection)
     if not _owns_reconciliation_lease(
@@ -1924,6 +2192,26 @@ def _expire_inventory_sync_token(connection_id, run_id, lease_token):
     ).update(provider_etag="", provider_payload_hash="", provider_status="")
     connection.save(update_fields=["sync_token", "page_token", "updated_at"])
     _save_reconciliation_state(connection, state, page_token="")
+    log_google_calendar_operation(
+        logger,
+        "provider_inventory",
+        outcome="reset",
+        attempt=attempt,
+        google_status_class="4xx",
+        inventory_mode="full",
+        provider_page_count=max(0, attempt - 1),
+        local_candidate_count=0,
+        reconciliation_action="reset_inventory",
+        **_google_calendar_log_context(connection),
+    )
+    _publish_connection_analytics(
+        GOOGLE_CALENDAR_INVENTORY_RESET,
+        connection,
+        outcome="reset",
+        google_status_class="4xx",
+        inventory_mode="full",
+        reconciliation_action="reset_inventory",
+    )
     return True
 
 
@@ -2044,6 +2332,18 @@ def _advance_local_scan(connection_id, run_id, lease_token):
     correlations = list(queryset[: GOOGLE_CALENDAR_RECONCILIATION_LOCAL_PAGE_SIZE + 1])
     current_page = correlations[:GOOGLE_CALENDAR_RECONCILIATION_LOCAL_PAGE_SIZE]
     has_more = len(correlations) > len(current_page)
+    log_google_calendar_operation(
+        logger,
+        "local_inventory",
+        outcome="page_selected",
+        attempt=1,
+        google_status_class="not_requested",
+        inventory_mode="local",
+        provider_page_count=0,
+        local_candidate_count=len(current_page),
+        reconciliation_action="continue_local_scan" if has_more else "complete_local_scan",
+        **_google_calendar_log_context(connection),
+    )
     if has_more:
         return "more", current_page
     connection.reconciliation_lease_expires_at = timezone.now() + GOOGLE_CALENDAR_RECONCILIATION_LEASE
@@ -2113,7 +2413,7 @@ def reconcile_google_calendar_inventory(connection_id, run_id=None, force_local_
 
     if connection.reconciliation_phase == GOOGLE_CALENDAR_RECONCILIATION_PROVIDER_PHASE:
         client = _client_for(connection)
-        for _ in range(GOOGLE_CALENDAR_RECONCILIATION_PROVIDER_PAGE_LIMIT):
+        for attempt in range(1, GOOGLE_CALENDAR_RECONCILIATION_PROVIDER_PAGE_LIMIT + 1):
             connection.refresh_from_db()
             state = _reconciliation_state(connection)
             if not _owns_reconciliation_lease(connection, state, run_id, lease_token):
@@ -2125,7 +2425,7 @@ def reconcile_google_calendar_inventory(connection_id, run_id=None, force_local_
                     sync_token=connection.sync_token or None,
                 )
             except GoogleCalendarSyncTokenExpired:
-                if not _expire_inventory_sync_token(connection.id, run_id, lease_token):
+                if not _expire_inventory_sync_token(connection.id, run_id, lease_token, attempt):
                     return "stale"
                 connection.refresh_from_db()
                 continue
@@ -2139,7 +2439,7 @@ def reconcile_google_calendar_inventory(connection_id, run_id=None, force_local_
                 if not _record_reconciliation_authorization_failure(connection.id, run_id, lease_token, exc):
                     return "stale"
                 return "authorization_failed"
-            result = _record_inventory_page(connection.id, run_id, lease_token, page)
+            result = _record_inventory_page(connection.id, run_id, lease_token, page, attempt)
             if result == "stale":
                 return result
             if result == "more":
@@ -2492,6 +2792,7 @@ def reconcile_google_calendar_connection(connection_id, generation):
 
     prepared_state = _prepare_reconciliation(connection_id, generation)
     if prepared_state in {"missing", "stale"}:
+        _log_lifecycle_reconciliation_outcome(connection_id, prepared_state, "prepare")
         return prepared_state
     connection_manager = (
         GoogleCalendarConnection.all_objects
@@ -2501,10 +2802,45 @@ def reconcile_google_calendar_connection(connection_id, generation):
     try:
         connection = connection_manager.get(id=connection_id)
     except GoogleCalendarConnection.DoesNotExist:
+        _log_lifecycle_reconciliation_outcome(connection_id, "missing", "prepare")
         return "missing"
     if prepared_state == GoogleCalendarConnection.DesiredState.CONNECTED:
-        return _converge_present(connection, generation)
-    delete_result = _delete_absent_calendar(connection, generation)
-    if delete_result != "ready":
-        return delete_result
-    return _complete_absent(connection, generation)
+        result = _converge_present(connection, generation)
+        action = "present"
+    else:
+        delete_result = _delete_absent_calendar(connection, generation)
+        result = delete_result if delete_result != "ready" else _complete_absent(connection, generation)
+        action = "cleanup"
+    connection = connection_manager.select_related("workspace_integration").get(id=connection_id)
+    log_google_calendar_operation(
+        logger,
+        "lifecycle_reconciliation",
+        outcome=result,
+        attempt=1,
+        google_status_class=_lifecycle_google_status_class(result),
+        reconciliation_action=action,
+        **_google_calendar_log_context(connection),
+    )
+    return result
+
+
+def _log_lifecycle_reconciliation_outcome(connection_id, outcome, action):
+    log_google_calendar_operation(
+        logger,
+        "lifecycle_reconciliation",
+        connection_id=connection_id,
+        outcome=outcome,
+        attempt=1,
+        google_status_class=_lifecycle_google_status_class(outcome),
+        reconciliation_action=action,
+    )
+
+
+def _lifecycle_google_status_class(outcome):
+    if outcome == "active":
+        return "2xx"
+    if outcome in {"missing", "stale"}:
+        return "not_requested"
+    # Cleanup success and lifecycle errors can include either provider HTTP or
+    # local-only convergence. Without the exact response, report that honestly.
+    return "unknown"

@@ -2,7 +2,6 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # See the LICENSE file for details.
 
-import hmac
 import random
 import time
 from dataclasses import dataclass
@@ -20,7 +19,7 @@ from plane.integrations.google_calendar.oauth import (
     GoogleCalendarOAuthConfigurationError,
     get_google_calendar_oauth_credentials,
 )
-from plane.license.utils.google_calendar_credentials import google_calendar_credential_fingerprint
+from plane.license.utils.google_calendar_credentials import google_calendar_credential_binding_matches
 
 
 GOOGLE_CALENDAR_API_URL = "https://www.googleapis.com/calendar/v3"
@@ -123,14 +122,7 @@ class GoogleCalendarClient:
             credentials = get_google_calendar_oauth_credentials()
         except GoogleCalendarOAuthConfigurationError as exc:
             raise GoogleCalendarCredentialMismatch("Google Calendar OAuth credentials changed") from exc
-        effective_fingerprint = google_calendar_credential_fingerprint(
-            credentials.client_id,
-            credentials.client_secret,
-        )
-        if not self._credential_fingerprint or not hmac.compare_digest(
-            self._credential_fingerprint,
-            effective_fingerprint,
-        ):
+        if not google_calendar_credential_binding_matches(self._credential_fingerprint, credentials):
             raise GoogleCalendarCredentialMismatch("Google Calendar OAuth credentials changed")
         return credentials
 

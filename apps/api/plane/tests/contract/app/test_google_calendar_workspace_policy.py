@@ -436,6 +436,7 @@ class TestGoogleCalendarWorkspacePolicy:
             patch("plane.app.views.integration._has_complete_google_calendar_credentials", return_value=True),
             patch("plane.integrations.google_calendar.lifecycle._acquire_advisory_xact_lock"),
             patch("plane.app.views.integration.current_app.signature", return_value=lifecycle_task),
+            patch("plane.app.views.integration.publish_google_calendar_analytics") as analytics,
         ):
             response = session_client.patch(_policy_url(workspace), {"enabled": True}, format="json")
 
@@ -456,6 +457,12 @@ class TestGoogleCalendarWorkspacePolicy:
         assert connection.status == GoogleCalendarConnection.Status.PENDING
         assert connection.lifecycle_generation == 5
         lifecycle_task.delay.assert_called_once_with(str(connection.id), 5)
+        adoption = next(call for call in analytics.call_args_list if call.args == ("google_calendar_adopted",))
+        assert adoption.kwargs["user_id"] == workspace.owner_id
+        assert adoption.kwargs["workspace_id"] == workspace.id
+        assert adoption.kwargs["outcome"] == "enabled"
+        assert adoption.kwargs["google_status_class"] == "not_requested"
+        assert adoption.kwargs["reconciliation_action"] == "adopt"
 
     @pytest.mark.django_db(transaction=True)
     def test_completion_policy_update_resyncs_terminal_and_reopened_events_after_commit(

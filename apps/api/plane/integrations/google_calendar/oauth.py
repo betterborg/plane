@@ -18,6 +18,7 @@ from django.db.models import Q
 from django.utils import timezone
 
 from plane.db.models import GoogleCalendarConnection
+from plane.integrations.google_calendar.telemetry import log_google_calendar_operation
 from plane.license.utils.instance_value import get_configuration_value
 
 
@@ -219,7 +220,29 @@ def revoke_rejected_google_calendar_grant(grant, *, account_id=""):
             timeout=GOOGLE_CALENDAR_OAUTH_TIMEOUT,
         )
         response.raise_for_status()
-    except requests.RequestException:
-        logger.warning("Failed to revoke a rejected Google Calendar OAuth grant", exc_info=True)
+    except requests.RequestException as exc:
+        log_google_calendar_operation(
+            logger,
+            "rejected_grant_revocation",
+            outcome="failed",
+            attempt=1,
+            google_status_class=_google_calendar_response_status_class(getattr(exc, "response", None)),
+            reconciliation_action="best_effort_revoke",
+        )
         return False
+    log_google_calendar_operation(
+        logger,
+        "rejected_grant_revocation",
+        outcome="revoked",
+        attempt=1,
+        google_status_class=_google_calendar_response_status_class(response),
+        reconciliation_action="best_effort_revoke",
+    )
     return True
+
+
+def _google_calendar_response_status_class(response):
+    status_code = getattr(response, "status_code", None)
+    if isinstance(status_code, int) and 100 <= status_code <= 599:
+        return f"{status_code // 100}xx"
+    return "transport_error"

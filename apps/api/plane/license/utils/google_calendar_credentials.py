@@ -7,6 +7,7 @@ import hmac
 
 from django.conf import settings
 from plane.db.models import GoogleCalendarConnection
+from plane.integrations.google_calendar.contracts import has_google_calendar_provider_state
 from plane.integrations.google_calendar.lifecycle import lock_all_google_calendar_connections
 
 
@@ -16,20 +17,6 @@ GOOGLE_CALENDAR_CREDENTIAL_KEYS = frozenset(
         "GOOGLE_CALENDAR_CLIENT_SECRET",
         "GOOGLE_CALENDAR_IS_PROJECT_DEDICATED",
     }
-)
-
-_GOOGLE_CALENDAR_PROVIDER_STATE_FIELDS = (
-    "provider_account_id",
-    "provider_email",
-    "calendar_id",
-    "calendar_operation_id",
-    "access_token",
-    "refresh_token",
-    "sync_token",
-    "page_token",
-    "token_expires_at",
-    "scopes",
-    "credential_fingerprint",
 )
 
 _GOOGLE_CALENDAR_OAUTH_ATTEMPT_DEFAULTS = {
@@ -61,11 +48,7 @@ def prepare_google_calendar_credential_replacement(configuration_keys):
     # Use the unfiltered manager so a soft-deleted grant can never make an
     # unsupported credential replacement appear safe.
     calendar_connections = lock_all_google_calendar_connections()
-    if any(
-        getattr(connection, field)
-        for connection in calendar_connections
-        for field in _GOOGLE_CALENDAR_PROVIDER_STATE_FIELDS
-    ):
+    if any(has_google_calendar_provider_state(connection) for connection in calendar_connections):
         raise GoogleCalendarCredentialsLocked
 
     # Lock every remaining attempt-only/tombstone row before invalidating it.
@@ -84,3 +67,19 @@ def google_calendar_credential_fingerprint(client_id, client_secret):
 
     credential_material = f"{client_id}\0{client_secret}".encode()
     return hmac.new(settings.SECRET_KEY.encode(), credential_material, hashlib.sha256).hexdigest()
+
+
+def google_calendar_credential_binding_matches(credential_fingerprint, credentials):
+    """Return whether persisted binding matches the effective OAuth credentials."""
+
+    effective_fingerprint = google_calendar_credential_fingerprint(
+        credentials.client_id,
+        credentials.client_secret,
+    )
+    return bool(
+        credential_fingerprint
+        and hmac.compare_digest(
+            credential_fingerprint,
+            effective_fingerprint,
+        )
+    )

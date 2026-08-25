@@ -63,25 +63,28 @@ class TestEnqueueGoogleCalendarTaskOnCommit:
         failed_task = Mock()
         failed_task.delay.side_effect = RuntimeError("broker unavailable")
 
-        with caplog.at_level(logging.ERROR, logger="django.db.backends.base"):
+        with caplog.at_level(logging.ERROR, logger="plane.integrations.google_calendar.dispatch"):
             enqueue_google_calendar_task_on_commit(failed_task, "connection-id")
 
         failed_task.delay.assert_called_once_with("connection-id")
-        assert "_enqueue_google_calendar_task" in caplog.text
-        assert "broker unavailable" in caplog.text
+        record = next(record for record in caplog.records if getattr(record, "operation", None) == "task_publication")
+        assert record.outcome == "failed"
+        assert record.publication_failure_class == "RuntimeError"
+        assert "broker unavailable" not in repr(record.__dict__)
 
     def test_broker_exception_does_not_prevent_later_callback(self, caplog):
         failed_task = Mock()
         failed_task.delay.side_effect = RuntimeError("broker unavailable")
         later_callback = Mock()
 
-        with caplog.at_level(logging.ERROR, logger="django.db.backends.base"):
+        with caplog.at_level(logging.ERROR, logger="plane.integrations.google_calendar.dispatch"):
             with transaction.atomic():
                 enqueue_google_calendar_task_on_commit(failed_task, "connection-id")
                 transaction.on_commit(later_callback)
 
         failed_task.delay.assert_called_once_with("connection-id")
         later_callback.assert_called_once_with()
+        assert "broker unavailable" not in repr(caplog.records[-1].__dict__)
 
 
 @pytest.mark.unit
