@@ -64,6 +64,23 @@ export interface IGoogleCalendarWorkspaceStatus {
   connection: IGoogleCalendarConnectionStatus | null;
 }
 
+export interface IGoogleCalendarReleaseReadiness {
+  ready: boolean;
+  released: boolean;
+  configuration_complete: boolean;
+  credential_binding_complete: boolean;
+  lifecycle_recovery_complete: boolean;
+  backend_verification_complete: boolean;
+  reconciliation_overdue: boolean;
+  provider_connection_count: number;
+  credential_mismatch_count: number;
+  incomplete_lifecycle_count: number;
+  required_verification_count: number;
+  completed_verification_count: number;
+  overdue_reconciliation_count: number;
+  last_completion_age_seconds: number | null;
+}
+
 export interface IGoogleCalendarFilterOptionLabel {
   id: string;
   name: string;
