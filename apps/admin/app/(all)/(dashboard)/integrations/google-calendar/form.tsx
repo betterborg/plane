@@ -4,13 +4,20 @@
  * See the LICENSE file for details.
  */
 
+import { useState } from "react";
 import { Controller, useForm } from "react-hook-form";
-import { CalendarCheck, CircleAlert } from "lucide-react";
+import { CalendarCheck, Check, CircleAlert, CircleX } from "lucide-react";
+import useSWR, { useSWRConfig } from "swr";
 // plane internal packages
 import { API_BASE_URL } from "@plane/constants";
 import { Button } from "@plane/propel/button";
 import { TOAST_TYPE, setToast } from "@plane/propel/toast";
-import type { IFormattedInstanceConfiguration, TInstanceGoogleCalendarConfigurationKeys } from "@plane/types";
+import { InstanceService } from "@plane/services";
+import type {
+  IFormattedInstanceConfiguration,
+  IGoogleCalendarReleaseReadiness,
+  TInstanceGoogleCalendarConfigurationKeys,
+} from "@plane/types";
 import { Checkbox } from "@plane/ui";
 // components
 import { CodeBlock } from "@/components/common/code-block";
@@ -30,15 +37,186 @@ type ConfigurationError = {
   error?: string;
 };
 
-const isCalendarCredentialsLockedError = (error: unknown): error is ConfigurationError =>
+const CALENDAR_CREDENTIAL_REPLACEMENT_ERRORS = new Set([
+  "google_calendar_credentials_in_use",
+  "google_calendar_credentials_locked",
+]);
+const GOOGLE_CALENDAR_RELEASE_READINESS_KEY = "GOOGLE_CALENDAR_RELEASE_READINESS";
+
+const instanceService = new InstanceService();
+
+const isCalendarCredentialReplacementError = (error: unknown): error is ConfigurationError =>
   typeof error === "object" &&
   error !== null &&
   "error" in error &&
-  (error as ConfigurationError).error === "google_calendar_credentials_locked";
+  typeof (error as ConfigurationError).error === "string" &&
+  CALENDAR_CREDENTIAL_REPLACEMENT_ERRORS.has((error as ConfigurationError).error as string);
+
+type ReadinessCheckProps = {
+  complete: boolean;
+  label: string;
+  description: string;
+};
+
+function ReadinessCheck(props: ReadinessCheckProps) {
+  const { complete, label, description } = props;
+
+  return (
+    <li className="flex items-start gap-3 py-3 first:pt-0 last:pb-0">
+      <span
+        className={`mt-0.5 flex size-5 shrink-0 items-center justify-center rounded-full ${
+          complete ? "bg-success-subtle text-success-primary" : "bg-warning-subtle text-warning-primary"
+        }`}
+      >
+        {complete ? <Check className="size-3.5" /> : <CircleX className="size-3.5" />}
+      </span>
+      <div>
+        <p className="text-13 font-medium text-primary">{label}</p>
+        <p className="mt-0.5 text-12 text-tertiary">{description}</p>
+      </div>
+    </li>
+  );
+}
+
+function readinessSummary(readiness: IGoogleCalendarReleaseReadiness) {
+  if (readiness.ready) {
+    return {
+      title: "Calendar backend is ready",
+      description: "Credentials, lifecycle recovery, and required reconciliation checks are complete.",
+    };
+  }
+  if (!readiness.configuration_complete) {
+    return {
+      title: "Calendar backend setup is incomplete",
+      description: "Save a dedicated Google OAuth client before preparing this integration for release.",
+    };
+  }
+  if (!readiness.credential_binding_complete) {
+    return {
+      title: "Calendar credential mismatch detected",
+      description: "One or more connections are bound to a different OAuth client configuration.",
+    };
+  }
+  if (!readiness.lifecycle_recovery_complete) {
+    return {
+      title: "Calendar lifecycle recovery is incomplete",
+      description: "Wait for pending connection and cleanup operations to reach a terminal state.",
+    };
+  }
+  return {
+    title: "Calendar backend verification is incomplete",
+    description: "Required reconciliation checks must complete before the backend is ready for release.",
+  };
+}
+
+function InstanceGoogleCalendarReadiness() {
+  const {
+    data: readiness,
+    error,
+    isLoading,
+  } = useSWR(GOOGLE_CALENDAR_RELEASE_READINESS_KEY, () => instanceService.googleCalendarReleaseReadiness());
+
+  if (isLoading) {
+    return (
+      <section className="rounded-lg border border-subtle bg-layer-1 p-5">
+        <p className="text-13 text-tertiary">Checking Calendar backend readiness…</p>
+      </section>
+    );
+  }
+
+  if (error || !readiness) {
+    return (
+      <section className="flex gap-3 rounded-lg border border-danger-subtle bg-danger-subtle p-5">
+        <CircleAlert className="mt-0.5 size-4 shrink-0 text-danger-primary" />
+        <div>
+          <h2 className="text-14 font-medium text-primary">Calendar readiness is unavailable</h2>
+          <p className="mt-1 text-13 text-secondary">
+            Plane could not verify the backend state. Refresh this page before making a release decision.
+          </p>
+        </div>
+      </section>
+    );
+  }
+
+  const summary = readinessSummary(readiness);
+  const verificationDescription = readiness.backend_verification_complete
+    ? `${readiness.completed_verification_count} of ${readiness.required_verification_count} required connections verified.`
+    : readiness.reconciliation_overdue
+      ? `${readiness.overdue_reconciliation_count} required reconciliation checks are overdue.`
+      : `${readiness.completed_verification_count} of ${readiness.required_verification_count} required connections verified.`;
+
+  return (
+    <section className="rounded-lg border border-subtle bg-layer-1 p-5">
+      <div className="flex flex-wrap items-start justify-between gap-3 border-b border-subtle pb-4">
+        <div className="flex gap-3">
+          {readiness.ready ? (
+            <span className="flex size-8 shrink-0 items-center justify-center rounded-full bg-success-subtle text-success-primary">
+              <Check className="size-5" />
+            </span>
+          ) : (
+            <span className="flex size-8 shrink-0 items-center justify-center rounded-full bg-warning-subtle text-warning-primary">
+              <CircleAlert className="size-5" />
+            </span>
+          )}
+          <div>
+            <h2 className="text-16 font-medium text-primary">{summary.title}</h2>
+            <p className="mt-1 max-w-2xl text-13 text-secondary">{summary.description}</p>
+          </div>
+        </div>
+        <span className="rounded-sm border border-subtle bg-surface-1 px-2 py-1 text-11 font-medium text-secondary">
+          {readiness.released ? "Released by server environment" : "Release disabled by server environment"}
+        </span>
+      </div>
+
+      <ul className="divide-y divide-subtle pt-4">
+        <ReadinessCheck
+          complete={readiness.configuration_complete}
+          label="OAuth configuration"
+          description={
+            readiness.configuration_complete
+              ? "The dedicated OAuth client configuration is complete."
+              : "The OAuth client ID, encrypted secret, and dedicated-project acknowledgement are required."
+          }
+        />
+        <ReadinessCheck
+          complete={readiness.credential_binding_complete}
+          label="Credential binding"
+          description={
+            !readiness.configuration_complete
+              ? "Credential binding cannot be verified until the OAuth configuration is complete."
+              : readiness.credential_binding_complete
+                ? `${readiness.provider_connection_count} provider connections match the configured OAuth client.`
+                : `${readiness.credential_mismatch_count} provider connections do not match. Finish terminal disconnect cleanup before replacing credentials.`
+          }
+        />
+        <ReadinessCheck
+          complete={readiness.lifecycle_recovery_complete}
+          label="Lifecycle recovery"
+          description={
+            readiness.lifecycle_recovery_complete
+              ? "No connection or cleanup operations require recovery."
+              : `${readiness.incomplete_lifecycle_count} connection or cleanup operations have not reached a terminal state.`
+          }
+        />
+        <ReadinessCheck
+          complete={readiness.backend_verification_complete}
+          label="Backend verification"
+          description={verificationDescription}
+        />
+      </ul>
+
+      <p className="mt-4 border-t border-subtle pt-4 text-12 text-tertiary">
+        The release setting is controlled only by the server environment and cannot be changed in God Mode.
+      </p>
+    </section>
+  );
+}
 
 export function InstanceGoogleCalendarConfigForm(props: Props) {
   const { config } = props;
   const { updateInstanceConfigurations } = useInstance();
+  const { mutate } = useSWRConfig();
+  const [credentialReplacementBlocked, setCredentialReplacementBlocked] = useState(false);
   const {
     control,
     handleSubmit,
@@ -77,6 +255,7 @@ export function InstanceGoogleCalendarConfigForm(props: Props) {
   ];
 
   const onSubmit = async (formData: GoogleCalendarConfigFormValues) => {
+    setCredentialReplacementBlocked(false);
     try {
       const response = await updateInstanceConfigurations(formData);
       const savedValues = Object.fromEntries(response.map(({ key, value }) => [key, value]));
@@ -88,18 +267,20 @@ export function InstanceGoogleCalendarConfigForm(props: Props) {
         GOOGLE_CALENDAR_IS_PROJECT_DEDICATED:
           savedValues.GOOGLE_CALENDAR_IS_PROJECT_DEDICATED ?? formData.GOOGLE_CALENDAR_IS_PROJECT_DEDICATED,
       });
+      void mutate(GOOGLE_CALENDAR_RELEASE_READINESS_KEY);
       setToast({
         type: TOAST_TYPE.SUCCESS,
         title: "Configuration saved",
         message: "Google Calendar OAuth credentials were saved successfully.",
       });
     } catch (error) {
-      if (isCalendarCredentialsLockedError(error)) {
+      if (isCalendarCredentialReplacementError(error)) {
+        setCredentialReplacementBlocked(true);
         setToast({
           type: TOAST_TYPE.ERROR,
-          title: "Calendar credentials are locked",
+          title: "Calendar credentials cannot be replaced",
           message:
-            "Live credential rotation is not supported. Revoke Calendar access project-wide before replacing this OAuth client.",
+            "Confirm release is disabled in the server environment and finish terminal disconnect cleanup for every Calendar connection.",
         });
         return;
       }
@@ -115,6 +296,22 @@ export function InstanceGoogleCalendarConfigForm(props: Props) {
 
   return (
     <form className="space-y-8" onSubmit={handleSubmit(onSubmit)}>
+      <InstanceGoogleCalendarReadiness />
+
+      {credentialReplacementBlocked && (
+        <div className="flex gap-3 rounded-lg border border-danger-subtle bg-danger-subtle p-4 text-13 text-secondary">
+          <CircleAlert className="mt-0.5 size-4 shrink-0 text-danger-primary" />
+          <div className="space-y-1">
+            <p className="font-medium text-primary">Credential replacement requires terminal cleanup</p>
+            <p>
+              Live rotation is not supported. An operator must disable the environment-managed release gate, and every
+              member connection—including soft-deleted records—must finish disconnecting and remove its provider state
+              before these credentials can be replaced. There is no force-rotation path.
+            </p>
+          </div>
+        </div>
+      )}
+
       <div className="grid grid-cols-1 gap-8 lg:grid-cols-2 lg:gap-12">
         <section className="space-y-5">
           <div>

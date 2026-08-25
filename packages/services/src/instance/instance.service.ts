@@ -12,6 +12,7 @@ import type {
   IInstanceAdmin,
   IInstanceConfiguration,
   IInstanceInfo,
+  IGoogleCalendarReleaseReadiness,
   TPage,
 } from "@plane/types";
 // api service
@@ -108,6 +109,19 @@ export class InstanceService extends APIService {
   async updateConfigurations(data: Partial<IFormattedInstanceConfiguration>): Promise<IInstanceConfiguration[]> {
     return this.patch("/api/instances/configurations/", data)
       .then((response) => response?.data)
+      .catch((error) => {
+        throw error?.response?.data;
+      });
+  }
+
+  /**
+   * Fetches the secret-free Google Calendar release readiness state.
+   * @returns The backend readiness checks for the instance.
+   * @throws {Error} If the API request fails.
+   */
+  async googleCalendarReleaseReadiness(): Promise<IGoogleCalendarReleaseReadiness> {
+    return this.get("/api/integrations/google-calendar/readiness/")
+      .then((response) => response.data)
       .catch((error) => {
         throw error?.response?.data;
       });
