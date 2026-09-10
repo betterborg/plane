@@ -178,7 +178,10 @@ class TestGoogleCalendarBrokerFailureReleaseGate:
         issue_activity = Mock()
 
         with (
-            override_settings(GOOGLE_CALENDAR_RELEASED=True),
+            override_settings(
+                GOOGLE_CALENDAR_RELEASED=True,
+                APP_BASE_URL="https://plane.example",
+            ),
             patch(
                 "plane.integrations.google_calendar.dispatch.publish_google_calendar_task",
                 side_effect=fail_after_observing_committed_state,
@@ -227,6 +230,7 @@ class TestGoogleCalendarBrokerFailureReleaseGate:
             )
 
             owner_start = len(observed_publications)
+            activity_start = issue_activity.call_count
             bulk_response = session_client.post(
                 reverse(
                     "project-issue-dates",
@@ -255,7 +259,7 @@ class TestGoogleCalendarBrokerFailureReleaseGate:
                 )
                 == 1
             )
-            assert issue_activity.call_count == 2
+            assert issue_activity.call_count - activity_start == 2
 
             owner_start = len(observed_publications)
             state_response = session_client.patch(
@@ -353,10 +357,7 @@ class TestGoogleCalendarBrokerFailureReleaseGate:
 
             owner_start = len(observed_publications)
             archive_project_response = session_client.post(
-                reverse(
-                    "project-archive-unarchive",
-                    kwargs={"slug": workspace.slug, "project_id": project.id},
-                )
+                f"/api/workspaces/{workspace.slug}/projects/{project.id}/archive/"
             )
             assert archive_project_response.status_code == status.HTTP_200_OK
             assert (
@@ -373,10 +374,7 @@ class TestGoogleCalendarBrokerFailureReleaseGate:
 
             owner_start = len(observed_publications)
             restore_project_response = session_client.delete(
-                reverse(
-                    "project-archive-unarchive",
-                    kwargs={"slug": workspace.slug, "project_id": project.id},
-                )
+                f"/api/workspaces/{workspace.slug}/projects/{project.id}/archive/"
             )
             assert restore_project_response.status_code == status.HTTP_204_NO_CONTENT
             assert (
@@ -509,21 +507,24 @@ class TestGoogleCalendarBrokerFailureReleaseGate:
         )
 
         observed_publications = []
-        draft_activity = Mock()
+        activity = Mock()
 
         def fail_publication(task, *args, **kwargs):
             observed_publications.append((_task_name(task), args, kwargs))
             raise RuntimeError("broker unavailable")
 
         with (
-            override_settings(GOOGLE_CALENDAR_RELEASED=True),
+            override_settings(
+                GOOGLE_CALENDAR_RELEASED=True,
+                APP_BASE_URL="https://plane.example",
+            ),
             patch(
                 "plane.integrations.google_calendar.dispatch.publish_google_calendar_task",
                 side_effect=fail_publication,
             ),
-            patch("plane.app.views.issue.archive.issue_activity.delay"),
-            patch("plane.app.views.workspace.draft.issue_activity.delay", draft_activity),
-            patch("plane.bgtasks.issue_automation_task.issue_activity.delay"),
+            # These owners import the same Celery task object. Patch it once so
+            # nested attribute patches cannot mask which later callbacks ran.
+            patch("plane.app.views.issue.archive.issue_activity.delay", activity),
             patch("plane.db.mixins.soft_delete_related_objects.delay"),
         ):
             owner_start = len(observed_publications)
@@ -595,6 +596,7 @@ class TestGoogleCalendarBrokerFailureReleaseGate:
             )
 
             owner_start = len(observed_publications)
+            activity_start = activity.call_count
             draft_response = session_client.post(
                 f"/api/workspaces/{workspace.slug}/draft-to-issue/{draft.id}/",
                 {
@@ -628,7 +630,7 @@ class TestGoogleCalendarBrokerFailureReleaseGate:
                 )
                 == 1
             )
-            assert draft_activity.call_count == 2
+            assert activity.call_count - activity_start == 2
 
             owner_start = len(observed_publications)
             archive_old_issues()
@@ -748,16 +750,16 @@ class TestGoogleCalendarBrokerFailureReleaseGate:
 
         workspace_integration.config = {"enabled": False}
         workspace_integration.save(update_fields=["config", "updated_at"])
-        connection.active = False
         connection.desired_state = GoogleCalendarConnection.DesiredState.DISCONNECTED
         connection.status = GoogleCalendarConnection.Status.DISCONNECTED
         connection.calendar_id = ""
+        connection.retain_grant_after_cleanup = True
         connection.save(
             update_fields=[
-                "active",
                 "desired_state",
                 "status",
                 "calendar_id",
+                "retain_grant_after_cleanup",
                 "updated_at",
             ]
         )
@@ -930,6 +932,7 @@ class TestGoogleCalendarBrokerFailureReleaseGate:
         failed_email = Mock(side_effect=RuntimeError("email broker unavailable"))
 
         with (
+            override_settings(APP_BASE_URL="https://plane.example"),
             patch("plane.integrations.google_calendar.lifecycle._acquire_advisory_xact_lock"),
             patch("plane.app.views.user.base.current_app.signature", return_value=failed_account_task),
             patch("plane.app.views.user.base.user_deactivation_email.delay", failed_email),
@@ -954,9 +957,9 @@ class TestGoogleCalendarBrokerFailureReleaseGate:
             call(GOOGLE_CALENDAR_LIFECYCLE_TASK),
             call(GOOGLE_CALENDAR_LIFECYCLE_TASK),
         ]
-        assert set(recovered_cleanup.delay.call_args_list) == {
-            call(str(member_connection.id), 5),
-            call(str(account_connection.id), 8),
+        assert {invocation.args for invocation in recovered_cleanup.delay.call_args_list} == {
+            (str(member_connection.id), 5),
+            (str(account_connection.id), 8),
         }
 
         workspace_owner = UserFactory()
@@ -964,7 +967,7 @@ class TestGoogleCalendarBrokerFailureReleaseGate:
         workspace_client.force_authenticate(user=workspace_owner)
         doomed_workspace = WorkspaceFactory(
             name="Doomed workspace",
-            slug=f"doomed-{workspace_owner.id}",
+            slug=f"doomed-{str(workspace_owner.id)[:8]}",
             owner=workspace_owner,
             created_by=workspace_owner,
         )
